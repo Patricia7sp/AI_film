@@ -1,0 +1,92 @@
+---
+# PersistentVolumeClaim para Dagster
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dagster-pvc
+  namespace: ai-film
+  labels:
+    app: dagster
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# PersistentVolumeClaim para Imagens
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: images-pvc
+  namespace: ai-film
+  labels:
+    app: ai-film-pipeline
+    component: storage
+    type: images
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard
+
+---
+# PersistentVolumeClaim para Vídeos
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: videos-pvc
+  namespace: ai-film
+  labels:
+    app: ai-film-pipeline
+    component: storage
+    type: videos
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: standard
+
+---
+# PersistentVolumeClaim para Modelos
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: models-pvc
+  namespace: ai-film
+  labels:
+    app: ai-film-pipeline
+    component: storage
+    type: models
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard
+
+---
+# PersistentVolumeClaim para PostgreSQL
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: ai-film
+  labels:
+    app: postgresql
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard

@@ -1,0 +1,95 @@
+---
+# ComfyUI StatefulSet (precisa de GPU)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: comfyui
+  namespace: ai-film
+  labels:
+    app: comfyui
+    component: image-generation
+spec:
+  serviceName: comfyui
+  replicas: 1
+  selector:
+    matchLabels:
+      app: comfyui
+  template:
+    metadata:
+      labels:
+        app: comfyui
+        component: image-generation
+    spec:
+      containers:
+      - name: comfyui
+        image: ghcr.io/comfyanonymous/comfyui:latest
+        ports:
+        - containerPort: 8188
+          name: http
+        env:
+        - name: COMFYUI_URL
+          valueFrom:
+            configMapKeyRef:
+              name: comfyui-config
+              key: COMFYUI_URL
+        volumeMounts:
+        - name: models-storage
+          mountPath: /app/models
+        - name: output-storage
+          mountPath: /app/output
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+            nvidia.com/gpu: "1"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8188
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8188
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: models-storage
+        persistentVolumeClaim:
+          claimName: models-pvc
+      - name: output-storage
+        persistentVolumeClaim:
+          claimName: images-pvc
+      # Tolerations para nodes com GPU
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      # Node selector para garantir GPU
+      nodeSelector:
+        accelerator: nvidia-tesla-t4  # Ajustar conforme seu cluster
+
+---
+# ComfyUI Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfyui
+  namespace: ai-film
+  labels:
+    app: comfyui
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8188
+    targetPort: 8188
+    protocol: TCP
+    name: http
+  selector:
+    app: comfyui

@@ -1,0 +1,274 @@
+name: Deploy with Colab ComfyUI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      force_colab_restart:
+        description: 'Force restart Colab ComfyUI'
+        required: false
+        default: 'false'
+
+env:
+  PYTHON_VERSION: '3.11'
+  COLAB_NOTEBOOK_ID: '1bfDjw5JGeqExdsUWYM41txvqlCGzOF99'
+
+jobs:
+  # Job 1: Start ComfyUI on Colab
+  start-comfyui-colab:
+    name: Start ComfyUI on Google Colab
+    runs-on: ubuntu-latest
+    outputs:
+      comfyui_url: ${{ steps.get-url.outputs.url }}
+      colab_status: ${{ steps.get-url.outputs.status }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install requests selenium webdriver-manager google-auth google-auth-oauthlib
+
+      - name: Trigger Colab Notebook
+        id: trigger-colab
+        run: |
+          python .github/scripts/trigger_colab_comfyui.py
+        env:
+          COLAB_NOTEBOOK_ID: ${{ env.COLAB_NOTEBOOK_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_COLAB_CREDENTIALS }}
+
+      - name: Wait for ComfyUI to start
+        run: |
+          echo "⏳ Aguardando ComfyUI iniciar no Colab..."
+          sleep 60
+
+      - name: Get ComfyUI URL
+        id: get-url
+        run: |
+          python .github/scripts/get_colab_url.py
+        env:
+          COLAB_NOTEBOOK_ID: ${{ env.COLAB_NOTEBOOK_ID }}
+
+      - name: Verify ComfyUI connectivity
+        run: |
+          URL="${{ steps.get-url.outputs.url }}"
+          echo "🧪 Testando conectividade: $URL"
+          
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if curl -f -s "$URL" > /dev/null; then
+              echo "✅ ComfyUI está acessível!"
+              exit 0
+            fi
+            echo "⏳ Tentativa $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+            sleep 10
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+          done
+          
+          echo "❌ ComfyUI não ficou acessível após $MAX_RETRIES tentativas"
+          exit 1
+
+      - name: Save ComfyUI URL as artifact
+        run: |
+          mkdir -p artifacts
+          echo "${{ steps.get-url.outputs.url }}" > artifacts/comfyui_url.txt
+          echo "Colab Session: $(date)" >> artifacts/comfyui_url.txt
+
+      - name: Upload ComfyUI URL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfyui-url
+          path: artifacts/comfyui_url.txt
+          retention-days: 1
+
+  # Job 2: Update Configuration
+  update-config:
+    name: Update Project Configuration
+    runs-on: ubuntu-latest
+    needs: start-comfyui-colab
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download ComfyUI URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
+          path: artifacts/
+
+      - name: Update configuration files
+        run: |
+          COMFYUI_URL=$(head -n 1 artifacts/comfyui_url.txt)
+          echo "📝 Atualizando configuração com URL: $COMFYUI_URL"
+          
+          # Atualizar .env
+          if [ -f "open3d_implementation/.env" ]; then
+            sed -i "s|COMFYUI_URL=.*|COMFYUI_URL=$COMFYUI_URL|g" open3d_implementation/.env
+          else
+            echo "COMFYUI_URL=$COMFYUI_URL" > open3d_implementation/.env
+          fi
+          
+          # Atualizar deploy script
+          sed -i "s|export COMFYUI_URL=.*|export COMFYUI_URL=\"$COMFYUI_URL\"|g" deploy_alternative_ports.sh
+          
+          # Criar arquivo de configuração para Kubernetes
+          mkdir -p k8s/secrets
+          cat > k8s/secrets/comfyui-url-secret.yaml <<EOF
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: comfyui-url-secret
+            namespace: ai-film
+          type: Opaque
+          stringData:
+            COMFYUI_URL: "$COMFYUI_URL"
+            COMFYUI_UPDATED_AT: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          EOF
+          
+          echo "✅ Configuração atualizada!"
+
+      - name: Commit and push changes
+        if: github.event_name == 'push'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          git add open3d_implementation/.env deploy_alternative_ports.sh k8s/secrets/comfyui-url-secret.yaml
+          
+          if git diff --staged --quiet; then
+            echo "Nenhuma mudança para commitar"
+          else
+            git commit -m "chore: update ComfyUI URL from Colab [skip ci]"
+            git push
+          fi
+
+  # Job 3: Run Tests with Colab ComfyUI
+  test-with-colab:
+    name: Test Pipeline with Colab ComfyUI
+    runs-on: ubuntu-latest
+    needs: [start-comfyui-colab, update-config]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download ComfyUI URL
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
+          path: artifacts/
+
+      - name: Install dependencies
+        run: |
+          cd open3d_implementation
+          pip install -r requirements.txt
+
+      - name: Run integration tests
+        env:
+          COMFYUI_URL: ${{ needs.start-comfyui-colab.outputs.comfyui_url }}
+        run: |
+          cd open3d_implementation
+          pytest tests/test_comfyui_integration.py -v
+          pytest tests/test_pipeline_integration.py -v
+
+      - name: Test Dagster pipeline
+        env:
+          COMFYUI_URL: ${{ needs.start-comfyui-colab.outputs.comfyui_url }}
+        run: |
+          cd open3d_implementation/orchestration
+          python -c "
+          import os
+          os.environ['COMFYUI_URL'] = '${{ needs.start-comfyui-colab.outputs.comfyui_url }}'
+          from dagster_pipeline import test_pipeline_execution
+          test_pipeline_execution()
+          "
+
+  # Job 4: Deploy to Kubernetes (if main branch)
+  deploy-kubernetes:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [start-comfyui-colab, update-config, test-with-colab]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Download ComfyUI URL
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
+          path: artifacts/
+
+      - name: Update Kubernetes secrets
+        run: |
+          COMFYUI_URL=$(head -n 1 artifacts/comfyui_url.txt)
+          
+          kubectl create secret generic comfyui-url-secret \
+            --from-literal=COMFYUI_URL="$COMFYUI_URL" \
+            --from-literal=COMFYUI_UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -n ai-film \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to Kubernetes
+        run: |
+          cd k8s
+          ./deploy.sh
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/dagster -n ai-film --timeout=5m
+          kubectl rollout status deployment/langgraph -n ai-film --timeout=5m
+
+      - name: Verify deployment
+        run: |
+          kubectl get all -n ai-film
+          kubectl get secret comfyui-url-secret -n ai-film -o yaml
+
+  # Job 5: Notification
+  notify:
+    name: Send Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [start-comfyui-colab, update-config, test-with-colab, deploy-kubernetes]
+    if: always()
+    steps:
+      - name: Send notification
+        run: |
+          echo "🎉 Deploy completo!"
+          echo "ComfyUI URL: ${{ needs.start-comfyui-colab.outputs.comfyui_url }}"
+          echo "Status: ${{ job.status }}"
+          
+          # Aqui você pode adicionar notificação para Slack, Discord, etc
+          # curl -X POST ${{ secrets.SLACK_WEBHOOK }} -d "..."

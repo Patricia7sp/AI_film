@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-film
+  labels:
+    name: ai-film
+    environment: production
+    app: ai-film-pipeline
+    managed-by: kubectl

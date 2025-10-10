@@ -1,0 +1,194 @@
+name: GitFlow Workflow
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'hotfix/**'
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  # Validação de branch naming
+  validate-branch:
+    name: Validate Branch Name
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch name
+        run: |
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          echo "Branch: $BRANCH_NAME"
+          
+          if [[ "$BRANCH_NAME" =~ ^(main|develop|feature/.*|hotfix/.*|release/.*)$ ]]; then
+            echo "✅ Branch name válido: $BRANCH_NAME"
+          else
+            echo "❌ Branch name inválido: $BRANCH_NAME"
+            echo "Padrões aceitos: main, develop, feature/*, hotfix/*, release/*"
+            exit 1
+          fi
+
+  # Feature branch: Testes básicos
+  feature-tests:
+    name: Feature Branch Tests
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    needs: validate-branch
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r open3d_implementation/orchestration/requirements_dagster.txt
+          pip install pytest black flake8
+
+      - name: Run linting
+        run: |
+          black --check open3d_implementation/
+          flake8 open3d_implementation/ --max-line-length=120
+
+      - name: Run unit tests
+        run: |
+          cd open3d_implementation
+          pytest tests/ -v --maxfail=5
+
+  # Develop branch: Testes completos
+  develop-tests:
+    name: Develop Branch Tests
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    needs: validate-branch
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r open3d_implementation/orchestration/requirements_dagster.txt
+          pip install pytest pytest-cov black flake8 mypy
+
+      - name: Run full test suite
+        run: |
+          cd open3d_implementation
+          pytest tests/ -v --cov=. --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./open3d_implementation/coverage.xml
+
+  # Release branch: Validação pré-produção
+  release-validation:
+    name: Release Validation
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/release/')
+    needs: validate-branch
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          BRANCH_NAME="${GITHUB_REF#refs/heads/release/}"
+          echo "version=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "Release version: $BRANCH_NAME"
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "✅ Version format válido: $VERSION"
+          else
+            echo "❌ Version format inválido: $VERSION"
+            echo "Formato esperado: v1.2.3"
+            exit 1
+          fi
+
+      - name: Run release tests
+        run: |
+          pip install -r open3d_implementation/orchestration/requirements_dagster.txt
+          cd open3d_implementation
+          pytest tests/ -v --maxfail=1
+
+      - name: Build Docker image
+        run: |
+          docker build -t ai-film-pipeline:${{ steps.version.outputs.version }} \
+            -f open3d_implementation/Dockerfile \
+            open3d_implementation/
+
+  # Hotfix branch: Testes críticos
+  hotfix-tests:
+    name: Hotfix Tests
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/hotfix/')
+    needs: validate-branch
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run critical tests
+        run: |
+          pip install -r open3d_implementation/orchestration/requirements_dagster.txt
+          cd open3d_implementation
+          pytest tests/ -v -m "critical" --maxfail=1
+
+  # Auto-merge para develop (features aprovadas)
+  auto-merge-to-develop:
+    name: Auto-merge to Develop
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'develop' &&
+      startsWith(github.event.pull_request.head.ref, 'feature/') &&
+      github.event.pull_request.mergeable == true
+    needs: [feature-tests]
+    steps:
+      - name: Auto-merge PR
+        uses: pascalgn/automerge-action@v0.15.6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_LABELS: "auto-merge,approved"
+          MERGE_METHOD: "squash"
+          MERGE_COMMIT_MESSAGE: "pull-request-title"
+
+  # Notificações
+  notify-success:
+    name: Notify Success
+    runs-on: ubuntu-latest
+    if: success()
+    needs: [validate-branch]
+    steps:
+      - name: Send notification
+        run: |
+          echo "✅ GitFlow workflow concluído com sucesso"
+          # Adicionar integração com Slack/Discord se necessário
+
+  notify-failure:
+    name: Notify Failure
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: [validate-branch]
+    steps:
+      - name: Send failure notification
+        run: |
+          echo "❌ GitFlow workflow falhou"
+          # Adicionar integração com Slack/Discord se necessário

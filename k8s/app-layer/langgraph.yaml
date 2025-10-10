@@ -1,0 +1,97 @@
+---
+# LangGraph MCP Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langgraph
+  namespace: ai-film
+  labels:
+    app: langgraph
+    component: ai-agents
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: langgraph
+  template:
+    metadata:
+      labels:
+        app: langgraph
+        component: ai-agents
+    spec:
+      containers:
+      - name: langgraph
+        image: ghcr.io/your-org/ai-film-pipeline:latest  # Atualizar com sua imagem
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: COMFYUI_URL
+          valueFrom:
+            configMapKeyRef:
+              name: comfyui-config
+              key: COMFYUI_URL
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: api-keys-secret
+              key: OPENAI_API_KEY
+        - name: REDIS_HOST
+          value: "redis.ai-film.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-secret
+              key: REDIS_PASSWORD
+        volumeMounts:
+        - name: images-storage
+          mountPath: /app/output/images
+        - name: videos-storage
+          mountPath: /app/output/videos
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: images-storage
+        persistentVolumeClaim:
+          claimName: images-pvc
+      - name: videos-storage
+        persistentVolumeClaim:
+          claimName: videos-pvc
+
+---
+# LangGraph Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: langgraph
+  namespace: ai-film
+  labels:
+    app: langgraph
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: langgraph

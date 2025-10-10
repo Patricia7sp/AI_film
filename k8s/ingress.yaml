@@ -1,0 +1,51 @@
+---
+# Ingress para expor serviços
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-film-ingress
+  namespace: ai-film
+  labels:
+    app: ai-film-pipeline
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: ai-film.local
+    http:
+      paths:
+      # Dagster UI
+      - path: /dagster
+        pathType: Prefix
+        backend:
+          service:
+            name: dagster
+            port:
+              number: 3000
+      # Flask Upload
+      - path: /upload
+        pathType: Prefix
+        backend:
+          service:
+            name: flask-upload
+            port:
+              number: 5000
+      # LangGraph API
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: langgraph
+            port:
+              number: 8080
+      # ComfyUI (se quiser expor)
+      - path: /comfyui
+        pathType: Prefix
+        backend:
+          service:
+            name: comfyui
+            port:
+              number: 8188

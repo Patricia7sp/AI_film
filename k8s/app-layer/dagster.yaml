@@ -1,0 +1,122 @@
+---
+# Dagster Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dagster
+  namespace: ai-film
+  labels:
+    app: dagster
+    component: orchestration
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dagster
+  template:
+    metadata:
+      labels:
+        app: dagster
+        component: orchestration
+    spec:
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox:latest
+        command: ['sh', '-c', 'until nc -z postgresql 5432; do echo waiting for postgres; sleep 2; done;']
+      containers:
+      - name: dagster
+        image: ghcr.io/your-org/ai-film-pipeline:latest  # Atualizar com sua imagem
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: DAGSTER_POSTGRES_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: dagster-config
+              key: DAGSTER_POSTGRES_HOST
+        - name: DAGSTER_POSTGRES_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: dagster-config
+              key: DAGSTER_POSTGRES_PORT
+        - name: DAGSTER_POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: dagster-config
+              key: DAGSTER_POSTGRES_DB
+        - name: DAGSTER_POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_USER
+        - name: DAGSTER_POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_PASSWORD
+        - name: COMFYUI_URL
+          valueFrom:
+            configMapKeyRef:
+              name: comfyui-config
+              key: COMFYUI_URL
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: api-keys-secret
+              key: OPENAI_API_KEY
+        volumeMounts:
+        - name: dagster-storage
+          mountPath: /opt/dagster/dagster_home
+        - name: images-storage
+          mountPath: /app/output/images
+        - name: videos-storage
+          mountPath: /app/output/videos
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        livenessProbe:
+          httpGet:
+            path: /server_info
+            port: 3000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /server_info
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: dagster-storage
+        persistentVolumeClaim:
+          claimName: dagster-pvc
+      - name: images-storage
+        persistentVolumeClaim:
+          claimName: images-pvc
+      - name: videos-storage
+        persistentVolumeClaim:
+          claimName: videos-pvc
+
+---
+# Dagster Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: dagster
+  namespace: ai-film
+  labels:
+    app: dagster
+spec:
+  type: LoadBalancer  # Ou ClusterIP se usar Ingress
+  ports:
+  - port: 3000
+    targetPort: 3000
+    protocol: TCP
+    name: http
+  selector:
+    app: dagster

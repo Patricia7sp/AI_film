@@ -1,0 +1,75 @@
+---
+# Blender Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blender
+  namespace: ai-film
+  labels:
+    app: blender
+    component: 3d-rendering
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: blender
+  template:
+    metadata:
+      labels:
+        app: blender
+        component: 3d-rendering
+    spec:
+      containers:
+      - name: blender
+        image: linuxserver/blender:latest
+        ports:
+        - containerPort: 9876
+          name: http
+        env:
+        - name: BLENDER_PATH
+          value: "/usr/bin/blender"
+        volumeMounts:
+        - name: output-storage
+          mountPath: /output
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9876
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9876
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: output-storage
+        persistentVolumeClaim:
+          claimName: videos-pvc
+
+---
+# Blender Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: blender
+  namespace: ai-film
+  labels:
+    app: blender
+spec:
+  type: ClusterIP
+  ports:
+  - port: 9876
+    targetPort: 9876
+    protocol: TCP
+    name: http
+  selector:
+    app: blender
