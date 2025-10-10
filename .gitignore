@@ -257,3 +257,62 @@ ENV/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Scripts de teste (ignorar)
+test_*.py
+*_test.py
+teste_*.py
+*_teste.py
+debug_*.py
+*_debug.py
+diagnose_*.py
+check_*.py
+*_check.py
+example_*.py
+*_example.py
+run_test*.py
+
+# Arquivos de teste específicos do projeto
+script/test_*.py
+script/*_test.py
+script/debug_*.py
+script/diagnose_*.py
+test_data/
+test_output/
+
+# Outputs temporários
+*.wav
+*.mp4
+*.mp3
+*.png
+*.jpg
+*.jpeg
+*.gif
+scene_output/
+audio_output/
+hyper3d_cache/
+transforms.json
+
+# Arquivos de configuração sensíveis
+*oauth*.json
+*credentials*.json
+client_secrets.json
+gcp-oauth.keys.json
+
+# Logs e arquivos temporários do servidor
+server_log.txt
+nul
+cloudflared.log
+comfyui.log
+
+# Google Cloud SDK
+google-cloud-sdk/
+
+# Virtual environments específicos
+.venv_*/
+venv_*/
+
+# Lock files
+uv.lock
+poetry.lock
+Pipfile.lock
