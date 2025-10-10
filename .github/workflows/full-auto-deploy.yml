@@ -44,8 +44,25 @@ jobs:
           echo "🚀 Iniciando ComfyUI..."
           cd ComfyUI
           nohup python main.py --listen --port 8188 > comfyui.log 2>&1 &
-          sleep 10
-          echo "✅ ComfyUI iniciado!"
+          
+          # Aguardar ComfyUI realmente iniciar
+          echo "⏳ Aguardando ComfyUI iniciar..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8188 > /dev/null 2>&1; then
+              echo "✅ ComfyUI está respondendo!"
+              break
+            fi
+            echo "   Tentativa $i/30..."
+            sleep 2
+          done
+          
+          # Verificar se iniciou
+          if ! curl -s http://localhost:8188 > /dev/null 2>&1; then
+            echo "❌ ComfyUI não iniciou corretamente"
+            echo "📋 Log do ComfyUI:"
+            tail -50 comfyui.log
+            exit 1
+          fi
 
       - name: Install Cloudflare Tunnel
         run: |
@@ -57,27 +74,51 @@ jobs:
         id: expose-comfyui
         run: |
           echo "🌐 Criando túnel Cloudflare..."
-          nohup cloudflared tunnel --url http://localhost:8188 > cloudflared.log 2>&1 &
           
-          # Aguardar URL ser gerada (aumentado para 2 minutos)
+          # Verificar ComfyUI antes
+          echo "🔍 Verificando ComfyUI está ativo..."
+          curl -s http://localhost:8188 || echo "⚠️ ComfyUI pode não estar respondendo"
+          
+          # Iniciar cloudflared
+          nohup cloudflared tunnel --url http://localhost:8188 > cloudflared.log 2>&1 &
+          CLOUDFLARED_PID=$!
+          echo "   Cloudflared PID: $CLOUDFLARED_PID"
+          
+          # Aguardar URL ser gerada (aumentado para 3 minutos)
           echo "⏳ Aguardando URL do Cloudflare..."
           URL=""
-          for i in {1..60}; do
+          for i in {1..90}; do
             sleep 2
+            
+            # Mostrar progresso a cada 10 tentativas
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "   Tentativa $i/90... (${i}s passados)"
+              echo "   Últimas linhas do log:"
+              tail -3 cloudflared.log
+            fi
+            
             if grep -q "trycloudflare.com" cloudflared.log; then
               URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | head -1)
               echo "✅ URL gerada: $URL"
               echo "url=$URL" >> $GITHUB_OUTPUT
               break
             fi
-            echo "   Tentativa $i/60... (aguardando túnel)"
+            
+            # Verificar se processo ainda está rodando
+            if ! ps -p $CLOUDFLARED_PID > /dev/null 2>&1; then
+              echo "❌ Cloudflared morreu!"
+              break
+            fi
           done
           
           # Verificar se URL foi capturada
           if [ -z "$URL" ]; then
-            echo "❌ Falha ao obter URL"
-            echo "📋 Log do Cloudflare:"
+            echo "❌ Falha ao obter URL após 180 segundos"
+            echo "📋 Log completo do Cloudflare:"
             cat cloudflared.log
+            echo ""
+            echo "📋 Processos ativos:"
+            ps aux | grep -E "cloudflared|python"
             exit 1
           fi
           
