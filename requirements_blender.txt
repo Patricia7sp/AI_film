@@ -1,0 +1,6 @@
+bpy
+blenderproc
+torch
+torchvision
+torchaudio
+# Outras dependências do Hyper3D podem ser adicionadas aqui

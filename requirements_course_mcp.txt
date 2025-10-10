@@ -1,0 +1,28 @@
+# Course Transcription MCP Requirements
+# Requisitos para o servidor MCP de transcrição de cursos
+
+# Core MCP
+mcp>=0.1.0
+
+# Web automation
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+httpx>=0.25.0
+
+# Video/Audio processing
+yt-dlp>=2024.1.0
+pydub>=0.25.0
+ffmpeg-python>=0.2.0
+
+# Transcription
+openai-whisper>=20231117
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Security
+cryptography>=41.0.0
+keyring>=24.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiofiles>=23.0.0
