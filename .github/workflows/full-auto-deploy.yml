@@ -59,25 +59,31 @@ jobs:
           echo "🌐 Criando túnel Cloudflare..."
           nohup cloudflared tunnel --url http://localhost:8188 > cloudflared.log 2>&1 &
           
-          # Aguardar URL ser gerada
+          # Aguardar URL ser gerada (aumentado para 2 minutos)
           echo "⏳ Aguardando URL do Cloudflare..."
-          for i in {1..30}; do
+          URL=""
+          for i in {1..60}; do
+            sleep 2
             if grep -q "trycloudflare.com" cloudflared.log; then
               URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | head -1)
               echo "✅ URL gerada: $URL"
               echo "url=$URL" >> $GITHUB_OUTPUT
               break
             fi
-            echo "   Tentativa $i/30..."
-            sleep 2
+            echo "   Tentativa $i/60... (aguardando túnel)"
           done
           
           # Verificar se URL foi capturada
           if [ -z "$URL" ]; then
             echo "❌ Falha ao obter URL"
+            echo "📋 Log do Cloudflare:"
             cat cloudflared.log
             exit 1
           fi
+          
+          # Dar mais tempo para túnel estabilizar
+          echo "⏳ Aguardando túnel estabilizar..."
+          sleep 10
 
       - name: Test ComfyUI Connectivity
         run: |
