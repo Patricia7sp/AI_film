@@ -50,17 +50,15 @@ jobs:
           COLAB_NOTEBOOK_ID: ${{ env.COLAB_NOTEBOOK_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_COLAB_CREDENTIALS }}
 
-      - name: Wait for ComfyUI to start
-        run: |
-          echo "⏳ Aguardando ComfyUI iniciar no Colab..."
-          sleep 60
-
-      - name: Get ComfyUI URL
+      - name: Get ComfyUI URL (AUTO - via Gist)
         id: get-url
         run: |
-          python .github/scripts/get_colab_url.py
+          python .github/scripts/auto_update_comfyui_url.py
         env:
+          MODE: read
           COLAB_NOTEBOOK_ID: ${{ env.COLAB_NOTEBOOK_ID }}
+          COMFYUI_URL_GIST_ID: ${{ secrets.COMFYUI_URL_GIST_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify ComfyUI connectivity
         run: |
