@@ -153,12 +153,26 @@ jobs:
         run: |
           pip install pytest requests
 
+      - name: Debug - Show URL from previous job
+        run: |
+          echo "🔍 Debug: URL do job anterior"
+          echo "Output comfyui_url: ${{ needs.get-comfyui-url.outputs.comfyui_url }}"
+          echo "Tamanho: ${#url}"
+
       - name: Test ComfyUI Integration
         env:
           COMFYUI_URL: ${{ needs.get-comfyui-url.outputs.comfyui_url }}
         run: |
           echo "🧪 Testando integração com ComfyUI..."
           echo "URL: $COMFYUI_URL"
+          echo "URL length: ${#COMFYUI_URL}"
+          
+          # Fallback para secret se output estiver vazio
+          if [ -z "$COMFYUI_URL" ]; then
+            echo "⚠️ Output está vazio, tentando usar secret diretamente..."
+            COMFYUI_URL="${{ secrets.COMFYUI_FALLBACK_URL }}"
+            echo "URL do secret: $COMFYUI_URL"
+          fi
           
           # Criar teste básico
           cat > test_comfyui.py << 'EOF'
