@@ -153,15 +153,23 @@ jobs:
           python test_comfyui_auto.py "$URL"
 
   # ============================================================
-  # JOB 4: Generate AI Content (Automated)
+  # JOB 4: Trigger Dagster Pipeline (NEW!)
   # ============================================================
-  generate-content:
-    name: 🎬 Generate AI Content
+  trigger-dagster:
+    name: 📊 Trigger Dagster Pipeline
     runs-on: ubuntu-latest
     needs: [orchestrate-colab, test-integration]
+    outputs:
+      dagster_run_id: ${{ steps.dagster.outputs.run_id }}
+      dagster_status: ${{ steps.dagster.outputs.status }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      
+      - name: Download URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -170,19 +178,25 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt || echo "requirements.txt not found"
+          pip install requests dagster-graphql
 
-      - name: 🎬 Run AI Film Pipeline
+      - name: 📊 Trigger Dagster Pipeline
+        id: dagster
         env:
-          COMFYUI_URL: ${{ needs.orchestrate-colab.outputs.comfyui_url }}
+          DAGSTER_URL: ${{ secrets.DAGSTER_URL || 'http://localhost:3000' }}
         run: |
-          echo "🎬 Iniciando pipeline de geração de conteúdo..."
-          echo "URL do ComfyUI: $COMFYUI_URL"
+          COMFYUI_URL=$(cat comfyui_url.txt)
+          echo "📊 Iniciando Dagster Pipeline..."
+          echo "ComfyUI URL: $COMFYUI_URL"
+          echo "Dagster URL: $DAGSTER_URL"
           
-          # Aqui você pode chamar seu pipeline principal
-          # Exemplo: python run_pipeline.py --comfyui-url "$COMFYUI_URL"
+          python .github/scripts/trigger_dagster_pipeline.py \
+            --dagster-url "$DAGSTER_URL" \
+            --comfyui-url "$COMFYUI_URL" \
+            --wait-completion \
+            --timeout 1800
           
-          echo "✅ Pipeline de conteúdo executado!"
+          echo "✅ Dagster Pipeline executado com sucesso!"
 
   # ============================================================
   # JOB 5: Deploy to Kubernetes (Automated - Only on main)
@@ -190,7 +204,7 @@ jobs:
   deploy-kubernetes:
     name: 🚢 Deploy to Kubernetes
     runs-on: ubuntu-latest
-    needs: [orchestrate-colab, generate-content]
+    needs: [orchestrate-colab, trigger-dagster]
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout code
@@ -213,13 +227,13 @@ jobs:
   notify:
     name: 📢 Send Notification
     runs-on: ubuntu-latest
-    needs: [orchestrate-colab, generate-content]
+    needs: [orchestrate-colab, trigger-dagster]
     if: always()
     steps:
       - name: Send notification
         run: |
-          STATUS="${{ needs.generate-content.result }}"
-          URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
+          STATUS="${{ needs.trigger-dagster.result }}"
+          DAGSTER_RUN_ID="${{ needs.trigger-dagster.outputs.dagster_run_id }}"
           
           echo "📢 Enviando notificação..."
           echo "Status: $STATUS"
@@ -236,7 +250,7 @@ jobs:
   cleanup:
     name: 🧹 Cleanup Resources
     runs-on: ubuntu-latest
-    needs: [orchestrate-colab, generate-content, deploy-kubernetes]
+    needs: [orchestrate-colab, trigger-dagster, deploy-kubernetes]
     if: always()
     steps:
       - name: Cleanup temporary resources

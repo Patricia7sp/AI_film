@@ -22,7 +22,39 @@ O **AI Film Pipeline** é um sistema completo de produção automatizada de film
 
 ---
 
-## 🏗️ Arquitetura do CI/CD (Sem Cloud)
+## 🏗️ Arquitetura Completa do Sistema
+
+### **Fluxo End-to-End: GitHub Actions → Colab → Dagster → Produção**
+
+```mermaid
+graph TD
+    A[GitHub Actions CI/CD] --> B[1️⃣ Orchestrate Colab]
+    B --> C[Google Colab GPU]
+    C --> D[ComfyUI + Cloudflare]
+    D --> E[✅ ComfyUI Endpoint Ready]
+    
+    E --> F[2️⃣ Trigger Dagster Pipeline]
+    F --> G[Dagster Webserver Port 3000]
+    G --> H[LangGraph MCP Port 8000]
+    
+    H --> I[MICROSERVICES LAYER]
+    I --> J[ComfyUI Port 8188]
+    I --> K[Blender Port 9876]
+    I --> L[FFmpeg Service]
+    I --> M[OpenCV Service]
+    
+    I --> N[Redis Cache]
+    I --> O[PostgreSQL Dagster]
+    
+    J --> P[PERSISTENT STORAGE]
+    K --> P
+    L --> P
+    M --> P
+    
+    P --> Q[Images PVC]
+    P --> R[Videos PVC]
+    P --> S[Models PVC]
+```
 
 ### **Visão Geral da Arquitetura**
 

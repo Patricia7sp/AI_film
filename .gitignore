@@ -331,3 +331,8 @@ venv_*/
 uv.lock
 poetry.lock
 Pipfile.lock
+
+# Service Account Keys
+colab-automation-key.json
+colab-automation-key-base64.txt
+*-key.json
