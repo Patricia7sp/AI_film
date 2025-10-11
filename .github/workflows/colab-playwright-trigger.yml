@@ -1,0 +1,76 @@
+name: 🎭 Trigger Colab via Playwright
+
+on:
+  workflow_dispatch:
+    inputs:
+      headless:
+        description: 'Run in headless mode'
+        required: false
+        default: 'true'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  trigger-colab:
+    name: 🎭 Start Colab with Playwright
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps
+
+      - name: 🎭 Trigger Colab Execution
+        env:
+          GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
+          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
+          COLAB_NOTEBOOK_ID: ${{ secrets.COLAB_NOTEBOOK_ID }}
+          HEADLESS: ${{ github.event.inputs.headless || 'true' }}
+        run: |
+          echo "🎭 Iniciando Playwright Colab Trigger..."
+          python .github/scripts/playwright_colab_trigger.py
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Colab iniciado com sucesso!"
+          else
+            echo "❌ Falha ao iniciar Colab"
+            exit 1
+          fi
+
+      - name: Wait for Colab Ready
+        run: |
+          echo "⏳ Aguardando Colab processar (30 segundos)..."
+          sleep 30
+          echo "✅ Colab deve estar executando agora!"
+
+      - name: Verify Gist Updated
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMFYUI_URL_GIST_ID: ${{ secrets.COMFYUI_URL_GIST_ID }}
+        run: |
+          echo "🔍 Verificando se URL foi reportada no Gist..."
+          
+          GIST_URL="https://api.github.com/gists/$COMFYUI_URL_GIST_ID"
+          
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$GIST_URL")
+          
+          URL=$(echo "$RESPONSE" | jq -r '.files["comfyui_url.json"].content | fromjson | .url')
+          
+          if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+            echo "✅ URL encontrada no Gist: $URL"
+            echo "🎉 Automação completa funcionando!"
+          else
+            echo "⚠️ URL ainda não disponível no Gist"
+            echo "💡 Aguarde mais alguns minutos para o auto-reporter atualizar"
+          fi

@@ -79,10 +79,9 @@ coverage-*
 .blender/
 
 # ComfyUI
-ComfyUI/input/
-ComfyUI/output/
-ComfyUI/temp/
-ComfyUI/.git/
+ComfyUI/
+ComfyUI/**
+!ComfyUI/.gitkeep
 
 # Arquivos de configuração local
 local_settings.py
@@ -280,6 +279,10 @@ script/diagnose_*.py
 test_data/
 test_output/
 
+# Script directory (legacy)
+script/
+!script/README.md
+
 # Outputs temporários
 *.wav
 *.mp4
@@ -292,6 +295,18 @@ scene_output/
 audio_output/
 hyper3d_cache/
 transforms.json
+
+# Open3D Implementation outputs
+open3d_implementation/output/
+open3d_implementation/video/assets/
+open3d_implementation/audio/
+open3d_implementation/images/
+open3d_implementation/animations/
+open3d_implementation/checkpoints/
+open3d_implementation/*.blend
+open3d_implementation/**/temp/
+open3d_implementation/**/*.json
+!open3d_implementation/config/*.json
 
 # Arquivos de configuração sensíveis
 *oauth*.json
