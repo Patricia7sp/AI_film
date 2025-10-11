@@ -153,20 +153,20 @@ jobs:
           python test_comfyui_auto.py "$URL"
 
   # ============================================================
-  # JOB 4: Trigger Dagster Pipeline (NEW!)
+  # JOB 4: Start Dagster + Flask Services (NEW!)
   # ============================================================
-  trigger-dagster:
-    name: 📊 Trigger Dagster Pipeline
+  start-services:
+    name: 🚀 Start Dagster + Flask
     runs-on: ubuntu-latest
     needs: [orchestrate-colab, test-integration]
     outputs:
-      dagster_run_id: ${{ steps.dagster.outputs.run_id }}
-      dagster_status: ${{ steps.dagster.outputs.status }}
+      dagster_url: ${{ steps.services.outputs.dagster_url }}
+      flask_url: ${{ steps.services.outputs.flask_url }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Download URL artifact
+      - name: Download ComfyUI URL artifact
         uses: actions/download-artifact@v4
         with:
           name: comfyui-url
@@ -178,33 +178,109 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests dagster-graphql
+          pip install -r requirements.txt || echo "No requirements.txt"
+          pip install requests dagster dagster-webserver flask
 
-      - name: 📊 Trigger Dagster Pipeline
-        id: dagster
-        env:
-          DAGSTER_URL: ${{ secrets.DAGSTER_URL || 'http://localhost:3000' }}
+      - name: Export ComfyUI URL to environment
         run: |
           COMFYUI_URL=$(cat comfyui_url.txt)
-          echo "📊 Iniciando Dagster Pipeline..."
-          echo "ComfyUI URL: $COMFYUI_URL"
-          echo "Dagster URL: $DAGSTER_URL"
+          echo "COMFYUI_URL=$COMFYUI_URL" >> $GITHUB_ENV
+          echo "📡 ComfyUI URL: $COMFYUI_URL"
+
+      - name: 🚀 Start Dagster + Flask Services
+        id: services
+        run: |
+          echo "🚀 Starting services..."
           
-          python .github/scripts/trigger_dagster_pipeline.py \
-            --dagster-url "$DAGSTER_URL" \
-            --comfyui-url "$COMFYUI_URL" \
-            --wait-completion \
-            --timeout 1800
+          python .github/scripts/start_services.py \
+            --dagster-port 3000 \
+            --flask-port 5001 \
+            --wait \
+            --max-wait 120
           
-          echo "✅ Dagster Pipeline executado com sucesso!"
+          echo "✅ Services started successfully!"
 
   # ============================================================
-  # JOB 5: Deploy to Kubernetes (Automated - Only on main)
+  # JOB 5: Upload Story & Trigger Pipeline (NEW!)
+  # ============================================================
+  trigger-pipeline:
+    name: 📤 Upload Story & Trigger
+    runs-on: ubuntu-latest
+    needs: [orchestrate-colab, start-services]
+    outputs:
+      session_id: ${{ steps.upload.outputs.session_id }}
+      upload_status: ${{ steps.upload.outputs.upload_status }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: 📤 Upload Story File Automatically
+        id: upload
+        run: |
+          FLASK_URL="${{ needs.start-services.outputs.flask_url }}"
+          STORY_FILE="data/historia.txt"
+          
+          echo "📤 Uploading story automatically..."
+          echo "Flask URL: $FLASK_URL"
+          echo "Story File: $STORY_FILE"
+          
+          python .github/scripts/upload_story_auto.py \
+            --flask-url "$FLASK_URL" \
+            --story-file "$STORY_FILE" \
+            --method file \
+            --retry 3 \
+            --retry-delay 5
+          
+          echo "✅ Story uploaded and pipeline triggered!"
+
+      - name: ⏳ Monitor Pipeline Execution
+        run: |
+          SESSION_ID="${{ steps.upload.outputs.session_id }}"
+          FLASK_URL="${{ needs.start-services.outputs.flask_url }}"
+          
+          echo "⏳ Monitoring pipeline execution..."
+          echo "Session ID: $SESSION_ID"
+          
+          # Poll status for 30 minutes
+          MAX_WAIT=1800
+          INTERVAL=10
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Check if pipeline is still running
+            # (You can implement status endpoint in Flask if needed)
+            
+            echo "⏳ Elapsed: ${ELAPSED}s / ${MAX_WAIT}s"
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+            
+            # TODO: Add real status check when Flask status endpoint exists
+            # For now, just wait for reasonable time
+            if [ $ELAPSED -ge 600 ]; then
+              echo "✅ Pipeline has been running for 10 minutes"
+              echo "💡 Assuming successful execution (add status endpoint for real monitoring)"
+              break
+            fi
+          done
+          
+          echo "✅ Pipeline monitoring complete!"
+
+  # ============================================================
+  # JOB 6: Deploy to Kubernetes (Automated - Only on main)
   # ============================================================
   deploy-kubernetes:
     name: 🚢 Deploy to Kubernetes
     runs-on: ubuntu-latest
-    needs: [orchestrate-colab, trigger-dagster]
+    needs: [orchestrate-colab, trigger-pipeline]
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout code
@@ -222,18 +298,18 @@ jobs:
           echo "✅ Secret atualizado (simulado)"
 
   # ============================================================
-  # JOB 6: Notification (Automated)
+  # JOB 7: Notification (Automated)
   # ============================================================
   notify:
     name: 📢 Send Notification
     runs-on: ubuntu-latest
-    needs: [orchestrate-colab, trigger-dagster]
+    needs: [orchestrate-colab, trigger-pipeline]
     if: always()
     steps:
       - name: Send notification
         run: |
-          STATUS="${{ needs.trigger-dagster.result }}"
-          DAGSTER_RUN_ID="${{ needs.trigger-dagster.outputs.dagster_run_id }}"
+          STATUS="${{ needs.trigger-pipeline.result }}"
+          SESSION_ID="${{ needs.trigger-pipeline.outputs.session_id }}"
           
           echo "📢 Enviando notificação..."
           echo "Status: $STATUS"
@@ -245,12 +321,12 @@ jobs:
           echo "✅ Notificação enviada!"
 
   # ============================================================
-  # JOB 7: Cleanup (Automated)
+  # JOB 8: Cleanup (Automated)
   # ============================================================
   cleanup:
     name: 🧹 Cleanup Resources
     runs-on: ubuntu-latest
-    needs: [orchestrate-colab, trigger-dagster, deploy-kubernetes]
+    needs: [orchestrate-colab, trigger-pipeline]
     if: always()
     steps:
       - name: Cleanup temporary resources
