@@ -14,20 +14,19 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 class ColabAutomationAgent:
-    """Agente para automação completa do Colab"""
     
     def __init__(self):
         self.github_token = os.getenv('GITHUB_TOKEN')
         self.colab_notebook_id = os.getenv('COLAB_NOTEBOOK_ID')
         self.gist_id = os.getenv('COMFYUI_URL_GIST_ID')
-        self.max_retries = 30
-        self.retry_delay = 10
-        
+        self.webhook_url = os.getenv('COLAB_TRIGGER_WEBHOOK')
+        self.fallback_url = os.getenv('COMFYUI_FALLBACK_URL')
+        self.max_retries = 30  # 5 minutos (30 × 10s)
+        self.retry_delay = 10  # segundos      
     def log(self, message: str, level: str = "INFO"):
         """Log estruturado"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{timestamp}] [{level}] {message}")
-        
     def trigger_colab_execution(self) -> bool:
         """
         Trigger Colab notebook execution via API
@@ -175,6 +174,17 @@ class ColabAutomationAgent:
         except:
             return False
     
+    def _export_url_to_github_output(self, url: str):
+        """Exporta URL para GitHub Actions output"""
+        github_output = os.getenv('GITHUB_OUTPUT')
+        if github_output:
+            with open(github_output, 'a') as f:
+                f.write(f"comfyui_url={url}\n")
+            self.log("✅ URL exportada para GitHub Actions")
+        
+        # Também exportar como variável de ambiente
+        print(f"::set-output name=comfyui_url::{url}")
+    
     def capture_and_export_url(self) -> Optional[str]:
         """
         Captura URL do Colab e exporta para GitHub Actions
@@ -189,16 +199,7 @@ class ColabAutomationAgent:
             return None
         
         self.log(f"✅ URL capturada: {url}")
-        
-        # Exportar para GitHub Actions output
-        github_output = os.getenv('GITHUB_OUTPUT')
-        if github_output:
-            with open(github_output, 'a') as f:
-                f.write(f"comfyui_url={url}\n")
-            self.log("✅ URL exportada para GitHub Actions")
-        
-        # Também exportar como variável de ambiente
-        print(f"::set-output name=comfyui_url::{url}")
+        self._export_url_to_github_output(url)
         
         return url
     
@@ -253,14 +254,22 @@ class ColabAutomationAgent:
         
         # Passo 2: Aguardar estar pronto
         if not self.wait_for_colab_ready():
-            self.log("❌ Colab não ficou pronto no tempo esperado", "ERROR")
-            return False
-        
-        # Passo 3: Capturar URL
-        url = self.capture_and_export_url()
-        if not url:
-            self.log("❌ Falha ao capturar URL", "ERROR")
-            return False
+            self.log("⚠️ Colab não ficou pronto no tempo esperado", "WARN")
+            
+            # Usar fallback URL se disponível
+            if self.fallback_url:
+                self.log(f"🔄 Usando fallback URL: {self.fallback_url}")
+                url = self.fallback_url
+                self._export_url_to_github_output(url)
+            else:
+                self.log("❌ Nenhum fallback URL configurado", "ERROR")
+                return False
+        else:
+            # Passo 3: Capturar URL do Gist
+            url = self.capture_and_export_url()
+            if not url:
+                self.log("❌ Falha ao capturar URL", "ERROR")
+                return False
         
         # Passo 4: Verificar saúde
         health = self.monitor_colab_health(url)

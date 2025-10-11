@@ -43,6 +43,7 @@ jobs:
           COLAB_NOTEBOOK_ID: ${{ secrets.COLAB_NOTEBOOK_ID }}
           COMFYUI_URL_GIST_ID: ${{ secrets.COMFYUI_URL_GIST_ID }}
           COLAB_TRIGGER_WEBHOOK: ${{ secrets.COLAB_TRIGGER_WEBHOOK }}
+          COMFYUI_FALLBACK_URL: ${{ secrets.COMFYUI_FALLBACK_URL }}
         run: |
           echo "🤖 Iniciando Agente de Automação do Colab..."
           python .github/scripts/colab_automation_agent.py
