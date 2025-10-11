@@ -16,12 +16,12 @@ env:
   PYTHON_VERSION: '3.11'
 
 jobs:
-  # Job 1: Start ComfyUI in GitHub Actions (TOTALMENTE AUTOMÁTICO)
-  start-comfyui:
-    name: Start ComfyUI (Auto)
+  # Job 1: Trigger Colab and Get ComfyUI URL
+  get-comfyui-url:
+    name: Get ComfyUI URL from Colab
     runs-on: ubuntu-latest
     outputs:
-      comfyui_url: ${{ steps.expose-comfyui.outputs.url }}
+      comfyui_url: ${{ steps.get-url.outputs.url }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,138 +31,81 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install ComfyUI
+      - name: Install dependencies
         run: |
-          echo "📦 Instalando ComfyUI..."
-          git clone https://github.com/comfyanonymous/ComfyUI.git
-          cd ComfyUI
-          pip install -r requirements.txt
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install requests
 
-      - name: Start ComfyUI Server
+      - name: Check for Manual ComfyUI URL
+        id: check-manual
         run: |
-          echo "🚀 Iniciando ComfyUI..."
-          cd ComfyUI
-          # Forçar uso de CPU (sem GPU no GitHub Actions)
-          nohup python main.py --cpu --listen --port 8188 > comfyui.log 2>&1 &
-          
-          # Aguardar ComfyUI realmente iniciar
-          echo "⏳ Aguardando ComfyUI iniciar..."
-          for i in {1..30}; do
-            if curl -s http://localhost:8188 > /dev/null 2>&1; then
-              echo "✅ ComfyUI está respondendo!"
-              break
-            fi
-            echo "   Tentativa $i/30..."
-            sleep 2
-          done
-          
-          # Verificar se iniciou
-          if ! curl -s http://localhost:8188 > /dev/null 2>&1; then
-            echo "❌ ComfyUI não iniciou corretamente"
-            echo "📋 Log do ComfyUI:"
-            tail -50 comfyui.log
-            exit 1
+          if [ -n "${{ secrets.COMFYUI_FALLBACK_URL }}" ]; then
+            echo "✅ URL manual encontrada"
+            echo "url=${{ secrets.COMFYUI_FALLBACK_URL }}" >> $GITHUB_OUTPUT
+            echo "source=manual" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ URL manual não configurada"
+            echo "source=gist" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install Cloudflare Tunnel
+      - name: Get URL from Gist (AUTO)
+        id: get-url
+        if: steps.check-manual.outputs.source == 'gist'
         run: |
-          echo "📡 Instalando Cloudflare Tunnel..."
-          wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
+          echo "📖 Obtendo URL do Gist..."
+          python .github/scripts/auto_update_comfyui_url.py
+        env:
+          MODE: read
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMFYUI_URL_GIST_ID: ${{ secrets.COMFYUI_URL_GIST_ID }}
 
-      - name: Expose ComfyUI via Cloudflare
-        id: expose-comfyui
+      - name: Use Manual URL
+        if: steps.check-manual.outputs.source == 'manual'
         run: |
-          echo "🌐 Criando túnel Cloudflare..."
+          echo "url=${{ steps.check-manual.outputs.url }}" >> $GITHUB_OUTPUT
+          echo "✅ Usando URL manual: ${{ steps.check-manual.outputs.url }}"
+
+      - name: Verify ComfyUI is Accessible
+        run: |
+          URL="${{ steps.get-url.outputs.url || steps.check-manual.outputs.url }}"
+          echo "🧪 Verificando ComfyUI: $URL"
           
-          # Verificar ComfyUI antes
-          echo "🔍 Verificando ComfyUI está ativo..."
-          curl -s http://localhost:8188 || echo "⚠️ ComfyUI pode não estar respondendo"
-          
-          # Iniciar cloudflared
-          nohup cloudflared tunnel --url http://localhost:8188 > cloudflared.log 2>&1 &
-          CLOUDFLARED_PID=$!
-          echo "   Cloudflared PID: $CLOUDFLARED_PID"
-          
-          # Aguardar URL ser gerada (aumentado para 3 minutos)
-          echo "⏳ Aguardando URL do Cloudflare..."
-          URL=""
-          for i in {1..90}; do
-            sleep 2
-            
-            # Mostrar progresso a cada 10 tentativas
-            if [ $((i % 10)) -eq 0 ]; then
-              echo "   Tentativa $i/90... (${i}s passados)"
-              echo "   Últimas linhas do log:"
-              tail -3 cloudflared.log
-            fi
-            
-            if grep -q "trycloudflare.com" cloudflared.log; then
-              URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cloudflared.log | head -1)
-              echo "✅ URL gerada: $URL"
-              echo "url=$URL" >> $GITHUB_OUTPUT
-              break
-            fi
-            
-            # Verificar se processo ainda está rodando
-            if ! ps -p $CLOUDFLARED_PID > /dev/null 2>&1; then
-              echo "❌ Cloudflared morreu!"
-              break
-            fi
-          done
-          
-          # Verificar se URL foi capturada
           if [ -z "$URL" ]; then
-            echo "❌ Falha ao obter URL após 180 segundos"
-            echo "📋 Log completo do Cloudflare:"
-            cat cloudflared.log
+            echo "❌ URL não disponível"
             echo ""
-            echo "📋 Processos ativos:"
-            ps aux | grep -E "cloudflared|python"
+            echo "📋 INSTRUÇÕES:"
+            echo "1. Execute o notebook do Colab: https://colab.research.google.com/drive/1bfDjw5JGeqExdsUWYM41txvqlCGzOF99"
+            echo "2. Aguarde o túnel Cloudflare ser criado"
+            echo "3. A URL será enviada automaticamente para o Gist"
+            echo "4. OU configure manualmente: gh secret set COMFYUI_FALLBACK_URL --body 'URL_AQUI'"
             exit 1
           fi
           
-          # Dar mais tempo para túnel estabilizar
-          echo "⏳ Aguardando túnel estabilizar..."
-          sleep 10
-
-      - name: Test ComfyUI Connectivity
-        run: |
-          URL="${{ steps.expose-comfyui.outputs.url }}"
-          echo "🧪 Testando conectividade: $URL"
-          
-          for i in {1..10}; do
-            if curl -f -s "$URL" > /dev/null; then
+          # Testar conectividade
+          for i in {1..5}; do
+            if curl -f -s "$URL" > /dev/null 2>&1; then
               echo "✅ ComfyUI está acessível!"
               exit 0
             fi
-            echo "   Tentativa $i/10..."
+            echo "   Tentativa $i/5..."
             sleep 3
           done
           
-          echo "❌ ComfyUI não está acessível"
+          echo "⚠️ ComfyUI não está respondendo"
+          echo "URL testada: $URL"
           exit 1
-
-      - name: Keep ComfyUI Running
-        run: |
-          echo "🔄 Mantendo ComfyUI ativo para próximos jobs..."
-          # ComfyUI continua rodando em background
-          ps aux | grep python
-          ps aux | grep cloudflared
 
   # Job 2: Update Configuration
   update-config:
     name: Update Configuration
     runs-on: ubuntu-latest
-    needs: start-comfyui
+    needs: get-comfyui-url
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Update ComfyUI URL in configs
         run: |
-          URL="${{ needs.start-comfyui.outputs.comfyui_url }}"
+          URL="${{ needs.get-comfyui-url.outputs.comfyui_url }}"
           echo "🔄 Atualizando configurações com URL: $URL"
           
           # Atualizar .env.example
@@ -178,7 +121,7 @@ jobs:
 
       - name: Update Kubernetes Secret
         run: |
-          URL="${{ needs.start-comfyui.outputs.comfyui_url }}"
+          URL="${{ needs.get-comfyui-url.outputs.comfyui_url }}"
           echo "🔐 URL para K8s: $URL"
           # Secret será usado no próximo job
 
@@ -186,7 +129,7 @@ jobs:
   test-with-comfyui:
     name: Run Tests with ComfyUI
     runs-on: ubuntu-latest
-    needs: [start-comfyui, update-config]
+    needs: [get-comfyui-url, update-config]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -202,7 +145,7 @@ jobs:
 
       - name: Test ComfyUI Integration
         env:
-          COMFYUI_URL: ${{ needs.start-comfyui.outputs.comfyui_url }}
+          COMFYUI_URL: ${{ needs.get-comfyui-url.outputs.comfyui_url }}
         run: |
           echo "🧪 Testando integração com ComfyUI..."
           echo "URL: $COMFYUI_URL"
@@ -234,7 +177,7 @@ jobs:
   deploy-kubernetes:
     name: Deploy to Kubernetes
     runs-on: ubuntu-latest
-    needs: [start-comfyui, test-with-comfyui]
+    needs: [get-comfyui-url, test-with-comfyui]
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout code
@@ -253,7 +196,7 @@ jobs:
 
       - name: Update ComfyUI URL Secret
         env:
-          COMFYUI_URL: ${{ needs.start-comfyui.outputs.comfyui_url }}
+          COMFYUI_URL: ${{ needs.get-comfyui-url.outputs.comfyui_url }}
         run: |
           echo "🔐 Atualizando secret do Kubernetes..."
           kubectl create secret generic comfyui-url-secret \
@@ -285,13 +228,13 @@ jobs:
   notify:
     name: Send Notification
     runs-on: ubuntu-latest
-    needs: [start-comfyui, deploy-kubernetes]
+    needs: [get-comfyui-url, deploy-kubernetes]
     if: always()
     steps:
       - name: Send notification
         run: |
           echo "🎉 Pipeline completo!"
-          echo "ComfyUI URL: ${{ needs.start-comfyui.outputs.comfyui_url }}"
+          echo "ComfyUI URL: ${{ needs.get-comfyui-url.outputs.comfyui_url }}"
           echo "Status: ${{ job.status }}"
           
           # Aqui você pode adicionar notificação por email
