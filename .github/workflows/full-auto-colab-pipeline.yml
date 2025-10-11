@@ -62,6 +62,16 @@ jobs:
           fi
           
           echo "✅ URL válida capturada!"
+          
+          # Salvar URL em arquivo para outros jobs
+          echo "$URL" > comfyui_url.txt
+      
+      - name: Upload URL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfyui-url
+          path: comfyui_url.txt
+          retention-days: 1
 
   # ============================================================
   # JOB 2: Update Configuration (Automated)
@@ -73,10 +83,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      
+      - name: Download URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
 
       - name: Update .env with Colab URL
         run: |
-          URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
+          URL=$(cat comfyui_url.txt)
           echo "📝 Atualizando configurações com URL: $URL"
           
           # Criar/atualizar .env
@@ -96,6 +111,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      
+      - name: Download URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -107,20 +127,18 @@ jobs:
           pip install pytest requests
 
       - name: Test ComfyUI Integration
-        env:
-          COMFYUI_URL: ${{ needs.orchestrate-colab.outputs.comfyui_url }}
         run: |
+          URL=$(cat comfyui_url.txt)
           echo "🧪 Testando integração com ComfyUI..."
-          echo "URL: $COMFYUI_URL"
+          echo "URL: $URL"
           
           # Criar teste
           cat > test_comfyui_auto.py << 'EOF'
-          import os
+          import sys
           import requests
 
-          def test_comfyui_available():
-              url = os.getenv('COMFYUI_URL')
-              assert url, "COMFYUI_URL not set"
+          def test_comfyui_available(url):
+              assert url, "URL not provided"
               
               print(f"🔍 Testando URL: {url}")
               response = requests.get(url, timeout=10)
@@ -128,10 +146,11 @@ jobs:
               print(f"✅ ComfyUI is accessible at {url}")
 
           if __name__ == "__main__":
-              test_comfyui_available()
+              url = sys.argv[1] if len(sys.argv) > 1 else None
+              test_comfyui_available(url)
           EOF
           
-          python test_comfyui_auto.py
+          python test_comfyui_auto.py "$URL"
 
   # ============================================================
   # JOB 4: Generate AI Content (Automated)
