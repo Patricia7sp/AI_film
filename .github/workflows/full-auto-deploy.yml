@@ -21,7 +21,7 @@ jobs:
     name: Get ComfyUI URL from Colab
     runs-on: ubuntu-latest
     outputs:
-      comfyui_url: ${{ steps.get-url.outputs.url }}
+      comfyui_url: ${{ steps.final-url.outputs.url }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -61,12 +61,22 @@ jobs:
       - name: Use Manual URL
         if: steps.check-manual.outputs.source == 'manual'
         run: |
-          echo "url=${{ steps.check-manual.outputs.url }}" >> $GITHUB_OUTPUT
           echo "✅ Usando URL manual: ${{ steps.check-manual.outputs.url }}"
+
+      - name: Set Final URL
+        id: final-url
+        run: |
+          if [ "${{ steps.check-manual.outputs.source }}" = "manual" ]; then
+            URL="${{ steps.check-manual.outputs.url }}"
+          else
+            URL="${{ steps.get-url.outputs.url }}"
+          fi
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "📌 URL final: $URL"
 
       - name: Verify ComfyUI is Accessible
         run: |
-          URL="${{ steps.get-url.outputs.url || steps.check-manual.outputs.url }}"
+          URL="${{ steps.final-url.outputs.url }}"
           echo "🧪 Verificando ComfyUI: $URL"
           
           if [ -z "$URL" ]; then
