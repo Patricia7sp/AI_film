@@ -43,7 +43,8 @@ jobs:
         run: |
           echo "🚀 Iniciando ComfyUI..."
           cd ComfyUI
-          nohup python main.py --listen --port 8188 > comfyui.log 2>&1 &
+          # Forçar uso de CPU (sem GPU no GitHub Actions)
+          nohup python main.py --cpu --listen --port 8188 > comfyui.log 2>&1 &
           
           # Aguardar ComfyUI realmente iniciar
           echo "⏳ Aguardando ComfyUI iniciar..."
