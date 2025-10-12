@@ -336,3 +336,4 @@ Pipfile.lock
 colab-automation-key.json
 colab-automation-key-base64.txt
 *-key.json
+colab-automation-key.json
