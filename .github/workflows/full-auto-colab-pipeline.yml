@@ -40,6 +40,7 @@ jobs:
         id: agent
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOOGLE_COLAB_CREDENTIALS: ${{ secrets.GOOGLE_COLAB_CREDENTIALS }}
           COLAB_NOTEBOOK_ID: ${{ secrets.COLAB_NOTEBOOK_ID }}
           COMFYUI_URL_GIST_ID: ${{ secrets.COMFYUI_URL_GIST_ID }}
           COLAB_TRIGGER_WEBHOOK: ${{ secrets.COLAB_TRIGGER_WEBHOOK }}
