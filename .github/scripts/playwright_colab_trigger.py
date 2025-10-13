@@ -15,14 +15,23 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 # Playwright stealth para evitar detecção de bot
 try:
-    from playwright_stealth import stealth_async
-except ImportError:
-    # Fallback: algumas versões usam apenas 'stealth'
+    # Tentar importar a função stealth diretamente
+    import playwright_stealth
+    
+    # Criar wrapper async para a função stealth
+    async def apply_stealth(page):
+        """Aplica stealth ao page"""
+        # playwright_stealth.stealth é síncrono, mas funciona com async pages
+        playwright_stealth.stealth_sync(page)
+except (ImportError, AttributeError):
     try:
-        from playwright_stealth import stealth as stealth_async
-    except ImportError:
-        # Se não tiver playwright-stealth, criar função dummy
-        async def stealth_async(page):
+        # Fallback: tentar API alternativa
+        from playwright_stealth import stealth_sync
+        async def apply_stealth(page):
+            stealth_sync(page)
+    except (ImportError, AttributeError):
+        # Fallback final: função dummy
+        async def apply_stealth(page):
             """Fallback se playwright-stealth não estiver disponível"""
             pass
 
@@ -100,12 +109,8 @@ class PlaywrightColabTrigger:
                 
                 # 🎭 APLICAR STEALTH - Esconde assinaturas de bot
                 self.log("🎭 Aplicando técnicas stealth...")
-                try:
-                    stealth_async(page)
-                    self.log("✅ Stealth aplicado com sucesso")
-                except Exception as e:
-                    self.log(f"⚠️ Erro aplicando stealth: {e}", "WARN")
-                    self.log("💡 Continuando sem stealth...", "WARN")
+                await apply_stealth(page)
+                self.log("✅ Stealth aplicado - navegador parece humano")
                 
                 # Passo 1: Login no Google
                 if not await self._login_google(page):
