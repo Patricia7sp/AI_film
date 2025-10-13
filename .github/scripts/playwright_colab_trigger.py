@@ -100,8 +100,12 @@ class PlaywrightColabTrigger:
                 
                 # 🎭 APLICAR STEALTH - Esconde assinaturas de bot
                 self.log("🎭 Aplicando técnicas stealth...")
-                await stealth_async(page)
-                self.log("✅ Stealth aplicado - navegador parece humano")
+                try:
+                    stealth_async(page)
+                    self.log("✅ Stealth aplicado com sucesso")
+                except Exception as e:
+                    self.log(f"⚠️ Erro aplicando stealth: {e}", "WARN")
+                    self.log("💡 Continuando sem stealth...", "WARN")
                 
                 # Passo 1: Login no Google
                 if not await self._login_google(page):
