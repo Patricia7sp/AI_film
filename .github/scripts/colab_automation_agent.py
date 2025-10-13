@@ -59,27 +59,59 @@ class ColabAutomationAgent:
         try:
             import subprocess
             
+            self.log("=" * 60)
+            self.log("🔍 VALIDAÇÃO DE CREDENCIAIS PARA PLAYWRIGHT")
+            self.log("=" * 60)
+            
             # Verificar se temos credenciais Google
             google_email = os.getenv('GOOGLE_EMAIL')
             google_password = os.getenv('GOOGLE_PASSWORD')
             
-            if not google_email or not google_password:
-                self.log("⚠️ GOOGLE_EMAIL ou GOOGLE_PASSWORD não configurados", "WARN")
-                self.log("💡 Pulando método Playwright")
+            # Log detalhado de validação
+            self.log(f"📧 GOOGLE_EMAIL: {'✅ Configurado' if google_email else '❌ NÃO CONFIGURADO'}")
+            if google_email:
+                # Mostrar parte do email para debug (mascarar parte sensível)
+                masked_email = google_email[:3] + "***" + google_email[google_email.find('@'):] if '@' in google_email else "***"
+                self.log(f"   Email (masked): {masked_email}")
+            
+            self.log(f"🔑 GOOGLE_PASSWORD: {'✅ Configurado' if google_password else '❌ NÃO CONFIGURADO'}")
+            if google_password:
+                self.log(f"   Tamanho: {len(google_password)} caracteres")
+            
+            self.log(f"📓 COLAB_NOTEBOOK_ID: {'✅ Configurado' if self.colab_notebook_id else '❌ NÃO CONFIGURADO'}")
+            if self.colab_notebook_id:
+                self.log(f"   ID: {self.colab_notebook_id}")
+            
+            # Validar credenciais
+            if not google_email:
+                self.log("❌ GOOGLE_EMAIL não configurado", "ERROR")
+                self.log("💡 Configure o secret GOOGLE_EMAIL no GitHub", "WARN")
+                return False
+                
+            if not google_password:
+                self.log("❌ GOOGLE_PASSWORD não configurado", "ERROR")
+                self.log("💡 Configure o secret GOOGLE_PASSWORD no GitHub", "WARN")
                 return False
             
             if not self.colab_notebook_id:
-                self.log("⚠️ COLAB_NOTEBOOK_ID não configurado", "WARN")
+                self.log("❌ COLAB_NOTEBOOK_ID não configurado", "ERROR")
                 return False
             
+            self.log("=" * 60)
             self.log("🎭 Iniciando Colab via Playwright...")
+            self.log("=" * 60)
             
             # Executar script Playwright
             playwright_script = ".github/scripts/playwright_colab_trigger.py"
             
             if not os.path.exists(playwright_script):
-                self.log(f"⚠️ Script Playwright não encontrado: {playwright_script}", "WARN")
+                self.log(f"❌ Script Playwright não encontrado: {playwright_script}", "ERROR")
                 return False
+            
+            self.log(f"📄 Script encontrado: {playwright_script}")
+            self.log(f"🐍 Python: {sys.executable}")
+            self.log("⏳ Executando Playwright (timeout: 5 minutos)...")
+            self.log("")
             
             # Executar em subprocesso
             result = subprocess.run(
@@ -89,19 +121,45 @@ class ColabAutomationAgent:
                 timeout=300  # 5 minutos timeout
             )
             
+            self.log("=" * 60)
+            self.log("📊 RESULTADO DO PLAYWRIGHT")
+            self.log("=" * 60)
+            self.log(f"Return Code: {result.returncode}")
+            
+            # Mostrar STDOUT (logs do Playwright)
+            if result.stdout:
+                self.log("📤 STDOUT:")
+                for line in result.stdout.strip().split('\n'):
+                    self.log(f"   {line}")
+            else:
+                self.log("📤 STDOUT: (vazio)")
+            
+            # Mostrar STDERR (erros do Playwright)
+            if result.stderr:
+                self.log("📥 STDERR:")
+                for line in result.stderr.strip().split('\n'):
+                    self.log(f"   {line}")
+            else:
+                self.log("📥 STDERR: (vazio)")
+            
+            self.log("=" * 60)
+            
             if result.returncode == 0:
                 self.log("✅ Playwright executou notebook com sucesso!")
                 self.log("📡 Notebook está rodando, aguardando URL no Gist...")
                 return True
             else:
-                self.log(f"⚠️ Playwright falhou: {result.stderr}", "WARN")
+                self.log(f"❌ Playwright falhou com código: {result.returncode}", "ERROR")
                 return False
                 
         except subprocess.TimeoutExpired:
-            self.log("⚠️ Playwright timeout (5 minutos)", "WARN")
+            self.log("❌ Playwright timeout (5 minutos)", "ERROR")
+            self.log("⚠️ Processo demorou mais que o esperado", "WARN")
             return False
         except Exception as e:
-            self.log(f"⚠️ Erro no método Playwright: {e}", "WARN")
+            self.log(f"❌ Erro no método Playwright: {e}", "ERROR")
+            import traceback
+            self.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             return False
     
     def _trigger_via_google_api(self) -> bool:

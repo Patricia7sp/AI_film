@@ -94,19 +94,37 @@ class PlaywrightColabTrigger:
     
     def _validate_config(self) -> bool:
         """Valida configuração necessária"""
+        self.log("=" * 60)
+        self.log("🔍 VALIDANDO CONFIGURAÇÃO")
+        self.log("=" * 60)
+        
         if not self.google_email:
             self.log("❌ GOOGLE_EMAIL não configurado", "ERROR")
+            self.log("💡 Defina a variável de ambiente GOOGLE_EMAIL", "WARN")
             return False
+        else:
+            # Mascarar email para segurança
+            masked_email = self.google_email[:3] + "***" + self.google_email[self.google_email.find('@'):] if '@' in self.google_email else "***"
+            self.log(f"✅ GOOGLE_EMAIL: {masked_email}")
         
         if not self.google_password:
             self.log("❌ GOOGLE_PASSWORD não configurado", "ERROR")
+            self.log("💡 Defina a variável de ambiente GOOGLE_PASSWORD", "WARN")
             return False
+        else:
+            self.log(f"✅ GOOGLE_PASSWORD: {'*' * len(self.google_password)} ({len(self.google_password)} chars)")
         
         if not self.notebook_id:
             self.log("❌ COLAB_NOTEBOOK_ID não configurado", "ERROR")
+            self.log("💡 Defina a variável de ambiente COLAB_NOTEBOOK_ID", "WARN")
             return False
+        else:
+            self.log(f"✅ COLAB_NOTEBOOK_ID: {self.notebook_id}")
         
-        self.log("✅ Configuração validada")
+        self.log(f"✅ Headless Mode: {self.headless}")
+        self.log(f"✅ Timeout: {self.timeout}ms")
+        self.log("=" * 60)
+        self.log("✅ Todas as configurações validadas!")
         return True
     
     async def _launch_browser(self, playwright):
@@ -131,34 +149,125 @@ class PlaywrightColabTrigger:
         Faz login no Google
         """
         try:
-            self.log("🔐 Fazendo login no Google...")
+            self.log("=" * 60)
+            self.log("🔐 INICIANDO LOGIN NO GOOGLE")
+            self.log("=" * 60)
             
             # Ir para página de login
-            await page.goto('https://accounts.google.com/signin', wait_until='networkidle')
+            self.log("🌐 Navegando para página de login...")
+            self.log("   URL: https://accounts.google.com/signin")
+            
+            try:
+                await page.goto('https://accounts.google.com/signin', wait_until='networkidle', timeout=30000)
+                self.log("✅ Página de login carregada")
+            except Exception as e:
+                self.log(f"❌ Erro ao carregar página de login: {e}", "ERROR")
+                return False
             
             # Passo 1: Email
-            self.log("📧 Inserindo email...")
-            await page.fill('input[type="email"]', self.google_email)
-            await page.click('button:has-text("Next"), button:has-text("Próxima")')
-            await page.wait_for_timeout(2000)
+            self.log("")
+            self.log("📧 PASSO 1: Inserindo email...")
+            
+            try:
+                # Aguardar campo de email aparecer
+                await page.wait_for_selector('input[type="email"]', timeout=10000)
+                self.log("✅ Campo de email encontrado")
+                
+                # Preencher email
+                await page.fill('input[type="email"]', self.google_email)
+                masked_email = self.google_email[:3] + "***" + self.google_email[self.google_email.find('@'):]
+                self.log(f"✅ Email preenchido: {masked_email}")
+                
+                # Clicar em "Next"/"Próxima"
+                self.log("🖱️ Clicando em 'Next'...")
+                await page.click('button:has-text("Next"), button:has-text("Próxima")')
+                self.log("✅ Botão 'Next' clicado")
+                
+                # Aguardar navegação
+                await page.wait_for_timeout(3000)
+                
+            except Exception as e:
+                self.log(f"❌ Erro no passo do email: {e}", "ERROR")
+                # Capturar screenshot para debug
+                try:
+                    await page.screenshot(path='/tmp/playwright_email_error.png')
+                    self.log("📸 Screenshot salvo: /tmp/playwright_email_error.png")
+                except:
+                    pass
+                return False
             
             # Passo 2: Senha
-            self.log("🔑 Inserindo senha...")
-            await page.fill('input[type="password"]', self.google_password)
-            await page.click('button:has-text("Next"), button:has-text("Próxima")')
+            self.log("")
+            self.log("🔑 PASSO 2: Inserindo senha...")
+            
+            try:
+                # Aguardar campo de senha aparecer
+                await page.wait_for_selector('input[type="password"]', timeout=10000)
+                self.log("✅ Campo de senha encontrado")
+                
+                # Preencher senha
+                await page.fill('input[type="password"]', self.google_password)
+                self.log(f"✅ Senha preenchida ({len(self.google_password)} caracteres)")
+                
+                # Clicar em "Next"/"Próxima"
+                self.log("🖱️ Clicando em 'Next'...")
+                await page.click('button:has-text("Next"), button:has-text("Próxima")')
+                self.log("✅ Botão 'Next' clicado")
+                
+            except Exception as e:
+                self.log(f"❌ Erro no passo da senha: {e}", "ERROR")
+                # Capturar screenshot para debug
+                try:
+                    await page.screenshot(path='/tmp/playwright_password_error.png')
+                    self.log("📸 Screenshot salvo: /tmp/playwright_password_error.png")
+                except:
+                    pass
+                return False
             
             # Aguardar login completar
-            await page.wait_for_url('https://myaccount.google.com/**', timeout=30000)
+            self.log("")
+            self.log("⏳ Aguardando login completar...")
             
-            self.log("✅ Login realizado com sucesso!")
-            return True
+            try:
+                # Aguardar redirecionamento para conta Google ou aceitar página
+                await page.wait_for_timeout(5000)
+                
+                current_url = page.url
+                self.log(f"📍 URL atual: {current_url}")
+                
+                # Verificar se login foi bem-sucedido
+                if 'myaccount.google.com' in current_url or 'accounts.google.com' in current_url:
+                    self.log("=" * 60)
+                    self.log("✅ LOGIN REALIZADO COM SUCESSO!")
+                    self.log("=" * 60)
+                    return True
+                else:
+                    self.log("⚠️ URL inesperada após login", "WARN")
+                    return True  # Continuar mesmo assim
+                    
+            except Exception as e:
+                self.log(f"⚠️ Erro ao verificar login: {e}", "WARN")
+                # Mesmo com erro, tentar continuar
+                return True
             
         except PlaywrightTimeout:
-            self.log("⚠️ Timeout no login - pode ter 2FA ativado", "WARN")
-            self.log("💡 Considere usar Service Account ao invés de login manual")
+            self.log("=" * 60)
+            self.log("❌ TIMEOUT NO LOGIN", "ERROR")
+            self.log("=" * 60)
+            self.log("⚠️ Possíveis causas:", "WARN")
+            self.log("   1. Verificação em 2 etapas (2FA) ativada")
+            self.log("   2. Credenciais incorretas")
+            self.log("   3. Google bloqueou login automático")
+            self.log("   4. Conexão lenta")
+            self.log("💡 Solução: Use Service Account ao invés de login manual")
             return False
+            
         except Exception as e:
-            self.log(f"❌ Erro no login: {e}", "ERROR")
+            self.log("=" * 60)
+            self.log(f"❌ ERRO GERAL NO LOGIN: {e}", "ERROR")
+            self.log("=" * 60)
+            import traceback
+            self.log(f"Traceback:\n{traceback.format_exc()}")
             return False
     
     async def _open_notebook(self, page) -> bool:
@@ -166,19 +275,43 @@ class PlaywrightColabTrigger:
         Abre notebook no Colab
         """
         try:
-            self.log("📓 Abrindo notebook no Colab...")
+            self.log("")
+            self.log("=" * 60)
+            self.log("📓 ABRINDO NOTEBOOK NO COLAB")
+            self.log("=" * 60)
             
             notebook_url = f"https://colab.research.google.com/drive/{self.notebook_id}"
-            await page.goto(notebook_url, wait_until='networkidle')
+            self.log(f"🌐 URL: {notebook_url}")
+            
+            try:
+                self.log("⏳ Navegando para notebook...")
+                await page.goto(notebook_url, wait_until='networkidle', timeout=60000)
+                self.log("✅ Página do notebook carregada")
+            except Exception as e:
+                self.log(f"❌ Erro ao navegar para notebook: {e}", "ERROR")
+                return False
             
             # Aguardar notebook carregar
-            await page.wait_for_selector('.notebook-container, #notebook', timeout=30000)
+            self.log("⏳ Aguardando notebook inicializar...")
+            try:
+                await page.wait_for_selector('.notebook-container, #notebook, colab-notebook', timeout=30000)
+                self.log("✅ Notebook inicializado!")
+            except Exception as e:
+                self.log(f"⚠️ Timeout aguardando notebook: {e}", "WARN")
+                # Tentar continuar mesmo assim
+                self.log("💡 Tentando continuar...")
             
-            self.log("✅ Notebook carregado!")
+            self.log("=" * 60)
+            self.log("✅ NOTEBOOK CARREGADO COM SUCESSO!")
+            self.log("=" * 60)
             return True
             
         except Exception as e:
-            self.log(f"❌ Erro ao abrir notebook: {e}", "ERROR")
+            self.log("=" * 60)
+            self.log(f"❌ ERRO AO ABRIR NOTEBOOK: {e}", "ERROR")
+            self.log("=" * 60)
+            import traceback
+            self.log(f"Traceback:\n{traceback.format_exc()}")
             return False
     
     async def _connect_runtime(self, page) -> bool:
@@ -186,7 +319,10 @@ class PlaywrightColabTrigger:
         Conecta ao runtime do Colab (GPU)
         """
         try:
-            self.log("🔌 Conectando ao runtime...")
+            self.log("")
+            self.log("=" * 60)
+            self.log("🔌 CONECTANDO AO RUNTIME")
+            self.log("=" * 60)
             
             # Procurar botão de conectar
             connect_selectors = [
@@ -196,30 +332,47 @@ class PlaywrightColabTrigger:
                 '#connect'
             ]
             
+            self.log("🔍 Procurando botão 'Connect'...")
+            button_found = False
+            
             for selector in connect_selectors:
                 try:
+                    self.log(f"   Tentando: {selector}")
                     await page.click(selector, timeout=5000)
-                    self.log(f"✅ Clicou em conectar: {selector}")
+                    self.log(f"✅ Botão encontrado e clicado: {selector}")
+                    button_found = True
                     break
                 except:
+                    self.log(f"   ⚠️ Não encontrado: {selector}")
                     continue
             
+            if not button_found:
+                self.log("⚠️ Botão 'Connect' não encontrado", "WARN")
+                self.log("💡 Possível que já esteja conectado")
+            
             # Aguardar conexão estabelecer
-            self.log("⏳ Aguardando runtime conectar...")
+            self.log("⏳ Aguardando runtime conectar (10s)...")
             await page.wait_for_timeout(10000)
             
             # Verificar se conectou (procurar indicador de RAM/Disk)
+            self.log("🔍 Verificando se runtime conectou...")
             try:
-                await page.wait_for_selector('text=/RAM|Disk/', timeout=20000)
-                self.log("✅ Runtime conectado!")
+                await page.wait_for_selector('text=/RAM|Disk|GPU/', timeout=20000)
+                self.log("=" * 60)
+                self.log("✅ RUNTIME CONECTADO COM SUCESSO!")
+                self.log("=" * 60)
                 return True
             except:
-                self.log("⚠️ Não foi possível confirmar conexão, mas continuando...", "WARN")
+                self.log("⚠️ Não foi possível confirmar conexão visual", "WARN")
+                self.log("💡 Mas continuando mesmo assim...")
+                self.log("=" * 60)
                 return True
             
         except Exception as e:
-            self.log(f"⚠️ Erro ao conectar runtime: {e}", "WARN")
-            self.log("💡 Continuando mesmo assim...")
+            self.log("=" * 60)
+            self.log(f"⚠️ ERRO AO CONECTAR RUNTIME: {e}", "WARN")
+            self.log("=" * 60)
+            self.log("💡 Continuando execução...")
             return True
     
     async def _execute_all_cells(self, page) -> bool:
@@ -227,40 +380,62 @@ class PlaywrightColabTrigger:
         Executa todas as células do notebook
         """
         try:
-            self.log("▶️ Executando todas as células...")
+            self.log("")
+            self.log("=" * 60)
+            self.log("▶️ EXECUTANDO TODAS AS CÉLULAS")
+            self.log("=" * 60)
             
             # Método 1: Menu Runtime > Run all
+            self.log("🔍 MÉTODO 1: Tentando via menu Runtime...")
             try:
-                await page.click('text=/Runtime|Ambiente de execução/')
+                self.log("   Clicando em 'Runtime'...")
+                await page.click('text=/Runtime|Ambiente de execução/', timeout=5000)
                 await page.wait_for_timeout(1000)
-                await page.click('text=/Run all|Executar tudo/')
-                self.log("✅ Executou via menu")
+                
+                self.log("   Clicando em 'Run all'...")
+                await page.click('text=/Run all|Executar tudo/', timeout=5000)
+                
+                self.log("=" * 60)
+                self.log("✅ EXECUTADO VIA MENU (Runtime > Run all)")
+                self.log("=" * 60)
                 return True
-            except:
-                pass
+            except Exception as e:
+                self.log(f"   ⚠️ Método 1 falhou: {e}")
             
             # Método 2: Atalho de teclado Ctrl+F9
+            self.log("🔍 MÉTODO 2: Tentando via atalho Ctrl+F9...")
             try:
                 await page.keyboard.press('Control+F9')
-                self.log("✅ Executou via atalho (Ctrl+F9)")
+                await page.wait_for_timeout(2000)
+                
+                self.log("=" * 60)
+                self.log("✅ EXECUTADO VIA ATALHO (Ctrl+F9)")
+                self.log("=" * 60)
                 return True
-            except:
-                pass
+            except Exception as e:
+                self.log(f"   ⚠️ Método 2 falhou: {e}")
             
             # Método 3: Clicar em cada célula
+            self.log("🔍 MÉTODO 3: Tentando executar células manualmente...")
             try:
-                cells = await page.query_selector_all('.cell')
-                self.log(f"📋 Encontradas {len(cells)} células")
+                cells = await page.query_selector_all('.cell, colab-cell')
+                self.log(f"   📋 Encontradas {len(cells)} células")
                 
-                for i, cell in enumerate(cells):
-                    await cell.click()
-                    await page.keyboard.press('Shift+Enter')
-                    await page.wait_for_timeout(500)
-                
-                self.log("✅ Executou todas as células manualmente")
-                return True
-            except:
-                pass
+                if len(cells) == 0:
+                    self.log("   ⚠️ Nenhuma célula encontrada")
+                else:
+                    for i, cell in enumerate(cells):
+                        self.log(f"   ▶️ Executando célula {i+1}/{len(cells)}")
+                        await cell.click()
+                        await page.keyboard.press('Shift+Enter')
+                        await page.wait_for_timeout(500)
+                    
+                    self.log("=" * 60)
+                    self.log(f"✅ EXECUTADAS {len(cells)} CÉLULAS MANUALMENTE")
+                    self.log("=" * 60)
+                    return True
+            except Exception as e:
+                self.log(f"   ⚠️ Método 3 falhou: {e}")
             
             self.log("⚠️ Não foi possível executar células", "WARN")
             return False
