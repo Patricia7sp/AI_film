@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Playwright Colab Trigger
-Inicia Google Colab automaticamente usando Playwright
-Mais moderno e confiável que Selenium
+Playwright Colab Trigger (STEALTH MODE)
+Inicia Google Colab automaticamente usando Playwright + Stealth
+Evita detecção de bot pelo Google
 """
 
 import os
 import sys
 import time
 import asyncio
+import random
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright_stealth import stealth_async
 
 
 class PlaywrightColabTrigger:
@@ -24,6 +26,18 @@ class PlaywrightColabTrigger:
         self.notebook_id = os.getenv('COLAB_NOTEBOOK_ID')
         self.headless = os.getenv('HEADLESS', 'true').lower() == 'true'
         self.timeout = 60000  # 60 segundos
+    
+    async def _human_delay(self, min_ms=500, max_ms=2000):
+        """Delay aleatório para parecer humano"""
+        delay = random.randint(min_ms, max_ms)
+        await asyncio.sleep(delay / 1000)
+    
+    async def _human_type(self, page, selector, text):
+        """Digita texto de forma humana (char por char com delay)"""
+        element = await page.wait_for_selector(selector)
+        for char in text:
+            await element.type(char, delay=random.randint(50, 150))
+        await self._human_delay(300, 800)
     
     def log(self, message: str, level: str = "INFO"):
         """Log estruturado"""
@@ -45,13 +59,37 @@ class PlaywrightColabTrigger:
                 # Iniciar navegador
                 browser = await self._launch_browser(p)
                 
-                # Criar contexto com cookies persistentes
+                # User agent real e atualizado
+                user_agent = (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                )
+                
+                # Criar contexto com configurações que parecem humanas
                 context = await browser.new_context(
                     viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    user_agent=user_agent,
+                    locale='en-US',
+                    timezone_id='America/New_York',
+                    permissions=['geolocation', 'notifications'],
+                    geolocation={'latitude': 40.7128, 'longitude': -74.0060},  # NYC
+                    extra_http_headers={
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'DNT': '1',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1'
+                    }
                 )
                 
                 page = await context.new_page()
+                
+                # 🎭 APLICAR STEALTH - Esconde assinaturas de bot
+                self.log("🎭 Aplicando técnicas stealth...")
+                await stealth_async(page)
+                self.log("✅ Stealth aplicado - navegador parece humano")
                 
                 # Passo 1: Login no Google
                 if not await self._login_google(page):
@@ -128,8 +166,15 @@ class PlaywrightColabTrigger:
         return True
     
     async def _launch_browser(self, playwright):
-        """Inicia navegador Chromium"""
-        self.log("🌐 Iniciando navegador Chromium...")
+        """Inicia navegador Chromium com STEALTH"""
+        self.log("🌐 Iniciando navegador Chromium (STEALTH MODE)...")
+        
+        # User agent real e atualizado
+        user_agent = (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        )
         
         browser = await playwright.chromium.launch(
             headless=self.headless,
@@ -137,11 +182,15 @@ class PlaywrightColabTrigger:
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu'
+                '--disable-blink-features=AutomationControlled',  # Hide automation
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--flag-switches-begin',
+                '--disable-web-security',
+                '--flag-switches-end'
             ]
         )
         
-        self.log("✅ Navegador iniciado")
+        self.log("✅ Navegador iniciado com stealth")
         return browser
     
     async def _login_google(self, page) -> bool:
@@ -173,18 +222,25 @@ class PlaywrightColabTrigger:
                 await page.wait_for_selector('input[type="email"]', timeout=10000)
                 self.log("✅ Campo de email encontrado")
                 
-                # Preencher email
-                await page.fill('input[type="email"]', self.google_email)
+                # Delay humano antes de clicar
+                await self._human_delay(800, 1500)
+                
+                # Preencher email COM DIGITAÇÃO HUMANA (char por char)
+                self.log("⌨️ Digitando email como humano...")
+                await self._human_type(page, 'input[type="email"]', self.google_email)
                 masked_email = self.google_email[:3] + "***" + self.google_email[self.google_email.find('@'):]
-                self.log(f"✅ Email preenchido: {masked_email}")
+                self.log(f"✅ Email digitado: {masked_email}")
+                
+                # Delay humano antes de clicar Next
+                await self._human_delay(500, 1200)
                 
                 # Clicar em "Next"/"Próxima"
                 self.log("🖱️ Clicando em 'Next'...")
                 await page.click('button:has-text("Next"), button:has-text("Próxima")')
                 self.log("✅ Botão 'Next' clicado")
                 
-                # Aguardar navegação
-                await page.wait_for_timeout(3000)
+                # Aguardar navegação com delay humano
+                await self._human_delay(2000, 4000)
                 
             except Exception as e:
                 self.log(f"❌ Erro no passo do email: {e}", "ERROR")
@@ -201,13 +257,20 @@ class PlaywrightColabTrigger:
             self.log("🔑 PASSO 2: Inserindo senha...")
             
             try:
-                # Aguardar campo de senha aparecer
-                await page.wait_for_selector('input[type="password"]', timeout=10000)
+                # Aguardar campo de senha aparecer (aumentado para 15s)
+                await page.wait_for_selector('input[type="password"]', timeout=15000)
                 self.log("✅ Campo de senha encontrado")
                 
-                # Preencher senha
-                await page.fill('input[type="password"]', self.google_password)
-                self.log(f"✅ Senha preenchida ({len(self.google_password)} caracteres)")
+                # Delay humano antes de digitar
+                await self._human_delay(1000, 2000)
+                
+                # Preencher senha COM DIGITAÇÃO HUMANA
+                self.log("⌨️ Digitando senha como humano...")
+                await self._human_type(page, 'input[type="password"]', self.google_password)
+                self.log(f"✅ Senha digitada ({len(self.google_password)} caracteres)")
+                
+                # Delay humano antes de clicar Next
+                await self._human_delay(800, 1500)
                 
                 # Clicar em "Next"/"Próxima"
                 self.log("🖱️ Clicando em 'Next'...")
