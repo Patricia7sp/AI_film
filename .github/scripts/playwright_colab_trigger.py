@@ -12,7 +12,19 @@ import asyncio
 import random
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import stealth_async
+
+# Playwright stealth para evitar detecção de bot
+try:
+    from playwright_stealth import stealth_async
+except ImportError:
+    # Fallback: algumas versões usam apenas 'stealth'
+    try:
+        from playwright_stealth import stealth as stealth_async
+    except ImportError:
+        # Se não tiver playwright-stealth, criar função dummy
+        async def stealth_async(page):
+            """Fallback se playwright-stealth não estiver disponível"""
+            pass
 
 
 class PlaywrightColabTrigger:
