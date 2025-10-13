@@ -98,11 +98,11 @@ class ColabAutomationAgent:
                 return False
             
             self.log("=" * 60)
-            self.log("🎭 Iniciando Colab via Playwright...")
+            self.log("🎭 Iniciando Colab via Playwright AVANÇADO...")
             self.log("=" * 60)
             
-            # Executar script Playwright
-            playwright_script = ".github/scripts/playwright_colab_trigger.py"
+            # Executar script Playwright AVANÇADO (com stealth manual)
+            playwright_script = ".github/scripts/advanced_playwright_colab.py"
             
             if not os.path.exists(playwright_script):
                 self.log(f"❌ Script Playwright não encontrado: {playwright_script}", "ERROR")
