@@ -34,12 +34,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests
+          pip install requests playwright
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: 🤖 Run Colab Automation Agent
         id: agent
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
+          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
           GOOGLE_COLAB_CREDENTIALS: ${{ secrets.GOOGLE_COLAB_CREDENTIALS }}
           COLAB_NOTEBOOK_ID: ${{ secrets.COLAB_NOTEBOOK_ID }}
           COMFYUI_URL_GIST_ID: ${{ secrets.COMFYUI_URL_GIST_ID }}

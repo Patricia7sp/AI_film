@@ -29,28 +29,85 @@ class ColabAutomationAgent:
         print(f"[{timestamp}] [{level}] {message}")
     def trigger_colab_execution(self) -> bool:
         """
-        Trigger Colab notebook execution via Google Drive API
-        Usa credenciais OAuth2 para iniciar notebook automaticamente
+        Trigger Colab notebook execution
+        Tenta múltiplos métodos em ordem de preferência
         """
         self.log("🚀 Iniciando execução do Colab notebook...")
         
-        # Tentar método 1: Google Colab API (via credentials)
+        # Método 1: Playwright (RECOMENDADO - Executa notebook automaticamente)
+        if self._trigger_via_playwright():
+            return True
+        
+        # Método 2: Google API (apenas autentica, não executa)
         if self._trigger_via_google_api():
             return True
         
-        # Tentar método 2: Webhook
+        # Método 3: Webhook
         if self._trigger_via_webhook():
             return True
         
-        # Método 3: Assumir que Colab já está rodando
+        # Método 4: Assumir que Colab já está rodando
         self.log("⚠️ Nenhum método de trigger funcionou", "WARN")
         self.log("💡 Assumindo que Colab já está rodando manualmente")
         return True
     
+    def _trigger_via_playwright(self) -> bool:
+        """
+        Método 1: Trigger via Playwright (RECOMENDADO)
+        Executa notebook Colab automaticamente usando browser automation
+        """
+        try:
+            import subprocess
+            
+            # Verificar se temos credenciais Google
+            google_email = os.getenv('GOOGLE_EMAIL')
+            google_password = os.getenv('GOOGLE_PASSWORD')
+            
+            if not google_email or not google_password:
+                self.log("⚠️ GOOGLE_EMAIL ou GOOGLE_PASSWORD não configurados", "WARN")
+                self.log("💡 Pulando método Playwright")
+                return False
+            
+            if not self.colab_notebook_id:
+                self.log("⚠️ COLAB_NOTEBOOK_ID não configurado", "WARN")
+                return False
+            
+            self.log("🎭 Iniciando Colab via Playwright...")
+            
+            # Executar script Playwright
+            playwright_script = ".github/scripts/playwright_colab_trigger.py"
+            
+            if not os.path.exists(playwright_script):
+                self.log(f"⚠️ Script Playwright não encontrado: {playwright_script}", "WARN")
+                return False
+            
+            # Executar em subprocesso
+            result = subprocess.run(
+                [sys.executable, playwright_script],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minutos timeout
+            )
+            
+            if result.returncode == 0:
+                self.log("✅ Playwright executou notebook com sucesso!")
+                self.log("📡 Notebook está rodando, aguardando URL no Gist...")
+                return True
+            else:
+                self.log(f"⚠️ Playwright falhou: {result.stderr}", "WARN")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.log("⚠️ Playwright timeout (5 minutos)", "WARN")
+            return False
+        except Exception as e:
+            self.log(f"⚠️ Erro no método Playwright: {e}", "WARN")
+            return False
+    
     def _trigger_via_google_api(self) -> bool:
         """
-        Método 1: Trigger via Google Colab API
-        Usa GOOGLE_COLAB_CREDENTIALS para autenticar
+        Método 2: Trigger via Google Colab API
+        Usa GOOGLE_COLAB_CREDENTIALS para autenticar (apenas valida, não executa)
         """
         try:
             import base64
