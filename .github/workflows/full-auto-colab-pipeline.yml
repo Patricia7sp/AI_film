@@ -161,6 +161,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          pip install requests
           pip install -r requirements.txt || echo "requirements.txt not found"
 
       - name: 🎬 Run AI Film Pipeline
