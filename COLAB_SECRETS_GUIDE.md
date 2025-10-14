@@ -78,8 +78,8 @@ import os
 # 1. Token do GitHub (que você acabou de criar)
 os.environ["GITHUB_TOKEN"] = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # ← COLE SEU TOKEN AQUI
 
-# 2. ID do Gist (copie da secret COMFYUI_URL_GIST_ID)
-os.environ["COMFYUI_URL_GIST_ID"] = "abc123def456"  # ← COLE O ID DO GIST AQUI
+# 2. ID do Gist (CRIADO AUTOMATICAMENTE PARA VOCÊ!)
+os.environ["COMFYUI_URL_GIST_ID"] = "2ba46d9b8484d4e13a292bde736e71ed"  # ✅ SEU GIST ID
 
 # 3. Repositório (já está correto)
 # Não precisa definir, usaremos direto no código
