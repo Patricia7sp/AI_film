@@ -170,8 +170,8 @@ jobs:
           echo "🎬 Iniciando pipeline de geração de conteúdo..."
           echo "URL do ComfyUI: $COMFYUI_URL"
           
-          # Aqui você pode chamar seu pipeline principal
-          # Exemplo: python run_pipeline.py --comfyui-url "$COMFYUI_URL"
+          # Executar pipeline real
+          python .github/scripts/run_ai_pipeline.py
           
           echo "✅ Pipeline de conteúdo executado!"
 
