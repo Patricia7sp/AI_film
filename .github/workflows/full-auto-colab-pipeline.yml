@@ -9,6 +9,8 @@ on:
         description: 'Force Colab restart'
         required: false
         default: 'false'
+  repository_dispatch:
+    types: [colab-ready]
 
 env:
   PYTHON_VERSION: '3.11'
