@@ -46,12 +46,20 @@ jobs:
           COMFYUI_URL_GIST_ID: ${{ secrets.COMFYUI_URL_GIST_ID }}
           COLAB_TRIGGER_WEBHOOK: ${{ secrets.COLAB_TRIGGER_WEBHOOK }}
           COMFYUI_FALLBACK_URL: ${{ secrets.COMFYUI_FALLBACK_URL }}
+          DISPATCH_COMFYUI_URL: ${{ github.event.client_payload.comfyui_url }}
         run: |
-          echo "🤖 Iniciando Agente de Automação do Colab..."
-          python .github/scripts/colab_automation_agent.py
-          
-          # Agente exporta URL automaticamente via GITHUB_OUTPUT
-          echo "✅ Agente executado com sucesso!"
+          # Se disparado via repository_dispatch com URL no payload, usar diretamente
+          if [ ! -z "$DISPATCH_COMFYUI_URL" ]; then
+            echo "🎯 Disparado via repository_dispatch!"
+            echo "📝 URL recebida do Colab: $DISPATCH_COMFYUI_URL"
+            echo "comfyui_url=$DISPATCH_COMFYUI_URL" >> $GITHUB_OUTPUT
+            echo "status=ready" >> $GITHUB_OUTPUT
+            echo "✅ URL do Colab configurada diretamente!"
+          else
+            echo "🤖 Iniciando Agente de Automação do Colab..."
+            python .github/scripts/colab_automation_agent.py
+            echo "✅ Agente executado com sucesso!"
+          fi
 
       - name: Verify URL captured
         run: |
