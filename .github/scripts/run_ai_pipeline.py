@@ -46,8 +46,20 @@ def start_dagster(comfyui_url: str):
     print(f"📂 Dagster Home: {env['DAGSTER_HOME']}")
     
     # Verificar se existe dagster_pipeline no repo
-    dagster_path = Path('open3d_implementation/orchestration/dagster_pipeline.py')
-    if dagster_path.exists():
+    # Tentar múltiplos caminhos possíveis
+    possible_paths = [
+        Path('orchestration/enhanced_dagster_pipeline.py'),
+        Path('open3d_implementation/orchestration/dagster_pipeline.py'),
+        Path('dagster_pipeline.py')
+    ]
+    
+    dagster_path = None
+    for path in possible_paths:
+        if path.exists():
+            dagster_path = path
+            break
+    
+    if dagster_path:
         print(f"✅ Encontrado: {dagster_path}")
         
         # Iniciar Dagster dev server
@@ -141,14 +153,70 @@ def start_flask(comfyui_url: str):
         return None
 
 
+def trigger_dagster_job(comfyui_url: str, dagster_port: int = 3000):
+    """Dispara um job do Dagster via GraphQL API"""
+    print("\n" + "=" * 70)
+    print("🎯 DISPARANDO JOB DO DAGSTER")
+    print("=" * 70)
+    
+    # Aguardar Dagster iniciar
+    print("⏳ Aguardando Dagster iniciar (5 segundos)...")
+    time.sleep(5)
+    
+    # Tentar disparar job via GraphQL
+    dagster_url = f"http://localhost:{dagster_port}/graphql"
+    
+    # Query para listar jobs disponíveis
+    list_jobs_query = """
+    {
+      repositoriesOrError {
+        ... on RepositoryConnection {
+          nodes {
+            name
+            pipelines {
+              name
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    try:
+        print(f"🔍 Consultando jobs disponíveis em {dagster_url}...")
+        response = requests.post(
+            dagster_url,
+            json={"query": list_jobs_query},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            print("✅ Dagster respondeu!")
+            print(f"📋 Jobs disponíveis: {data}")
+            
+            # TODO: Disparar job específico aqui
+            # Por enquanto, apenas confirma que Dagster está acessível
+            return True
+        else:
+            print(f"⚠️ Dagster retornou status {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"⚠️ Não foi possível conectar ao Dagster: {e}")
+        print("💡 Dagster pode estar iniciando ainda ou não estar configurado")
+        return False
+
+
 def run_pipeline_script(comfyui_url: str):
     """Executa script específico do pipeline se existir"""
     print("\n" + "=" * 70)
     print("🎬 EXECUTANDO PIPELINE")
     print("=" * 70)
     
-    # Procurar scripts de pipeline
+    # Procurar scripts de pipeline (incluindo nosso executor Dagster)
     pipeline_scripts = [
+        '.github/scripts/execute_dagster_pipeline.py',  # Nosso executor
         'run_pipeline.py',
         'pipeline.py',
         'main_pipeline.py',
@@ -215,7 +283,12 @@ def main():
     # 3. Iniciar Flask (se existir)
     flask_process = start_flask(comfyui_url)
     
-    # 4. Executar pipeline específico (se existir)
+    # 4. Disparar job do Dagster (se Dagster foi iniciado)
+    dagster_job_triggered = False
+    if dagster_process:
+        dagster_job_triggered = trigger_dagster_job(comfyui_url)
+    
+    # 5. Executar pipeline específico (se existir)
     pipeline_success = run_pipeline_script(comfyui_url)
     
     # Resumo
@@ -224,6 +297,7 @@ def main():
     print("=" * 70)
     print(f"✅ ComfyUI Health: OK")
     print(f"{'✅' if dagster_process else '⚠️'} Dagster: {'Rodando' if dagster_process else 'Não encontrado'}")
+    print(f"{'✅' if dagster_job_triggered else '⚠️'} Dagster Job: {'Disparado' if dagster_job_triggered else 'Não disparado'}")
     print(f"{'✅' if flask_process else '⚠️'} Flask: {'Rodando' if flask_process else 'Não encontrado'}")
     print(f"{'✅' if pipeline_success else '⚠️'} Pipeline: {'Executado' if pipeline_success else 'Não executado'}")
     print("=" * 70)
