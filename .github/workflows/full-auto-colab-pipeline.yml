@@ -163,6 +163,7 @@ jobs:
         run: |
           pip install requests
           pip install -r requirements.txt || echo "requirements.txt not found"
+          pip install -r open3d_implementation/orchestration/requirements_dagster.txt || echo "requirements_dagster.txt not found"
 
       - name: 🎬 Run AI Film Pipeline
         env:
