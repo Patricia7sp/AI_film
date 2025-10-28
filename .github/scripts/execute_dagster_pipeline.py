@@ -10,10 +10,10 @@ import os
 import sys
 from pathlib import Path
 
-# Adicionar root path
-root_path = '/usr/local/anaconda3/Agentes_youtube/langgraph_system/LANGGRAPH_MCP'
-if root_path not in sys.path:
-    sys.path.insert(0, root_path)
+# Adicionar root path (diretório do repositório)
+repo_root = Path(__file__).parent.parent.parent.absolute()
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 def execute_dagster_pipeline(comfyui_url: str, story_input: str = ""):
     """
@@ -28,6 +28,23 @@ def execute_dagster_pipeline(comfyui_url: str, story_input: str = ""):
     
     print(f"📝 ComfyUI URL: {comfyui_url}")
     print(f"📖 Story Input: {story_input or '(vazio - será gerado)'}")
+    print(f"📂 Working Directory: {os.getcwd()}")
+    print(f"📂 Repo Root: {repo_root}")
+    print(f"🐍 Python Path: {sys.path[:3]}")
+    
+    # Verificar se arquivo existe
+    pipeline_file = repo_root / "orchestration" / "enhanced_dagster_pipeline.py"
+    print(f"\n🔍 Verificando arquivo: {pipeline_file}")
+    print(f"   Existe: {pipeline_file.exists()}")
+    
+    if not pipeline_file.exists():
+        print(f"\n❌ Arquivo não encontrado: {pipeline_file}")
+        print("💡 Arquivos disponíveis em orchestration/:")
+        orchestration_dir = repo_root / "orchestration"
+        if orchestration_dir.exists():
+            for f in orchestration_dir.glob("*.py"):
+                print(f"   - {f.name}")
+        return False
     
     try:
         # Importar o pipeline

@@ -153,15 +153,11 @@ def start_flask(comfyui_url: str):
         return None
 
 
-def trigger_dagster_job(comfyui_url: str, dagster_port: int = 3000):
+def trigger_dagster_job(comfyui_url: str, dagster_port: int = 3000, max_retries: int = 6):
     """Dispara um job do Dagster via GraphQL API"""
     print("\n" + "=" * 70)
     print("🎯 DISPARANDO JOB DO DAGSTER")
     print("=" * 70)
-    
-    # Aguardar Dagster iniciar
-    print("⏳ Aguardando Dagster iniciar (5 segundos)...")
-    time.sleep(5)
     
     # Tentar disparar job via GraphQL
     dagster_url = f"http://localhost:{dagster_port}/graphql"
@@ -182,30 +178,52 @@ def trigger_dagster_job(comfyui_url: str, dagster_port: int = 3000):
     }
     """
     
-    try:
-        print(f"🔍 Consultando jobs disponíveis em {dagster_url}...")
-        response = requests.post(
-            dagster_url,
-            json={"query": list_jobs_query},
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            print("✅ Dagster respondeu!")
-            print(f"📋 Jobs disponíveis: {data}")
+    # Tentar conectar com retry
+    for attempt in range(max_retries):
+        try:
+            wait_time = 5 + (attempt * 2)  # Aumenta tempo de espera a cada tentativa
+            print(f"\n⏳ Tentativa {attempt + 1}/{max_retries} - Aguardando {wait_time}s...")
+            time.sleep(wait_time)
             
-            # TODO: Disparar job específico aqui
-            # Por enquanto, apenas confirma que Dagster está acessível
-            return True
-        else:
-            print(f"⚠️ Dagster retornou status {response.status_code}")
+            print(f"🔍 Consultando jobs disponíveis em {dagster_url}...")
+            response = requests.post(
+                dagster_url,
+                json={"query": list_jobs_query},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                print("✅ Dagster respondeu!")
+                print(f"📋 Jobs disponíveis: {data}")
+                
+                # TODO: Disparar job específico aqui
+                # Por enquanto, apenas confirma que Dagster está acessível
+                return True
+            else:
+                print(f"⚠️ Dagster retornou status {response.status_code}")
+                if attempt < max_retries - 1:
+                    print("   Tentando novamente...")
+                    continue
+                return False
+                
+        except requests.exceptions.ConnectionError as e:
+            print(f"⚠️ Dagster ainda não está pronto: {e}")
+            if attempt < max_retries - 1:
+                print("   Dagster pode estar iniciando ainda, aguardando...")
+                continue
+            else:
+                print("💡 Dagster não ficou pronto a tempo")
+                print("   Isso é normal - Dagster demora para iniciar")
+                print("   Pipeline continuará sem disparar jobs via GraphQL")
+                return False
+        except Exception as e:
+            print(f"⚠️ Erro inesperado: {e}")
+            if attempt < max_retries - 1:
+                continue
             return False
-            
-    except Exception as e:
-        print(f"⚠️ Não foi possível conectar ao Dagster: {e}")
-        print("💡 Dagster pode estar iniciando ainda ou não estar configurado")
-        return False
+    
+    return False
 
 
 def run_pipeline_script(comfyui_url: str):
