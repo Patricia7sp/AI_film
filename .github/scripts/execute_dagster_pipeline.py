@@ -76,7 +76,87 @@ def execute_dagster_pipeline(comfyui_url: str, story_input: str = ""):
             print(f"   Max Scenes: {config.max_scenes}")
             
             print("\n✅ Pipeline configurado com sucesso!")
-            return True
+            print("\n🚀 EXECUTANDO PIPELINE COMPLETO...")
+            
+            # Executar o asset principal
+            try:
+                from dagster import materialize
+                
+                # Materializar os assets do pipeline
+                print("📦 Materializando assets...")
+                
+                # Materializar o primeiro asset (input)
+                result = materialize(
+                    [enhanced_multimodal_input_asset],
+                    run_config={"ops": {"enhanced_multimodal_input_asset": {"config": config.__dict__}}}
+                )
+                
+                if result.success:
+                    print("✅ Asset de input executado com sucesso!")
+                    
+                    # Obter o resultado do primeiro asset
+                    input_result = result.output_for_node("enhanced_multimodal_input_asset")
+                    print(f"📋 Story processada: {len(input_result.get('story_text', ''))} caracteres")
+                    
+                    # Materializar o workflow completo
+                    from orchestration.enhanced_dagster_pipeline import enhanced_langgraph_workflow_asset
+                    
+                    print("🔄 Executando workflow LangGraph...")
+                    workflow_result = materialize(
+                        [enhanced_langgraph_workflow_asset],
+                        run_config={"ops": {"enhanced_langgraph_workflow_asset": {"config": input_result}}}
+                    )
+                    
+                    if workflow_result.success:
+                        print("✅ Workflow LangGraph executado!")
+                        
+                        # Obter resultado final
+                        final_result = workflow_result.output_for_node("enhanced_langgraph_workflow_asset")
+                        
+                        # Mostrar resultados
+                        images_count = len(final_result.get('scene_images', []))
+                        audio_count = len(final_result.get('audio_files', []))
+                        
+                        print(f"\n📊 RESULTADOS DO PIPELINE:")
+                        print(f"   ✅ Cenas processadas: {final_result.get('scenes_count', 0)}")
+                        print(f"   ✅ Imagens geradas: {images_count}")
+                        print(f"   ✅ Áudios gerados: {audio_count}")
+                        print(f"   ✅ Vídeo: {final_result.get('video_path', 'Não gerado')}")
+                        
+                        if images_count > 0:
+                            print(f"\n🎯 SUCESSO REAL:")
+                            print(f"   ✅ Pipeline executou 100%!")
+                            print(f"   ✅ Conteúdo gerado!")
+                            print(f"   ✅ Verifique as saídas no ambiente")
+                        else:
+                            print(f"\n⚠️ AVISO:")
+                            print(f"   Pipeline executou mas não gerou conteúdo")
+                            print(f"   Possíveis causas:")
+                            print(f"   - ComfyUI não respondeu")
+                            print(f"   - Sem prompts válidos")
+                            print(f"   - Erro na geração")
+                        
+                        return True
+                    else:
+                        print(f"❌ Workflow falhou: {workflow_result.failure_data}")
+                        return False
+                else:
+                    print(f"❌ Asset de input falhou: {result.failure_data}")
+                    return False
+                    
+            except Exception as exec_error:
+                print(f"❌ Erro ao executar pipeline: {exec_error}")
+                print("⚠️ Isso pode acontecer se Dagster não estiver rodando")
+                print("💡 Tente executar com Dagster UI para debug")
+                
+                # Não falhar completamente - só informar
+                print("\n📋 Pipeline está configurado mas não executou")
+                print("   - Configuração: ✅ OK")
+                print("   - Assets: ✅ Disponíveis")  
+                print("   - Execução: ❌ Falhou")
+                print("   - Para debug: execute via Dagster UI")
+                
+                return False
             
         except ImportError as import_err:
             print(f"⚠️ Não foi possível importar pipeline completo: {import_err}")
