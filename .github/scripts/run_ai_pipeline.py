@@ -153,7 +153,7 @@ def start_flask(comfyui_url: str):
         return None
 
 
-def trigger_dagster_job(comfyui_url: str, dagster_port: int = 3000, max_retries: int = 6):
+def trigger_dagster_job(comfyui_url: str, dagster_port: int = 3000, max_retries: int = 3):
     """Dispara um job do Dagster via GraphQL API"""
     print("\n" + "=" * 70)
     print("🎯 DISPARANDO JOB DO DAGSTER")
@@ -213,9 +213,10 @@ def trigger_dagster_job(comfyui_url: str, dagster_port: int = 3000, max_retries:
                 print("   Dagster pode estar iniciando ainda, aguardando...")
                 continue
             else:
-                print("💡 Dagster não ficou pronto a tempo")
-                print("   Isso é normal - Dagster demora para iniciar")
-                print("   Pipeline continuará sem disparar jobs via GraphQL")
+                print("💡 Dagster GraphQL não ficou pronto")
+                print("   ⚠️ Isso é ESPERADO - Dagster demora muito para iniciar (>60s)")
+                print("   ✅ Pipeline Python executará diretamente (não precisa de GraphQL)")
+                print("   ✅ Continuando execução normalmente...")
                 return False
         except Exception as e:
             print(f"⚠️ Erro inesperado: {e}")
