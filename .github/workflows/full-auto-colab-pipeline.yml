@@ -168,9 +168,18 @@ jobs:
       - name: 🎬 Run AI Film Pipeline
         env:
           COMFYUI_URL: ${{ needs.orchestrate-colab.outputs.comfyui_url }}
+          # LLM APIs (Gemini como principal, OpenAI como fallback)
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Outras APIs
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          STABILITY_API_KEY: ${{ secrets.STABILITY_API_KEY }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
         run: |
           echo "🎬 Iniciando pipeline de geração de conteúdo..."
           echo "URL do ComfyUI: $COMFYUI_URL"
+          echo "🤖 LLM: Gemini 2.0 Flash (Principal)"
           
           # Executar pipeline real
           python .github/scripts/run_ai_pipeline.py
