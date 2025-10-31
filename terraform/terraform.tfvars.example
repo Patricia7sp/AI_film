@@ -1,0 +1,16 @@
+# ============================================================
+# Terraform Variables - Example
+# Copie este arquivo para terraform.tfvars e preencha os valores
+# ============================================================
+
+# GitHub Configuration
+github_token      = "ghp_seu_token_aqui"
+github_owner      = "Patricia7sp"
+github_repository = "AI_film"
+
+# API Keys
+gemini_api_key       = "AIzaSyD6L3PQI5MSmiQvosOrhcQllU4_O3UplP4"
+openai_api_key       = ""  # Opcional - deixe vazio se já existe
+elevenlabs_api_key   = ""  # Opcional - deixe vazio se já existe
+stability_api_key    = ""  # Opcional - deixe vazio se já existe
+replicate_api_token  = ""  # Opcional - deixe vazio se já existe
