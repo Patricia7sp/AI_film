@@ -26,8 +26,17 @@ def execute_dagster_pipeline(comfyui_url: str, story_input: str = ""):
     # Configurar variáveis de ambiente
     os.environ['COMFYUI_URL'] = comfyui_url
     
+    # Tentar carregar história do arquivo se não fornecida
+    if not story_input:
+        story_file = Path('output/story_latest.txt')
+        if story_file.exists():
+            story_input = story_file.read_text(encoding='utf-8')
+            print(f"📖 História carregada de: {story_file}")
+        else:
+            print(f"⚠️ Arquivo de história não encontrado: {story_file}")
+    
     print(f"📝 ComfyUI URL: {comfyui_url}")
-    print(f"📖 Story Input: {story_input or '(vazio - será gerado)'}")
+    print(f"📖 Story Input: {story_input[:100] if story_input else '(vazio - será gerado)'}...")
     print(f"📂 Working Directory: {os.getcwd()}")
     print(f"📂 Repo Root: {repo_root}")
     print(f"🐍 Python Path: {sys.path[:3]}")
