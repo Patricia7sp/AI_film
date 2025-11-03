@@ -185,11 +185,16 @@ jobs:
           # Criar diretório output se não existir
           mkdir -p output
           
-          # Salvar história do payload em arquivo
+          # Salvar história do payload em arquivo (preservando quebras de linha)
           if [ ! -z "$STORY_INPUT" ]; then
-            echo "📝 História recebida do Colab (${#STORY_INPUT} caracteres)"
-            echo "$STORY_INPUT" > output/story_latest.txt
-            echo "✅ História salva em output/story_latest.txt"
+            echo "📝 História recebida do Colab"
+            # Usar cat com heredoc para preservar quebras de linha
+            cat > output/story_latest.txt << 'STORY_EOF'
+          ${{ github.event.client_payload.story }}
+          STORY_EOF
+            # Contar caracteres
+            STORY_SIZE=$(wc -c < output/story_latest.txt)
+            echo "✅ História salva: $STORY_SIZE caracteres"
           else
             echo "⚠️ Nenhuma história no payload, verificando arquivo..."
             if [ ! -f output/story_latest.txt ]; then
