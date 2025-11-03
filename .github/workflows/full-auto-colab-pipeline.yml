@@ -168,6 +168,7 @@ jobs:
       - name: 🎬 Run AI Film Pipeline
         env:
           COMFYUI_URL: ${{ needs.orchestrate-colab.outputs.comfyui_url }}
+          STORY_INPUT: ${{ github.event.client_payload.story }}
           # LLM APIs (Gemini como principal, OpenAI como fallback)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -180,6 +181,23 @@ jobs:
           echo "🎬 Iniciando pipeline de geração de conteúdo..."
           echo "URL do ComfyUI: $COMFYUI_URL"
           echo "🤖 LLM: Gemini 2.0 Flash (Principal)"
+          
+          # Criar diretório output se não existir
+          mkdir -p output
+          
+          # Salvar história do payload em arquivo
+          if [ ! -z "$STORY_INPUT" ]; then
+            echo "📝 História recebida do Colab (${#STORY_INPUT} caracteres)"
+            echo "$STORY_INPUT" > output/story_latest.txt
+            echo "✅ História salva em output/story_latest.txt"
+          else
+            echo "⚠️ Nenhuma história no payload, verificando arquivo..."
+            if [ ! -f output/story_latest.txt ]; then
+              echo "❌ Arquivo de história não encontrado!"
+              echo "💡 Criando história padrão..."
+              echo "Uma jornada épica através de um mundo cyberpunk futurista" > output/story_latest.txt
+            fi
+          fi
           
           # Executar pipeline real
           python .github/scripts/run_ai_pipeline.py
