@@ -87,70 +87,61 @@ def execute_dagster_pipeline(comfyui_url: str, story_input: str = ""):
             print("\n✅ Pipeline configurado com sucesso!")
             print("\n🚀 EXECUTANDO PIPELINE COMPLETO...")
             
-            # Executar o asset principal
+            # Executar o pipeline completo
             try:
                 from dagster import materialize
                 
-                # Materializar os assets do pipeline
-                print("📦 Materializando assets...")
+                # Importar todos os assets
+                from orchestration.enhanced_dagster_pipeline import enhanced_langgraph_workflow_asset
                 
-                # Materializar o primeiro asset (input)
+                # Materializar o pipeline completo (ambos assets)
+                print("📦 Materializando pipeline completo...")
+                
+                # Materializar ambos assets em ordem correta
                 result = materialize(
-                    [enhanced_multimodal_input_asset],
-                    run_config={"ops": {"enhanced_multimodal_input_asset": {"config": config.__dict__}}}
+                    [
+                        enhanced_multimodal_input_asset,
+                        enhanced_langgraph_workflow_asset
+                    ],
+                    run_config={
+                        "ops": {
+                            "enhanced_multimodal_input_asset": {"config": config.__dict__}
+                        }
+                    }
                 )
                 
                 if result.success:
-                    print("✅ Asset de input executado com sucesso!")
+                    print("✅ Pipeline completo executado com sucesso!")
                     
-                    # Obter o resultado do primeiro asset
-                    input_result = result.output_for_node("enhanced_multimodal_input_asset")
-                    print(f"📋 Story processada: {len(input_result.get('story_text', ''))} caracteres")
+                    # Obter resultado do workflow (asset final)
+                    final_result = result.output_for_node("enhanced_langgraph_workflow_asset")
                     
-                    # Materializar o workflow completo
-                    from orchestration.enhanced_dagster_pipeline import enhanced_langgraph_workflow_asset
+                    # Mostrar resultados
+                    images_count = len(final_result.get('scene_images', []))
+                    audio_count = len(final_result.get('audio_files', []))
                     
-                    print("🔄 Executando workflow LangGraph...")
-                    workflow_result = materialize(
-                        [enhanced_langgraph_workflow_asset],
-                        run_config={"ops": {"enhanced_langgraph_workflow_asset": {"config": input_result}}}
-                    )
+                    print(f"\n📊 RESULTADOS DO PIPELINE:")
+                    print(f"   ✅ Cenas processadas: {final_result.get('scenes_count', 0)}")
+                    print(f"   ✅ Imagens geradas: {images_count}")
+                    print(f"   ✅ Áudios gerados: {audio_count}")
+                    print(f"   ✅ Vídeo: {final_result.get('video_path', 'Não gerado')}")
                     
-                    if workflow_result.success:
-                        print("✅ Workflow LangGraph executado!")
-                        
-                        # Obter resultado final
-                        final_result = workflow_result.output_for_node("enhanced_langgraph_workflow_asset")
-                        
-                        # Mostrar resultados
-                        images_count = len(final_result.get('scene_images', []))
-                        audio_count = len(final_result.get('audio_files', []))
-                        
-                        print(f"\n📊 RESULTADOS DO PIPELINE:")
-                        print(f"   ✅ Cenas processadas: {final_result.get('scenes_count', 0)}")
-                        print(f"   ✅ Imagens geradas: {images_count}")
-                        print(f"   ✅ Áudios gerados: {audio_count}")
-                        print(f"   ✅ Vídeo: {final_result.get('video_path', 'Não gerado')}")
-                        
-                        if images_count > 0:
-                            print(f"\n🎯 SUCESSO REAL:")
-                            print(f"   ✅ Pipeline executou 100%!")
-                            print(f"   ✅ Conteúdo gerado!")
-                            print(f"   ✅ Verifique as saídas no ambiente")
-                        else:
-                            print(f"\n⚠️ AVISO:")
-                            print(f"   Pipeline executou mas não gerou conteúdo")
-                            print(f"   Possíveis causas:")
-                            print(f"   - ComfyUI não respondeu")
-                            print(f"   - Sem prompts válidos")
-                            print(f"   - Erro na geração")
-                        
-                        return True
+                    if images_count > 0:
+                        print(f"\n🎯 SUCESSO REAL:")
+                        print(f"   ✅ Pipeline executou 100%!")
+                        print(f"   ✅ Conteúdo gerado!")
+                        print(f"   ✅ Verifique as saídas no ambiente")
                     else:
-                        print(f"❌ Workflow falhou: {workflow_result.failure_data}")
-                        return False
+                        print(f"\n⚠️ AVISO:")
+                        print(f"   Pipeline executou mas não gerou conteúdo")
+                        print(f"   Possíveis causas:")
+                        print(f"   - ComfyUI não respondeu")
+                        print(f"   - Sem prompts válidos")
+                        print(f"   - Erro na geração")
+                    
+                    return True
                 else:
-                    print(f"❌ Asset de input falhou: {result.failure_data}")
+                    print(f"❌ Pipeline falhou: {result.failure_data}")
                     return False
                     
             except Exception as exec_error:
