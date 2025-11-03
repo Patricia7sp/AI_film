@@ -27,8 +27,10 @@ COMFYUI_URL = os.getenv("COMFYUI_URL")
 
 # Flask App
 app = Flask(__name__)
-run_with_ngrok(app)
 story_data = {"story": None, "submitted": False}
+
+# Configurar ngrok (será iniciado manualmente)
+flask_port = 5001  # Usar porta diferente para evitar conflito
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -100,14 +102,37 @@ class ColabManager:
         self.github_triggered = False
     
     def start_flask(self):
-        threading.Thread(target=app.run, daemon=True).start()
-        time.sleep(5)
+        """Inicia Flask com ngrok no Colab"""
+        print("🌐 Iniciando Flask...")
+        
+        # Iniciar ngrok primeiro
+        from pyngrok import ngrok
+        
         try:
-            tunnels = requests.get('http://localhost:4040/api/tunnels', timeout=5).json()['tunnels']
-            self.flask_url = tunnels[0]['public_url'] if tunnels else None
-            print(f"✅ Flask UI: {self.flask_url}")
+            # Matar processos anteriores
+            ngrok.kill()
         except:
-            print("⚠️ Flask URL não obtida automaticamente")
+            pass
+        
+        # Iniciar túnel ngrok
+        try:
+            public_url = ngrok.connect(flask_port, bind_tls=True)
+            self.flask_url = str(public_url)
+            print(f"✅ ngrok túnel criado: {self.flask_url}")
+        except Exception as e:
+            print(f"❌ Erro ao criar túnel ngrok: {e}")
+            return
+        
+        # Iniciar Flask em thread
+        def run_flask():
+            app.run(port=flask_port, use_reloader=False)
+        
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        
+        # Aguardar Flask iniciar
+        time.sleep(3)
+        print(f"✅ Flask rodando na porta {flask_port}")
     
     def open_flask_ui(self):
         if not self.flask_url:
@@ -158,12 +183,43 @@ class ColabManager:
         return False
     
     def start(self):
+        print("=" * 70)
         print("🎯 INICIANDO COLAB MANAGER")
-        self.start_flask()
-        self.open_flask_ui()
-        story = self.wait_for_story(10)
+        print("=" * 70)
+        
+        # Verificar se ComfyUI URL está definida
+        if not self.comfyui_url:
+            print("⚠️ COMFYUI_URL não definida!")
+            print("💡 Defina: os.environ['COMFYUI_URL'] = 'sua-url'")
+            return
+        
+        print(f"🔗 ComfyUI: {self.comfyui_url}")
+        print("")
+        
+        # Iniciar Flask
+        try:
+            self.start_flask()
+        except Exception as e:
+            print(f"❌ Erro ao iniciar Flask: {e}")
+            print("💡 Tentando continuar sem Flask UI...")
+            self.flask_url = None
+        
+        # Abrir UI se Flask iniciou
+        if self.flask_url:
+            self.open_flask_ui()
+            story = self.wait_for_story(10)
+        else:
+            print("⚠️ Flask UI não disponível")
+            print("💡 GitHub Actions será disparado sem história")
+            story = None
+        
+        # Disparar GitHub Actions
         self.trigger_github(story)
+        
+        print("")
+        print("=" * 70)
         print("✅ Setup completo!")
+        print("=" * 70)
 
 # Executar
 manager = ColabManager()
