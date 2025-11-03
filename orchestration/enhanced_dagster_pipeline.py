@@ -154,8 +154,7 @@ def enhanced_multimodal_input_asset(
 @asset(
     description="Workflow LangGraph com logs estruturados integrados",
     retry_policy=ai_model_retry,
-    compute_kind="langgraph_workflow",
-    deps=[enhanced_multimodal_input_asset]
+    compute_kind="langgraph_workflow"
 )
 def enhanced_langgraph_workflow_asset(
     context: AssetExecutionContext,
