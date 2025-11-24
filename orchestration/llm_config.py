@@ -130,6 +130,52 @@ COST_COMPARISON = {
 }
 
 
+def get_llm():
+    """
+    Função alias para get_llm_client para compatibilidade
+    """
+    return get_llm_client()
+
+
+def generate_cinematic_prompt(story_text: str):
+    """
+    Gera prompt cinematográfico a partir do texto da história
+    
+    Args:
+        story_text: Texto da história
+        
+    Returns:
+        Prompt cinematográfico detalhado para geração de imagens
+    """
+    try:
+        llm = get_llm_with_fallback()
+        
+        prompt = f"""
+Transforme esta história em um prompt cinematográfico ultra-detalhado para geração de imagens:
+
+HISTÓRIA:
+{story_text}
+
+Crie um prompt que inclua:
+1. Estilo cinematográfico específico (ex: "Blade Runner 2049 style", "Wes Anderson symmetry")
+2. Iluminação detalhada (ex: "golden hour backlight", "dramatic chiaroscuro")
+3. Lente e câmera (ex: "shot on ARRI Alexa, 35mm anamorphic lens")
+4. Composição (ex: "rule of thirds", "dutch angle", "extreme wide shot")
+5. Resolução e qualidade (ex: "8K, photorealistic, highly detailed")
+6. Mood e atmosfera (ex: "melancholic", "tense", "dreamlike")
+
+Retorne apenas o prompt final, sem formatação adicional.
+"""
+        
+        response = llm.invoke(prompt)
+        return response.content.strip()
+        
+    except Exception as e:
+        print(f"⚠️ Erro ao gerar prompt cinematográfico: {e}")
+        # Fallback para prompt simples
+        return f"Cinematic scene based on: {story_text[:100]}..., photorealistic, highly detailed, 8K"
+
+
 def print_llm_config():
     """Imprime configuração atual do LLM"""
     print("=" * 70)
