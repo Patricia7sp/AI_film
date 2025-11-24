@@ -96,8 +96,7 @@ def execute_dagster_pipeline(comfyui_url: str, story_input: str = ""):
                 
                 # Materializar o pipeline completo (ambos assets)
                 print("📦 Materializando pipeline completo...")
-                
-                # Materializar ambos assets em ordem correta
+ # Materializar ambos assets em ordem correta
                 result = materialize(
                     [
                         enhanced_multimodal_input_asset,

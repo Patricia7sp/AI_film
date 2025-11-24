@@ -179,10 +179,23 @@ def enhanced_langgraph_workflow_asset(
         # Criar workflow
         workflow = create_open3d_workflow()
         
+        if workflow is None:
+            raise ValueError("Não foi possível criar o workflow LangGraph")
+        
+        # Preparar estado inicial para o workflow
+        initial_state = {
+            'story_text': enhanced_multimodal_input_asset.get('story_text', ''),
+            'messages': [],
+            'current_step': 'initialized',
+            'scene_data': {},
+            'generated_content': {},
+            'enhanced_multimodal_input_asset': enhanced_multimodal_input_asset
+        }
+        
         # Executar com logs detalhados
         dagster_logger.info("🚀 Iniciando execução do workflow LangGraph...")
         
-        final_state = workflow.invoke(enhanced_multimodal_input_asset)
+        final_state = workflow.invoke(initial_state)
         
         # Coletar estatísticas finais
         scenes_count = len(final_state.get('scenes', []))
