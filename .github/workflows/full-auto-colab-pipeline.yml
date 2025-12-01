@@ -204,6 +204,10 @@ jobs:
             fi
           fi
           
+          # Instalar dependências Python
+          echo "📦 Instalando dependências Python..."
+          pip install langchain langchain-openai langchain-google-genai langgraph dagster python-dotenv requests pillow
+          
           # Executar pipeline real
           python .github/scripts/run_ai_pipeline.py
           

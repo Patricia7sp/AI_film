@@ -115,6 +115,7 @@ PROMPT: [prompt detalhado aqui]
 NEGATIVE: [negative prompts aqui]
 """
 
+
 # Custos estimados (por 1M tokens)
 COST_COMPARISON = {
     "gemini-2.0-flash-exp": {

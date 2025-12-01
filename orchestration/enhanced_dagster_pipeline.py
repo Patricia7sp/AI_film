@@ -144,7 +144,18 @@ def enhanced_multimodal_input_asset(
         
         dagster_logger.info(f"✅ Entrada multimodal processada com sucesso em {execution_time:.2f}s")
         
-        return initial_state
+        # Retornar como dicionário para compatibilidade com LangGraph
+        return {
+            'session_id': initial_state.session_id,
+            'story_text': initial_state.story_text,
+            'input_type': initial_state.input_type,
+            'structured_logger': initial_state.structured_logger,
+            'max_scenes': initial_state.max_scenes,
+            'metadata': initial_state.metadata,
+            'input_source': input_source,
+            'file_format': file_format,
+            'story_length': len(story_text)
+        }
         
     except Exception as e:
         structured_logger.log_error("multimodal_input", str(e))
