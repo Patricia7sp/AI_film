@@ -208,6 +208,9 @@ jobs:
           echo "📦 Instalando dependências Python..."
           pip install langchain langchain-openai langchain-google-genai langgraph dagster python-dotenv requests pillow
           
+          # Verificar ambiente
+          python .github/scripts/check_env.py
+          
           # Executar pipeline real
           python .github/scripts/run_ai_pipeline.py
           
