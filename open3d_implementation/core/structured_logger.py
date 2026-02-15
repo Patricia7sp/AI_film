@@ -64,3 +64,20 @@ class StructuredLogger:
         }
         self.logger.info(json.dumps(log_entry))
         print(f"✅ {message}")
+    
+    def log_pipeline_completion(self, total_scenes: int, total_files: int, 
+                                output_directory: str, execution_time: float):
+        """Log pipeline completion"""
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "session_id": self.session_id,
+            "stage": "pipeline_completion",
+            "metadata": {
+                "total_scenes": total_scenes,
+                "total_files": total_files,
+                "output_directory": output_directory,
+                "execution_time": execution_time
+            }
+        }
+        self.logger.info(json.dumps(log_entry))
+        print(f"✅ Pipeline completo: {total_scenes} cenas, {total_files} arquivos em {execution_time:.2f}s")

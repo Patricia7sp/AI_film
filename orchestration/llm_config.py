@@ -12,7 +12,7 @@ load_dotenv()
 
 # Configurações do LLM
 DEFAULT_LLM_PROVIDER = "gemini"  # gemini ou openai
-DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM", "gemini-2.0-flash-exp")
+DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM", "gemini-2.0-flash-thinking-exp-01-21")
 FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM", "gpt-4o-mini")
 
 # API Keys
@@ -118,7 +118,7 @@ NEGATIVE: [negative prompts aqui]
 
 # Custos estimados (por 1M tokens)
 COST_COMPARISON = {
-    "gemini-2.0-flash-exp": {
+    "gemini-2.0-flash-thinking-exp-01-21": {
         "input": 0.075,  # $0.075 / 1M tokens
         "output": 0.30,   # $0.30 / 1M tokens
         "description": "95% mais barato que GPT-4, excelente para criatividade"
@@ -190,8 +190,8 @@ def print_llm_config():
     print("=" * 70)
     print("\n💰 ECONOMIA ESTIMADA:")
     print(f"Usando Gemini: ~95% mais barato que GPT-4")
-    print(f"Custo Gemini Input: ${COST_COMPARISON['gemini-2.0-flash-exp']['input']}/1M tokens")
-    print(f"Custo Gemini Output: ${COST_COMPARISON['gemini-2.0-flash-exp']['output']}/1M tokens")
+    print(f"Custo Gemini Input: ${COST_COMPARISON['gemini-2.0-flash-thinking-exp-01-21']['input']}/1M tokens")
+    print(f"Custo Gemini Output: ${COST_COMPARISON['gemini-2.0-flash-thinking-exp-01-21']['output']}/1M tokens")
     print("=" * 70)
 
 
