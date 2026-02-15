@@ -1,0 +1,68 @@
+{
+  "timestamp": "1771169370.0489612",
+  "score": 7,
+  "max_score": 8,
+  "percentage": 87.5,
+  "results": {
+    "Python Version": {
+      "status": "\u2705",
+      "details": "Python 3.10.16",
+      "passed": true
+    },
+    "Dependencies": {
+      "status": "\u2705",
+      "details": {
+        "dagster": "\u2705",
+        "langchain": "\u2705",
+        "langgraph": "\u2705",
+        "requests": "\u2705",
+        "flask": "\u2705"
+      },
+      "passed": true
+    },
+    "Environment Vars": {
+      "status": "\u2705",
+      "details": {
+        "GEMINI_API_KEY": "\u2705 (LLM principal)",
+        "COMFYUI_URL": "\u2705 (Gera\u00e7\u00e3o de imagens)",
+        "DAGSTER_HOME": "\u2705 (Orquestra\u00e7\u00e3o)",
+        "OPENAI_API_KEY": "\u2705 (LLM fallback)"
+      },
+      "passed": true
+    },
+    "ComfyUI Connection": {
+      "status": "\u274c",
+      "details": "Erro: HTTPSConnectionPool(host='literacy-staff-singer-ac",
+      "passed": false
+    },
+    "File Structure": {
+      "status": "\u2705",
+      "details": {
+        "open3d_implementation/core/langgraph_adapter.py": "\u2705 LangGraph",
+        "orchestration/enhanced_dagster_pipeline.py": "\u2705 Dagster",
+        "open3d_implementation/.env": "\u2705 Configura\u00e7\u00e3o",
+        "requirements.txt": "\u2705 Depend\u00eancias"
+      },
+      "passed": true
+    },
+    "Dagster Setup": {
+      "status": "\u2705",
+      "details": "Instalado: dagster, version 1.11.5",
+      "passed": true
+    },
+    "LLM API (Gemini)": {
+      "status": "\u2705",
+      "details": "API funcionando \u2713 (gemini-2.5-flash)",
+      "passed": true
+    },
+    "GitHub Actions": {
+      "status": "\u2705",
+      "details": "8 workflows encontrados",
+      "passed": true
+    }
+  },
+  "fixes": [
+    "ComfyUI inacess\u00edvel - considerar setup no Hugging Face"
+  ],
+  "status": "ready"
+}
