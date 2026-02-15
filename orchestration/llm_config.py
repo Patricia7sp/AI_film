@@ -12,7 +12,7 @@ load_dotenv()
 
 # Configurações do LLM
 DEFAULT_LLM_PROVIDER = "gemini"  # gemini ou openai
-DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM", "gemini-2.0-flash-thinking-exp-01-21")
+DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM", "gemini-3-flash-preview")
 FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM", "gpt-4o-mini")
 
 # API Keys
@@ -118,14 +118,19 @@ NEGATIVE: [negative prompts aqui]
 
 # Custos estimados (por 1M tokens)
 COST_COMPARISON = {
-    "gemini-2.0-flash-thinking-exp-01-21": {
-        "input": 0.075,  # $0.075 / 1M tokens
-        "output": 0.30,   # $0.30 / 1M tokens
-        "description": "95% mais barato que GPT-4, excelente para criatividade"
+    "gemini-3-flash-preview": {
+        "input": 0.075,
+        "output": 0.30,
+        "description": "Gemini 3 Flash - Rápido e eficiente"
+    },
+    "gemini-3-pro-image-preview": {
+        "input": 0.15,
+        "output": 0.60,
+        "description": "Gemini 3 Pro - Melhor para imagens e vídeos"
     },
     "gpt-4o-mini": {
-        "input": 0.15,    # $0.15 / 1M tokens (estimado)
-        "output": 0.60,   # $0.60 / 1M tokens (estimado)
+        "input": 0.15,
+        "output": 0.60,
         "description": "Fallback para casos específicos"
     }
 }
@@ -138,18 +143,29 @@ def get_llm():
     return get_llm_client()
 
 
-def generate_cinematic_prompt(story_text: str):
+def generate_cinematic_prompt(story_text: str, use_pro_model: bool = False):
     """
     Gera prompt cinematográfico a partir do texto da história
     
     Args:
         story_text: Texto da história
+        use_pro_model: Se True, usa gemini-3-pro-image-preview para melhor qualidade
         
     Returns:
         Prompt cinematográfico detalhado para geração de imagens
     """
     try:
-        llm = get_llm_with_fallback()
+        # Usar modelo Pro para geração de prompts de imagem
+        if use_pro_model:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-3-pro-image-preview",
+                google_api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
+                temperature=0.9,
+                max_tokens=2048
+            )
+        else:
+            llm = get_llm_with_fallback()
         
         prompt = f"""
 Transforme esta história em um prompt cinematográfico ultra-detalhado para geração de imagens:
@@ -190,8 +206,8 @@ def print_llm_config():
     print("=" * 70)
     print("\n💰 ECONOMIA ESTIMADA:")
     print(f"Usando Gemini: ~95% mais barato que GPT-4")
-    print(f"Custo Gemini Input: ${COST_COMPARISON['gemini-2.0-flash-thinking-exp-01-21']['input']}/1M tokens")
-    print(f"Custo Gemini Output: ${COST_COMPARISON['gemini-2.0-flash-thinking-exp-01-21']['output']}/1M tokens")
+    print(f"Custo Gemini Input: ${COST_COMPARISON['gemini-3-flash-preview']['input']}/1M tokens")
+    print(f"Custo Gemini Output: ${COST_COMPARISON['gemini-3-flash-preview']['output']}/1M tokens")
     print("=" * 70)
 
 

@@ -1,5 +1,5 @@
 {
-  "timestamp": "1771169370.0489612",
+  "timestamp": "1771190416.7872133",
   "score": 7,
   "max_score": 8,
   "percentage": 87.5,
@@ -26,7 +26,9 @@
         "GEMINI_API_KEY": "\u2705 (LLM principal)",
         "COMFYUI_URL": "\u2705 (Gera\u00e7\u00e3o de imagens)",
         "DAGSTER_HOME": "\u2705 (Orquestra\u00e7\u00e3o)",
-        "OPENAI_API_KEY": "\u2705 (LLM fallback)"
+        "OPENAI_API_KEY": "\u2705 (LLM fallback)",
+        "ELEVENLABS_API_KEY": "\u2705 (API do ElevenLabs (\u00e1udio))",
+        "STABILITY_API_KEY": "\u2705 (API do Stability AI)"
       },
       "passed": true
     },
