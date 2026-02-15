@@ -146,12 +146,12 @@ def enhanced_multimodal_input_asset(
         
         # Retornar como dicionário para compatibilidade com LangGraph
         return {
-            'session_id': initial_state.session_id,
-            'story_text': initial_state.story_text,
-            'input_type': initial_state.input_type,
-            'structured_logger': initial_state.structured_logger,
-            'max_scenes': initial_state.max_scenes,
-            'metadata': initial_state.metadata,
+            'session_id': initial_state['session_id'],
+            'story_text': initial_state['story_text'],
+            'input_type': initial_state['input_type'],
+            'structured_logger': initial_state.get('structured_logger'),
+            'max_scenes': initial_state.get('max_scenes', 8),
+            'metadata': initial_state.get('metadata', {}),
             'input_source': input_source,
             'file_format': file_format,
             'story_length': len(story_text)
