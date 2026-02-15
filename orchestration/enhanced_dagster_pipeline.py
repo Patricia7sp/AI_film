@@ -194,8 +194,18 @@ def enhanced_langgraph_workflow_asset(
             raise ValueError("Não foi possível criar o workflow LangGraph")
         
         # Preparar estado inicial para o workflow
+        story_text = enhanced_multimodal_input_asset.get('story_text', '')
+        
+        # Debug
+        print(f"🔍 DEBUG - enhanced_multimodal_input_asset keys: {list(enhanced_multimodal_input_asset.keys())}")
+        print(f"🔍 DEBUG - story_text extraído: {len(story_text)} caracteres")
+        
+        if not story_text:
+            dagster_logger.warning("⚠️ AVISO: story_text está vazio no enhanced_multimodal_input_asset!")
+            dagster_logger.warning(f"⚠️ Conteúdo: {enhanced_multimodal_input_asset}")
+        
         initial_state = {
-            'story_text': enhanced_multimodal_input_asset.get('story_text', ''),
+            'story_text': story_text,
             'messages': [],
             'current_step': 'initialized',
             'scene_data': {},

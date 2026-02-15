@@ -32,14 +32,24 @@ def create_open3d_workflow():
         
         def extract_story(state: Open3DAgentState) -> Open3DAgentState:
             """Extract and process story from multimodal input"""
+            # Debug: ver o que está no state
+            print(f"🔍 DEBUG - State keys: {list(state.keys())}")
+            print(f"🔍 DEBUG - State type: {type(state)}")
+            
             story_text = state.get('story_text', '')
             
             if not story_text:
                 # Try to get from enhanced_multimodal_input_asset
                 if 'enhanced_multimodal_input_asset' in state:
+                    print(f"🔍 DEBUG - Found enhanced_multimodal_input_asset in state")
                     story_text = state['enhanced_multimodal_input_asset'].get('story_text', '')
+                else:
+                    print(f"⚠️ DEBUG - enhanced_multimodal_input_asset NOT in state")
             
             print(f"📖 Processando história: {len(story_text)} caracteres")
+            
+            if not story_text:
+                print(f"⚠️ AVISO: História vazia! State completo: {state}")
             
             # Generate cinematic prompt using Flash model (Pro exceeded quota)
             llm = get_llm()
