@@ -193,15 +193,25 @@ def execute_dagster_pipeline(comfyui_url: str, story_input: str = ""):
 
 def main():
     """Função principal"""
-    comfyui_url = os.getenv('COMFYUI_URL')
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Execute Dagster Pipeline')
+    parser.add_argument('--comfyui-url', help='ComfyUI URL')
+    parser.add_argument('--story', help='Story input text', default='')
+    args = parser.parse_args()
+    
+    comfyui_url = args.comfyui_url or os.getenv('COMFYUI_URL')
     
     if not comfyui_url:
         print("❌ COMFYUI_URL não definida!")
         print("💡 Defina: export COMFYUI_URL='https://your-url.trycloudflare.com'")
         sys.exit(1)
     
-    # Story input opcional
-    story_input = os.getenv('STORY_INPUT', '')
+    # Story input de argumento ou env var
+    story_input = args.story or os.getenv('STORY_INPUT', '')
+    
+    if story_input:
+        print(f"📖 História recebida: {len(story_input)} caracteres")
     
     success = execute_dagster_pipeline(comfyui_url, story_input)
     

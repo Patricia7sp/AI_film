@@ -233,6 +233,15 @@ def run_pipeline_script(comfyui_url: str):
     print("🎬 EXECUTANDO PIPELINE")
     print("=" * 70)
     
+    # Carregar história do arquivo
+    story_input = ""
+    story_file = Path('output/story_latest.txt')
+    if story_file.exists():
+        story_input = story_file.read_text(encoding='utf-8')
+        print(f"📖 História carregada: {len(story_input)} caracteres")
+    else:
+        print("⚠️ Arquivo de história não encontrado")
+    
     # Procurar scripts de pipeline (incluindo nosso executor Dagster)
     pipeline_scripts = [
         '.github/scripts/execute_dagster_pipeline.py',  # Nosso executor
@@ -247,9 +256,12 @@ def run_pipeline_script(comfyui_url: str):
         if script_path.exists():
             print(f"✅ Encontrado: {script}")
             
+            # Passar história como argumento
             cmd = ['python', str(script_path), '--comfyui-url', comfyui_url]
+            if story_input:
+                cmd.extend(['--story', story_input])
             
-            print(f"🔧 Comando: {' '.join(cmd)}")
+            print(f"🔧 Comando: python {script_path} --comfyui-url {comfyui_url[:50]}... --story <{len(story_input)} chars>")
             
             result = subprocess.run(
                 cmd,
