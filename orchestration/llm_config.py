@@ -185,7 +185,14 @@ Retorne apenas o prompt final, sem formatação adicional.
 """
         
         response = llm.invoke(prompt)
-        return response.content.strip()
+        
+        # Handle both string and list responses
+        if isinstance(response.content, list):
+            content = " ".join(str(item) for item in response.content)
+        else:
+            content = str(response.content)
+        
+        return content.strip()
         
     except Exception as e:
         print(f"⚠️ Erro ao gerar prompt cinematográfico: {e}")
