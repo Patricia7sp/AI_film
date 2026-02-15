@@ -41,9 +41,9 @@ def create_open3d_workflow():
             
             print(f"📖 Processando história: {len(story_text)} caracteres")
             
-            # Generate cinematic prompt using Pro model for better image generation
+            # Generate cinematic prompt using Flash model (Pro exceeded quota)
             llm = get_llm()
-            prompt = generate_cinematic_prompt(story_text, use_pro_model=True)
+            prompt = generate_cinematic_prompt(story_text, use_pro_model=False)
             
             state.update({
                 'story_text': story_text,
