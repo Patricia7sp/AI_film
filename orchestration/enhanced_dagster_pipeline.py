@@ -108,14 +108,14 @@ def enhanced_multimodal_input_asset(
         if not story_text:
             raise ValueError("Nenhuma história fornecida via arquivo ou texto direto")
         
-        # Preparar estado inicial com logger estruturado
-        initial_state = Open3DAgentState(
-            session_id=config.session_id,
-            story_text=story_text,
-            input_type=config.input_type,
-            structured_logger=structured_logger,  # Adicionar logger ao estado
-            max_scenes=config.max_scenes,
-            metadata={
+        # Preparar estado inicial como dict (não usar Open3DAgentState)
+        initial_state = {
+            'session_id': config.session_id,
+            'story_text': story_text,
+            'input_type': config.input_type,
+            'structured_logger': structured_logger,
+            'max_scenes': config.max_scenes,
+            'metadata': {
                 "input_source": input_source,
                 "story_file_path": config.story_file_path if config.story_file_path else None,
                 "file_format": file_format,
@@ -124,7 +124,7 @@ def enhanced_multimodal_input_asset(
                 "quality_threshold": config.quality_threshold,
                 "structured_logging_enabled": config.enable_structured_logging
             }
-        )
+        }
         
         execution_time = time.time() - start_time
         
