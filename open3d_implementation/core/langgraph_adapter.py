@@ -70,33 +70,76 @@ def create_open3d_workflow():
             return state
         
         def generate_scenes(state: Open3DAgentState) -> Open3DAgentState:
-            """Generate scenes from story"""
+            """Generate scenes from story using LLM"""
             story_text = state.get('story_text', '')
             cinematic_prompt = state.get('cinematic_prompt', '')
+            max_scenes = state.get('max_scenes', 8)
             
             print("🎬 Gerando cenas...")
             
-            # Simple scene generation (placeholder)
-            scenes = [
-                {
-                    "scene_id": 1,
-                    "description": f"Opening scene: {story_text[:100]}...",
-                    "prompt": cinematic_prompt,
-                    "duration": 5
-                },
-                {
-                    "scene_id": 2,
-                    "description": f"Development: Based on {story_text[:50]}...",
-                    "prompt": cinematic_prompt,
-                    "duration": 7
-                },
-                {
-                    "scene_id": 3,
-                    "description": f"Climax: {story_text[:80]}...",
-                    "prompt": cinematic_prompt,
-                    "duration": 6
-                }
-            ]
+            if not story_text:
+                print("⚠️ História vazia, usando cenas mock")
+                scenes = [
+                    {"scene_id": 1, "description": "Mock scene", "prompt": cinematic_prompt, "duration": 5},
+                    {"scene_id": 2, "description": "Mock scene", "prompt": cinematic_prompt, "duration": 5},
+                    {"scene_id": 3, "description": "Mock scene", "prompt": cinematic_prompt, "duration": 5}
+                ]
+            else:
+                # Generate real scenes using LLM
+                try:
+                    llm = get_llm()
+                    
+                    scene_prompt = f"""
+Divida esta história em {max_scenes} cenas cinematográficas.
+
+HISTÓRIA:
+{story_text}
+
+Para cada cena, forneça:
+1. ID da cena (número)
+2. Descrição detalhada (2-3 frases)
+3. Prompt visual para geração de imagem (estilo cinematográfico)
+4. Duração sugerida (5-10 segundos)
+
+Retorne em formato JSON:
+[
+  {{"scene_id": 1, "description": "...", "prompt": "...", "duration": 6}},
+  ...
+]
+"""
+                    
+                    response = llm.invoke(scene_prompt)
+                    
+                    # Parse response
+                    import json
+                    import re
+                    
+                    content = response.content if hasattr(response, 'content') else str(response)
+                    if isinstance(content, list):
+                        content = " ".join(str(item) for item in content)
+                    
+                    # Extract JSON from response
+                    json_match = re.search(r'\[.*\]', content, re.DOTALL)
+                    if json_match:
+                        scenes = json.loads(json_match.group())
+                        print(f"✅ {len(scenes)} cenas geradas com LLM")
+                    else:
+                        raise ValueError("Não foi possível extrair JSON da resposta")
+                        
+                except Exception as e:
+                    print(f"⚠️ Erro ao gerar cenas com LLM: {e}")
+                    print("💡 Usando cenas baseadas na história")
+                    # Fallback: criar cenas simples baseadas na história
+                    scenes = []
+                    story_parts = story_text.split('\n\n')[:max_scenes]
+                    for i, part in enumerate(story_parts, 1):
+                        scenes.append({
+                            "scene_id": i,
+                            "description": part[:200],
+                            "prompt": f"{cinematic_prompt}, scene showing: {part[:100]}",
+                            "duration": 6
+                        })
+                    print(f"✅ {len(scenes)} cenas criadas (fallback)")
             
             state.update({
                 'scenes': scenes,
