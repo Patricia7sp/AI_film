@@ -215,6 +215,7 @@ jobs:
           # Verificar ambiente
           python .github/scripts/check_env.py
           python .github/scripts/check_deps.py
+          python .github/scripts/test_env.py
           
           # Executar pipeline real
           python .github/scripts/run_ai_pipeline.py
