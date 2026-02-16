@@ -121,15 +121,28 @@ Retorne em formato JSON:
                     # Debug: ver resposta do LLM
                     print(f"🔍 DEBUG - Resposta LLM (primeiros 500 chars): {content[:500]}")
                     
-                    # Extract JSON from response - melhorar regex
+                    # Extract JSON from response - melhorar regex para markdown
+                    # Remover markdown se presente
+                    content = content.replace('```json', '').replace('```', '').strip()
+                    
+                    # Procurar por array JSON
                     json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
                     if json_match:
                         json_str = json_match.group()
                         # Limpar possíveis problemas
                         json_str = json_str.replace('{{', '{').replace('}}', '}')
-                        scenes = json.loads(json_str)
-                        print(f"✅ {len(scenes)} cenas geradas com LLM")
+                        # Remover aspas extras se presentes
+                        json_str = json_str.replace('"[{', '[{').replace('}]"', '}]')
+                        
+                        try:
+                            scenes = json.loads(json_str)
+                            print(f"✅ {len(scenes)} cenas geradas com LLM")
+                        except json.JSONDecodeError as e:
+                            print(f"⚠️ Erro no JSON: {e}")
+                            print(f"🔍 JSON tentado: {json_str[:200]}...")
+                            raise ValueError("JSON inválido mesmo após limpeza")
                     else:
+                        print(f"🔍 Conteúdo completo (primeiros 1000 chars): {content[:1000]}")
                         raise ValueError("Não foi possível extrair JSON da resposta")
                         
                 except Exception as e:
@@ -182,7 +195,20 @@ Retorne em formato JSON:
                         from PIL import Image
                         import io
                         
-                        # ComfyUI workflow for image generation
+                        print(f"🔗 Tentando ComfyUI em: {comfyui_url}")
+                        
+                        # Testar conexão primeiro
+                        try:
+                            test_response = requests.get(f"{comfyui_url}/system_stats", timeout=5)
+                            if test_response.status_code == 200:
+                                print(f"✅ ComfyUI conectado!")
+                            else:
+                                print(f"⚠️ ComfyUI respondeu com status: {test_response.status_code}")
+                        except Exception as conn_e:
+                            print(f"⚠️ Erro ao conectar ComfyUI: {conn_e}")
+                            raise Exception("ComfyUI não acessível")
+                        
+                        # ComfyUI workflow simplificado para maior compatibilidade
                         workflow = {
                             "1": {
                                 "inputs": {
@@ -193,7 +219,7 @@ Retorne em formato JSON:
                             },
                             "2": {
                                 "inputs": {
-                                    "text": "",
+                                    "text": "blurry, bad quality, distorted",
                                     "clip": ["4", 1]
                                 },
                                 "class_type": "CLIPTextEncode"
@@ -202,7 +228,7 @@ Retorne em formato JSON:
                                 "inputs": {
                                     "seed": 123456789,
                                     "steps": 20,
-                                    "cfg": 8,
+                                    "cfg": 7,
                                     "sampler_name": "euler",
                                     "scheduler": "normal",
                                     "denoise": 1,
@@ -244,48 +270,71 @@ Retorne em formato JSON:
                         }
                         
                         # Submit workflow to ComfyUI
-                        response = requests.post(f"{comfyui_url}/prompt", json={"prompt": workflow})
+                        print(f"📤 Enviando workflow para ComfyUI...")
+                        response = requests.post(f"{comfyui_url}/prompt", json={"prompt": workflow}, timeout=30)
                         
                         if response.status_code == 200:
                             result = response.json()
                             prompt_id = result.get('prompt_id')
                             
                             if prompt_id:
-                                # Wait for completion and get image
-                                time.sleep(10)  # Wait for generation
+                                print(f"🆔 Prompt ID: {prompt_id}")
                                 
-                                # Get generated image
-                                history_response = requests.get(f"{comfyui_url}/history/{prompt_id}")
-                                if history_response.status_code == 200:
-                                    history = history_response.json()
-                                    outputs = history.get(prompt_id, {}).get('outputs', {})
+                                # Wait for completion with polling
+                                max_wait = 60  # 60 seconds max
+                                wait_time = 0
+                                while wait_time < max_wait:
+                                    time.sleep(3)
+                                    wait_time += 3
                                     
-                                    if '7' in outputs:
-                                        images = outputs['7']['images']
-                                        if images:
-                                            # Download image
-                                            image_data = images[0]
-                                            image_response = requests.get(f"{comfyui_url}/view?filename={image_data['filename']}")
-                                            
-                                            if image_response.status_code == 200:
-                                                # Save image
-                                                with open(image_path, 'wb') as f:
-                                                    f.write(image_response.content)
-                                                
-                                                scene_images.append({
-                                                    'scene_id': scene['scene_id'],
-                                                    'image_path': image_path,
-                                                    'prompt': scene['prompt'],
-                                                    'comfyui_prompt_id': prompt_id
-                                                })
-                                                
-                                                print(f"✅ Imagem ComfyUI gerada: cena {scene['scene_id']}")
-                                                continue
-                            
-                            # Fallback to mock if ComfyUI fails
-                            print(f"⚠️ ComfyUI falhou, usando mock para cena {scene['scene_id']}")
+                                    history_response = requests.get(f"{comfyui_url}/history/{prompt_id}", timeout=10)
+                                    if history_response.status_code == 200:
+                                        history = history_response.json()
+                                        if prompt_id in history:
+                                            outputs = history[prompt_id].get('outputs', {})
+                                            if '7' in outputs:
+                                                images = outputs['7']['images']
+                                                if images:
+                                                    print(f"🖼️ Imagem gerada! Baixando...")
+                                                    
+                                                    # Download image
+                                                    image_data = images[0]
+                                                    image_response = requests.get(f"{comfyui_url}/view?filename={image_data['filename']}", timeout=30)
+                                                    
+                                                    if image_response.status_code == 200:
+                                                        # Save image as binary
+                                                        with open(image_path, 'wb') as f:
+                                                            f.write(image_response.content)
+                                                        
+                                                        # Verify it's a real image
+                                                        if os.path.exists(image_path) and os.path.getsize(image_path) > 1000:
+                                                            scene_images.append({
+                                                                'scene_id': scene['scene_id'],
+                                                                'image_path': image_path,
+                                                                'prompt': scene['prompt'],
+                                                                'comfyui_prompt_id': prompt_id,
+                                                                'generation_method': 'comfyui'
+                                                            })
+                                                            
+                                                            print(f"✅ Imagem ComfyUI REAL gerada: cena {scene['scene_id']} ({os.path.getsize(image_path)} bytes)")
+                                                            continue
+                                                        else:
+                                                            print(f"⚠️ Arquivo baixado não é uma imagem válida")
+                                            else:
+                                                print(f"⏳ Aguardando geração... ({wait_time}s)")
+                                        else:
+                                            print(f"⏳ Prompt ainda não encontrado no histórico... ({wait_time}s)")
+                                    else:
+                                        print(f"⚠️ Erro ao consultar histórico: {history_response.status_code}")
+                                else:
+                                    print(f"⏱️ Timeout após {max_wait}s")
+                            else:
+                                print(f"⚠️ Nenhum prompt_id retornado")
+                        else:
+                            print(f"⚠️ Erro ao enviar workflow: {response.status_code} - {response.text}")
                     
-                    # Fallback mock generation
+                    # Fallback mock generation se ComfyUI falhar
+                    print(f"💡 Usando mock de imagem para cena {scene['scene_id']}")
                     with open(image_path, 'w') as f:
                         f.write(f"Mock image for scene {scene['scene_id']}: {scene['prompt']}")
                     
@@ -334,8 +383,11 @@ Retorne em formato JSON:
                         import requests
                         import json
                         
+                        print(f"🔑 ElevenLabs API Key: {'✅ Configurada' if elevenlabs_api_key else '❌ Não encontrada'}")
+                        
                         # Prepare text for narration (scene description)
                         narration_text = f"Cena {scene['scene_id']}: {scene['description']}"
+                        print(f"📝 Texto para narração: {narration_text[:100]}...")
                         
                         # ElevenLabs API call
                         headers = {
@@ -356,25 +408,46 @@ Retorne em formato JSON:
                         # Use a default voice (you can customize this)
                         voice_url = 'https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM'
                         
-                        response = requests.post(voice_url, headers=headers, json=data)
-                        
-                        if response.status_code == 200:
-                            # Save real audio
-                            with open(audio_path, 'wb') as f:
-                                f.write(response.content)
+                        print(f"🎤 Chamando ElevenLabs API...")
+                        try:
+                            response = requests.post(voice_url, headers=headers, json=data, timeout=30)
                             
-                            audio_files.append({
-                                'scene_id': scene['scene_id'],
-                                'audio_path': audio_path,
-                                'text': narration_text,
-                                'voice_id': '21m00Tcm4TlvDq8ikWAM',
-                                'generation_method': 'elevenlabs'
-                            })
+                            print(f"📊 Status Code: {response.status_code}")
+                            if response.status_code != 200:
+                                print(f"❌ Resposta ElevenLabs: {response.text[:500]}")
                             
-                            print(f"✅ Áudio ElevenLabs gerado: cena {scene['scene_id']}")
-                            continue
-                        else:
-                            print(f"⚠️ ElevenLabs falhou: {response.status_code}")
+                            if response.status_code == 200:
+                                # Save real audio
+                                with open(audio_path, 'wb') as f:
+                                    f.write(response.content)
+                                
+                                # Verify it's real audio
+                                if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+                                    audio_files.append({
+                                        'scene_id': scene['scene_id'],
+                                        'audio_path': audio_path,
+                                        'text': narration_text,
+                                        'voice_id': '21m00Tcm4TlvDq8ikWAM',
+                                        'generation_method': 'elevenlabs'
+                                    })
+                                    
+                                    print(f"✅ Áudio ElevenLabs REAL gerado: cena {scene['scene_id']} ({os.path.getsize(audio_path)} bytes)")
+                                    continue
+                                else:
+                                    print(f"⚠️ Arquivo de áudio não é válido")
+                            else:
+                                print(f"⚠️ ElevenLabs falhou: HTTP {response.status_code}")
+                                if response.status_code == 401:
+                                    print(f"❌ Erro de autenticação - verifique API Key")
+                                elif response.status_code == 429:
+                                    print(f"⚠️ Limite de taxa excedido - tente novamente mais tarde")
+                                elif response.status_code == 400:
+                                    print(f"❌ Requisição inválida - verifique os parâmetros")
+                                    
+                        except Exception as e:
+                            print(f"⚠️ Erro na chamada ElevenLabs: {e}")
+                    else:
+                        print(f"❌ ElevenLabs API Key não encontrada nas variáveis de ambiente")
                     
                     # Fallback mock generation
                     with open(audio_path, 'w') as f:

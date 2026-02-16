@@ -204,12 +204,17 @@ jobs:
             fi
           fi
           
-          # Instalar dependências Python
+          # Instalar dependências Python e FFmpeg
           echo "📦 Instalando dependências Python..."
           pip install langchain langchain-openai langchain-google-genai langgraph dagster python-dotenv requests pillow
           
+          echo "🎬 Instalando FFmpeg..."
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          
           # Verificar ambiente
           python .github/scripts/check_env.py
+          python .github/scripts/check_deps.py
           
           # Executar pipeline real
           python .github/scripts/run_ai_pipeline.py
