@@ -265,8 +265,6 @@ teste_*.py
 debug_*.py
 *_debug.py
 diagnose_*.py
-check_*.py
-*_check.py
 example_*.py
 *_example.py
 run_test*.py
