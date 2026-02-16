@@ -118,10 +118,16 @@ Retorne em formato JSON:
                     if isinstance(content, list):
                         content = " ".join(str(item) for item in content)
                     
-                    # Extract JSON from response
-                    json_match = re.search(r'\[.*\]', content, re.DOTALL)
+                    # Debug: ver resposta do LLM
+                    print(f"🔍 DEBUG - Resposta LLM (primeiros 500 chars): {content[:500]}")
+                    
+                    # Extract JSON from response - melhorar regex
+                    json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
                     if json_match:
-                        scenes = json.loads(json_match.group())
+                        json_str = json_match.group()
+                        # Limpar possíveis problemas
+                        json_str = json_str.replace('{{', '{').replace('}}', '}')
+                        scenes = json.loads(json_str)
                         print(f"✅ {len(scenes)} cenas geradas com LLM")
                     else:
                         raise ValueError("Não foi possível extrair JSON da resposta")
