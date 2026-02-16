@@ -13,6 +13,12 @@ class Open3DAgentState(TypedDict):
     current_step: str
     scene_data: Dict[str, Any]
     generated_content: Dict[str, Any]
+    # Campos adicionais necessários
+    story_text: str
+    session_id: str
+    input_type: str
+    max_scenes: int
+    enhanced_multimodal_input_asset: Dict[str, Any]
 
 
 def create_open3d_workflow():
