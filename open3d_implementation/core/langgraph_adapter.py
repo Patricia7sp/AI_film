@@ -113,20 +113,47 @@ Retorne em formato JSON:
                     # Parse response
                     import json
                     import re
+                    import ast
                     
                     # Extrair conteúdo da resposta - tratar diferentes formatos
                     raw_content = response.content if hasattr(response, 'content') else str(response)
                     
-                    # Verificar se é um dicionário (formato {'type': 'text', 'text': ...})
+                    # Debug: ver tipo e conteúdo original
+                    print(f"🔍 DEBUG - Tipo de raw_content: {type(raw_content)}")
+                    print(f"🔍 DEBUG - raw_content (primeiros 200 chars): {str(raw_content)[:200]}")
+                    
+                    # Verificar se é um dicionário real ou string que parece dict
                     if isinstance(raw_content, dict):
                         content = raw_content.get('text', str(raw_content))
                     elif isinstance(raw_content, list):
                         content = " ".join(str(item) for item in raw_content)
                     else:
-                        content = str(raw_content)
+                        # É string - verificar se parece um dict
+                        content_str = str(raw_content)
+                        
+                        # Tentar extrair valor de 'text' se a string parecer um dict
+                        if "{'type': 'text', 'text':" in content_str or '{"type": "text", "text":' in content_str:
+                            try:
+                                # Tentar parse como dict Python
+                                parsed = ast.literal_eval(content_str)
+                                if isinstance(parsed, dict) and 'text' in parsed:
+                                    content = parsed['text']
+                                    print(f"✅ Extraído campo 'text' do dict")
+                                else:
+                                    content = content_str
+                            except:
+                                # Fallback: regex para extrair texto
+                                text_match = re.search(r"'text':\s*['\"](.+?)['\"]", content_str, re.DOTALL)
+                                if text_match:
+                                    content = text_match.group(1)
+                                    print(f"✅ Extraído campo 'text' via regex")
+                                else:
+                                    content = content_str
+                        else:
+                            content = content_str
                     
-                    # Debug: ver resposta do LLM
-                    print(f"🔍 DEBUG - Resposta LLM (primeiros 500 chars): {content[:500]}")
+                    # Debug: ver resposta do LLM processada
+                    print(f"🔍 DEBUG - Resposta LLM processada (primeiros 500 chars): {content[:500]}")
                     
                     # Extract JSON from response - melhorar regex para markdown
                     # Remover markdown se presente
