@@ -114,9 +114,16 @@ Retorne em formato JSON:
                     import json
                     import re
                     
-                    content = response.content if hasattr(response, 'content') else str(response)
-                    if isinstance(content, list):
-                        content = " ".join(str(item) for item in content)
+                    # Extrair conteúdo da resposta - tratar diferentes formatos
+                    raw_content = response.content if hasattr(response, 'content') else str(response)
+                    
+                    # Verificar se é um dicionário (formato {'type': 'text', 'text': ...})
+                    if isinstance(raw_content, dict):
+                        content = raw_content.get('text', str(raw_content))
+                    elif isinstance(raw_content, list):
+                        content = " ".join(str(item) for item in raw_content)
+                    else:
+                        content = str(raw_content)
                     
                     # Debug: ver resposta do LLM
                     print(f"🔍 DEBUG - Resposta LLM (primeiros 500 chars): {content[:500]}")
