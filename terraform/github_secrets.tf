@@ -5,7 +5,7 @@
 
 terraform {
   required_version = ">= 1.0"
-  
+
   required_providers {
     github = {
       source  = "integrations/github"
@@ -56,28 +56,28 @@ variable "openai_api_key" {
   description = "OpenAI API Key (Fallback)"
   type        = string
   sensitive   = true
-  default     = ""  # Opcional - já existe no GitHub
+  default     = "" # Opcional - já existe no GitHub
 }
 
 variable "elevenlabs_api_key" {
   description = "ElevenLabs API Key"
   type        = string
   sensitive   = true
-  default     = ""  # Opcional - já existe no GitHub
+  default     = "" # Opcional - já existe no GitHub
 }
 
 variable "stability_api_key" {
   description = "Stability AI API Key"
   type        = string
   sensitive   = true
-  default     = ""  # Opcional - já existe no GitHub
+  default     = "" # Opcional - já existe no GitHub
 }
 
 variable "replicate_api_token" {
   description = "Replicate API Token"
   type        = string
   sensitive   = true
-  default     = ""  # Opcional - já existe no GitHub
+  default     = "" # Opcional - já existe no GitHub
 }
 
 # ============================================================

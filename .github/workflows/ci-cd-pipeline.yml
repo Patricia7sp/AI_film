@@ -90,7 +90,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-cov pytest-xdist pytest-timeout
+          pip install pytest pytest-cov pytest-xdist pytest-timeout requests
           if [ -d open3d_implementation/tests ]; then
             pip install -r open3d_implementation/orchestration/requirements_dagster.txt
           fi
@@ -108,7 +108,7 @@ jobs:
               '' \
               '    assert adapter.WorkflowConfig().max_iterations == 10' \
               > .ci-tests/test_open3d_import.py
-            pytest .ci-tests -v --cov=open3d_implementation --cov-report=xml --maxfail=1
+            PYTHONPATH="$PWD" pytest .ci-tests -v --cov=open3d_implementation --cov-report=xml --maxfail=1
           fi
 
       - name: Upload Coverage to Codecov
