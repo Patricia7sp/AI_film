@@ -20,6 +20,7 @@ jobs:
   get-comfyui-url:
     name: Get ComfyUI URL from Colab
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
