@@ -8,15 +8,13 @@ setup(
         "langgraph>=0.1.0",
         "streamlit>=1.29.0",
         "pydantic>=2.5.0",
-        "langchain>=0.1.0"
+        "langchain>=0.1.0",
     ],
-    package_data={
-        "": ["*.txt", "*.json"]
-    },
+    package_data={"": ["*.txt", "*.json"]},
     include_package_data=True,
     python_requires=">=3.8",
     author="Seu Nome",
     author_email="paty7sp@gmail.com",
     description="MCP (Model Context Protocol) para LangGraph",
-    license="MIT"
+    license="MIT",
 )
