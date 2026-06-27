@@ -31,6 +31,7 @@ variable "github_token" {
   description = "GitHub Personal Access Token com permissão 'repo'"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "github_owner" {
@@ -49,7 +50,7 @@ variable "gemini_api_key" {
   description = "Google Gemini API Key"
   type        = string
   sensitive   = true
-  default     = "AIzaSyD6L3PQI5MSmiQvosOrhcQllU4_O3UplP4"
+  default     = ""
 }
 
 variable "openai_api_key" {
@@ -86,6 +87,7 @@ variable "replicate_api_token" {
 
 # Gemini API Key (Principal LLM)
 resource "github_actions_secret" "gemini_api_key" {
+  count           = var.gemini_api_key != "" ? 1 : 0
   repository      = var.github_repository
   secret_name     = "GEMINI_API_KEY"
   plaintext_value = var.gemini_api_key
@@ -130,7 +132,7 @@ resource "github_actions_secret" "replicate_api_token" {
 output "secrets_created" {
   description = "Lista de secrets criados"
   value = [
-    "GEMINI_API_KEY",
+    var.gemini_api_key != "" ? "GEMINI_API_KEY" : null,
     var.openai_api_key != "" ? "OPENAI_API_KEY" : null,
     var.elevenlabs_api_key != "" ? "ELEVENLABS_API_KEY" : null,
     var.stability_api_key != "" ? "STABILITY_API_KEY" : null,

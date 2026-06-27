@@ -49,11 +49,11 @@ nano terraform.tfvars
 
 **Conteúdo do `terraform.tfvars`:**
 ```hcl
-github_token      = "ghp_seu_token_aqui"
+github_token      = "your-github-token"
 github_owner      = "Patricia7sp"
 github_repository = "AI_film"
 
-gemini_api_key    = "AIzaSyD6L3PQI5MSmiQvosOrhcQllU4_O3UplP4"
+gemini_api_key    = "your-gemini-api-key"
 ```
 
 ### **Passo 2: Inicializar Terraform**
@@ -220,8 +220,8 @@ terraform/.terraform.lock.hcl
 
 4. ✅ **Use variáveis de ambiente (alternativa)**
    ```bash
-   export TF_VAR_github_token="ghp_..."
-   export TF_VAR_gemini_api_key="AIza..."
+   export TF_VAR_github_token="your-github-token"
+   export TF_VAR_gemini_api_key="your-gemini-api-key"
    terraform apply
    ```
 
