@@ -22,7 +22,127 @@ O **AI Film Pipeline** é um sistema completo de produção automatizada de film
 
 ---
 
-## 🏗️ Arquitetura do CI/CD (Sem Cloud)
+## 🏗️ Arquitetura Completa do Sistema
+
+### **Fluxo End-to-End: GitHub Actions → Colab → Dagster → Produção**
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                    🎬 AI FILM PIPELINE - ARQUITETURA COMPLETA                  ║
+║                   100% Automatizado: Git → Colab → Dagster → Cloud            ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         🔵 FASE 1: CI/CD & COLAB GPU                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+         ┌──────────────────┐
+         │  GitHub Actions  │
+         │      CI/CD       │  ← Push/PR/Manual Trigger
+         └────────┬─────────┘
+                  │
+                  ├─> 1️⃣ Orchestrate Colab (Service Account Auth)
+                  │
+         ┌────────▼─────────┐
+         │  Google Colab    │
+         │    GPU (T4)      │  ← GPU Gratuita
+         │                  │
+         │ • ComfyUI        │
+         │ • Cloudflare     │
+         └────────┬─────────┘
+                  │
+                  │ Cloudflare Tunnel
+                  ▼
+         ┌────────────────────────────────┐
+         │  ComfyUI Public Endpoint       │
+         │  https://xxx.trycloudflare.com │  ← URL Capturada via Gist
+         └────────┬───────────────────────┘
+                  │
+                  └─> ✅ ComfyUI Ready!
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   🟢 FASE 2: DAGSTER ORCHESTRATION                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                  │
+                  ├─> 2️⃣ Trigger Dagster Pipeline (GraphQL API)
+                  │
+         ┌────────▼─────────────────────────────────────────┐
+         │         KUBERNETES CLUSTER (Local/Cloud)          │
+         │                                                    │
+         │  ┌──────────────┐  ┌──────────────┐  ┌─────────┐│
+         │  │   Dagster    │  │  LangGraph   │  │  Flask  ││
+         │  │  Webserver   │  │     MCP      │  │ Upload  ││
+         │  │  Port 3000   │  │  Port 8000   │  │ Port 5000││
+         │  └──────┬───────┘  └──────┬───────┘  └─────────┘│
+         │         │                 │                       │
+         │         └────────┬────────┘                       │
+         │                  │                                │
+         │  ┌───────────────▼────────────────────────────┐  │
+         │  │      MICROSERVICES LAYER                    │  │
+         │  │                                              │  │
+         │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐ │  │
+         │  │  │ ComfyUI  │  │ Blender  │  │  FFmpeg  │ │  │
+         │  │  │ Port 8188│  │ Port 9876│  │ Service  │ │  │
+         │  │  └──────────┘  └──────────┘  └──────────┘ │  │
+         │  │                                              │  │
+         │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐ │  │
+         │  │  │  OpenCV  │  │  Redis   │  │PostgreSQL│ │  │
+         │  │  │ Service  │  │  Cache   │  │ Dagster  │ │  │
+         │  │  └──────────┘  └──────────┘  └──────────┘ │  │
+         │  └──────────────────┬───────────────────────┘  │
+         │                     │                           │
+         │  ┌──────────────────▼──────────────────────┐   │
+         │  │      PERSISTENT STORAGE (PVCs)           │   │
+         │  │                                           │   │
+         │  │  ┌──────────┐  ┌──────────┐  ┌────────┐ │   │
+         │  │  │  Images  │  │  Videos  │  │ Models │ │   │
+         │  │  │   PVC    │  │   PVC    │  │  PVC   │ │   │
+         │  │  └──────────┘  └──────────┘  └────────┘ │   │
+         │  └───────────────────────────────────────┘   │
+         └──────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    🟡 FASE 3: EXTERNAL INTEGRATIONS                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+         ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+         │ Google Colab │ ───> │  Cloudflare  │ ───> │   ComfyUI    │
+         │    (GPU)     │      │    Tunnel    │      │   Endpoint   │
+         └──────────────┘      └──────────────┘      └──────────────┘
+```
+
+### **Diagrama Interativo (Mermaid)**
+
+```mermaid
+graph TD
+    A[GitHub Actions CI/CD] --> B[1️⃣ Orchestrate Colab]
+    B --> C[Google Colab GPU]
+    C --> D[ComfyUI + Cloudflare]
+    D --> E[✅ ComfyUI Endpoint Ready]
+    
+    E --> F[2️⃣ Trigger Dagster Pipeline]
+    F --> G[Dagster Webserver Port 3000]
+    G --> H[LangGraph MCP Port 8000]
+    
+    H --> I[MICROSERVICES LAYER]
+    I --> J[ComfyUI Port 8188]
+    I --> K[Blender Port 9876]
+    I --> L[FFmpeg Service]
+    I --> M[OpenCV Service]
+    
+    I --> N[Redis Cache]
+    I --> O[PostgreSQL Dagster]
+    
+    J --> P[PERSISTENT STORAGE]
+    K --> P
+    L --> P
+    M --> P
+    
+    P --> Q[Images PVC]
+    P --> R[Videos PVC]
+    P --> S[Models PVC]
+```
 
 ### **Visão Geral da Arquitetura**
 

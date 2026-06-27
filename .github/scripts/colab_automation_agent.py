@@ -9,9 +9,19 @@ import os
 import sys
 import time
 import json
+import base64
+import binascii
 import requests
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, TypedDict
+
+
+class HealthStatus(TypedDict, total=False):
+    status: str
+    accessible: bool
+    response_time: float | None
+    timestamp: str
+    error: str
 
 class ColabAutomationAgent:
     
@@ -53,8 +63,6 @@ class ColabAutomationAgent:
         Usa GOOGLE_COLAB_CREDENTIALS para autenticar
         """
         try:
-            import base64
-            
             # Buscar credenciais do secret
             colab_creds = os.getenv('GOOGLE_COLAB_CREDENTIALS')
             if not colab_creds:
@@ -68,7 +76,7 @@ class ColabAutomationAgent:
             # Decodificar credenciais (se estiver em base64)
             try:
                 creds_json = base64.b64decode(colab_creds).decode('utf-8')
-            except:
+            except (binascii.Error, UnicodeDecodeError):
                 creds_json = colab_creds
             
             creds_data = json.loads(creds_json)
@@ -86,7 +94,7 @@ class ColabAutomationAgent:
             
             return True
             
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             self.log(f"⚠️ Erro no método Google API: {e}", "WARN")
             return False
     
@@ -120,7 +128,7 @@ class ColabAutomationAgent:
                 self.log(f"⚠️ Webhook retornou {response.status_code}", "WARN")
                 return True  # Continue mesmo assim
                 
-        except Exception as e:
+        except requests.RequestException as e:
             self.log(f"⚠️ Erro no webhook: {e}", "WARN")
             return True  # Continue mesmo assim
     
@@ -184,7 +192,7 @@ class ColabAutomationAgent:
             
             return None
             
-        except Exception as e:
+        except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError) as e:
             self.log(f"⚠️ Erro ao buscar Gist: {e}", "WARN")
             return None
     
@@ -193,19 +201,20 @@ class ColabAutomationAgent:
         try:
             response = requests.get(url, timeout=10)
             return response.status_code == 200
-        except:
+        except requests.RequestException:
             return False
     
-    def _export_url_to_github_output(self, url: str):
-        """Exporta URL para GitHub Actions output"""
+    def _persist_url_for_workflow(self, url: str):
+        """Persist ComfyUI URL as an artifact input without using job outputs."""
+        with open("comfyui_url.txt", "w", encoding="utf-8") as f:
+            f.write(url.strip())
+
         github_output = os.getenv('GITHUB_OUTPUT')
         if github_output:
             with open(github_output, 'a') as f:
-                f.write(f"comfyui_url={url}\n")
-            self.log("✅ URL exportada para GitHub Actions")
-        
-        # Também exportar como variável de ambiente
-        print(f"::set-output name=comfyui_url::{url}")
+                f.write("status=ready\n")
+
+        self.log("✅ URL persistida para artifact do GitHub Actions")
     
     def capture_and_export_url(self) -> Optional[str]:
         """
@@ -220,19 +229,19 @@ class ColabAutomationAgent:
             self.log("❌ Não foi possível capturar URL", "ERROR")
             return None
         
-        self.log(f"✅ URL capturada: {url}")
-        self._export_url_to_github_output(url)
+        self.log("✅ URL capturada")
+        self._persist_url_for_workflow(url)
         
         return url
     
-    def monitor_colab_health(self, url: str) -> Dict[str, Any]:
+    def monitor_colab_health(self, url: str) -> HealthStatus:
         """
         Monitora saúde do Colab e ComfyUI
         Retorna métricas para decisões inteligentes
         """
         self.log("🏥 Monitorando saúde do sistema...")
         
-        health = {
+        health: HealthStatus = {
             'status': 'unknown',
             'accessible': False,
             'response_time': None,
@@ -250,7 +259,7 @@ class ColabAutomationAgent:
             
             self.log(f"✅ Status: {health['status']} (tempo: {health['response_time']}s)")
             
-        except Exception as e:
+        except requests.RequestException as e:
             health['status'] = 'error'
             health['error'] = str(e)
             self.log(f"❌ Erro no health check: {e}", "ERROR")
@@ -280,9 +289,9 @@ class ColabAutomationAgent:
             
             # Usar fallback URL se disponível
             if self.fallback_url:
-                self.log(f"🔄 Usando fallback URL: {self.fallback_url}")
+                self.log("🔄 Usando fallback URL configurada")
                 url = self.fallback_url
-                self._export_url_to_github_output(url)
+                self._persist_url_for_workflow(url)
             else:
                 self.log("❌ Nenhum fallback URL configurado", "ERROR")
                 return False
@@ -301,7 +310,7 @@ class ColabAutomationAgent:
         
         self.log("=" * 60)
         self.log("✅ Automação completa executada com sucesso!")
-        self.log(f"🌐 ComfyUI URL: {url}")
+        self.log("🌐 ComfyUI URL pronta")
         self.log(f"🏥 Status: {health['status']}")
         self.log(f"⏱️ Tempo de resposta: {health['response_time']}s")
         

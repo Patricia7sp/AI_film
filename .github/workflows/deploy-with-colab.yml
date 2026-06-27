@@ -26,6 +26,7 @@ jobs:
   start-comfyui-colab:
     name: Start ComfyUI on Google Colab
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     outputs:
       comfyui_url: ${{ steps.get-url.outputs.url }}
       colab_status: ${{ steps.get-url.outputs.status }}

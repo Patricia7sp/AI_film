@@ -2,7 +2,7 @@ name: 🤖 Full Auto Colab Pipeline (100% Automated)
 
 on:
   push:
-    branches: [main, develop, automation-only]
+    branches: [main, develop]
   workflow_dispatch:
     inputs:
       force_colab_restart:
@@ -22,9 +22,6 @@ jobs:
   orchestrate-colab:
     name: 🤖 Orchestrate Colab (Automated)
     runs-on: ubuntu-latest
-    outputs:
-      comfyui_url: ${{ steps.agent.outputs.comfyui_url }}
-      colab_status: ${{ steps.agent.outputs.status }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -51,8 +48,7 @@ jobs:
           # Se disparado via repository_dispatch com URL no payload, usar diretamente
           if [ ! -z "$DISPATCH_COMFYUI_URL" ]; then
             echo "🎯 Disparado via repository_dispatch!"
-            echo "📝 URL recebida do Colab: $DISPATCH_COMFYUI_URL"
-            echo "comfyui_url=$DISPATCH_COMFYUI_URL" >> $GITHUB_OUTPUT
+            printf '%s' "$DISPATCH_COMFYUI_URL" > comfyui_url.txt
             echo "status=ready" >> $GITHUB_OUTPUT
             echo "✅ URL do Colab configurada diretamente!"
           else
@@ -63,15 +59,19 @@ jobs:
 
       - name: Verify URL captured
         run: |
-          URL="${{ steps.agent.outputs.comfyui_url }}"
-          echo "🔍 URL capturada: $URL"
-          
-          if [ -z "$URL" ]; then
+          if [ ! -s comfyui_url.txt ]; then
             echo "❌ URL não foi capturada pelo agente"
             exit 1
           fi
           
           echo "✅ URL válida capturada!"
+
+      - name: Upload URL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfyui-url
+          path: comfyui_url.txt
+          retention-days: 1
 
   # ============================================================
   # JOB 2: Update Configuration (Automated)
@@ -84,10 +84,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download ComfyUI URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
+
       - name: Update .env with Colab URL
         run: |
-          URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
-          echo "📝 Atualizando configurações com URL: $URL"
+          URL="$(cat comfyui_url.txt)"
+          echo "📝 Atualizando configurações com URL capturada"
           
           # Criar/atualizar .env
           echo "COMFYUI_URL=$URL" > .env.auto
@@ -107,6 +112,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download ComfyUI URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -117,11 +127,11 @@ jobs:
           pip install pytest requests
 
       - name: Test ComfyUI Integration
-        env:
-          COMFYUI_URL: ${{ needs.orchestrate-colab.outputs.comfyui_url }}
         run: |
+          COMFYUI_URL="$(cat comfyui_url.txt)"
+          export COMFYUI_URL
           echo "🧪 Testando integração com ComfyUI..."
-          echo "URL: $COMFYUI_URL"
+          echo "URL capturada para teste"
           
           # Criar teste
           cat > test_comfyui_auto.py << 'EOF'
@@ -154,6 +164,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download ComfyUI URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -165,9 +180,13 @@ jobs:
           pip install -r requirements.txt || echo "requirements.txt not found"
           pip install -r open3d_implementation/orchestration/requirements_dagster.txt || echo "requirements_dagster.txt not found"
 
+      - name: Export ComfyUI URL
+        run: |
+          echo "COMFYUI_URL=$(cat comfyui_url.txt)" >> "$GITHUB_ENV"
+          echo "✅ ComfyUI URL carregada"
+
       - name: 🎬 Run AI Film Pipeline
         env:
-          COMFYUI_URL: ${{ needs.orchestrate-colab.outputs.comfyui_url }}
           STORY_INPUT: ${{ github.event.client_payload.story }}
           # LLM APIs (Gemini como principal, OpenAI como fallback)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -179,7 +198,7 @@ jobs:
           REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
         run: |
           echo "🎬 Iniciando pipeline de geração de conteúdo..."
-          echo "URL do ComfyUI: $COMFYUI_URL"
+          echo "URL do ComfyUI carregada"
           echo "🤖 LLM: Gemini 2.0 Flash (Principal)"
           
           # Criar diretório output se não existir
@@ -235,11 +254,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download ComfyUI URL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: comfyui-url
+
       - name: Update Kubernetes Secret
         run: |
-          URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
+          URL="$(cat comfyui_url.txt)"
           echo "🔐 Atualizando secret do Kubernetes..."
-          echo "URL: $URL"
+          echo "URL capturada para secret"
           
           # Aqui você configuraria kubectl e atualizaria o secret
           # kubectl create secret generic comfyui-url --from-literal=url="$URL" --dry-run=client -o yaml | kubectl apply -f -
@@ -258,11 +282,9 @@ jobs:
       - name: Send notification
         run: |
           STATUS="${{ needs.generate-content.result }}"
-          URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
           
           echo "📢 Enviando notificação..."
           echo "Status: $STATUS"
-          echo "URL: $URL"
           
           # Aqui você pode enviar para Slack, Discord, etc
           # curl -X POST $WEBHOOK_URL -d "Pipeline status: $STATUS"

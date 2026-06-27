@@ -21,7 +21,7 @@ def capture_and_send_comfyui_url_auto():
     print("="*70)
     
     # Configurações (Configure estes valores)
-    GITHUB_TOKEN = "ghp_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN"  # Criar em: https://github.com/settings/tokens
+    GITHUB_TOKEN = "your-github-token"  # Criar em: https://github.com/settings/tokens
     GIST_ID = None  # Deixe None na primeira vez, depois atualize com o ID gerado
     
     # 1. Aguardar cloudflared criar o túnel

@@ -110,10 +110,16 @@ def main():
     
     print(f"📦 Repositório: {REPO_OWNER}/{REPO_NAME}")
     print(f"🔑 Token: {'✅ Configurado' if github_token else '❌ Não encontrado'}")
-    
+
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        print("❌ GEMINI_API_KEY não encontrado!")
+        print("💡 Defina: export GEMINI_API_KEY='your-gemini-api-key'")
+        sys.exit(1)
+
     # Secrets para adicionar
     secrets = {
-        "GEMINI_API_KEY": "AIzaSyD6L3PQI5MSmiQvosOrhcQllU4_O3UplP4",
+        "GEMINI_API_KEY": gemini_api_key,
         # Adicione outros secrets aqui se necessário
         # "ELEVENLABS_API_KEY": "...",
         # "STABILITY_API_KEY": "...",

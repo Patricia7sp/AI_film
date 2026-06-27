@@ -8,31 +8,38 @@ import os
 import sys
 import json
 import time
+import subprocess
 import requests
 from typing import Optional
 
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPO = os.getenv('GITHUB_REPOSITORY', 'Patricia7sp/AI_film')
 GIST_ID = os.getenv('COMFYUI_URL_GIST_ID')  # ID do Gist para armazenar URL
+URL_ARTIFACT_PATH = "comfyui_url.txt"
 
 
-def create_or_update_gist(url: str) -> str:
+def persist_url_artifact(url: str) -> None:
+    with open(URL_ARTIFACT_PATH, "w", encoding="utf-8") as artifact:
+        artifact.write(f"{url}\n")
+
+
+def create_or_update_gist(url: str) -> Optional[str]:
     """
     Cria ou atualiza um Gist com a URL do ComfyUI
-    
+
     Args:
         url: URL do ComfyUI
-        
+
     Returns:
         ID do Gist
     """
     print("📝 Atualizando Gist com URL do ComfyUI...")
-    
+
     headers = {
         'Authorization': f'token {GITHUB_TOKEN}',
         'Accept': 'application/vnd.github.v3+json'
     }
-    
+
     gist_content = {
         "description": "ComfyUI URL - AI Film Pipeline",
         "public": False,
@@ -46,7 +53,7 @@ def create_or_update_gist(url: str) -> str:
             }
         }
     }
-    
+
     if GIST_ID:
         # Atualizar Gist existente
         response = requests.patch(
@@ -61,7 +68,7 @@ def create_or_update_gist(url: str) -> str:
             headers=headers,
             json=gist_content
         )
-    
+
     if response.status_code in [200, 201]:
         gist_data = response.json()
         gist_id = gist_data['id']
@@ -76,98 +83,96 @@ def create_or_update_gist(url: str) -> str:
 def read_url_from_gist() -> Optional[str]:
     """
     Lê a URL do ComfyUI do Gist
-    
+
     Returns:
         URL ou None
     """
     if not GIST_ID:
         print("⚠️ COMFYUI_URL_GIST_ID não configurado")
         return None
-    
+
     print(f"📖 Lendo URL do Gist: {GIST_ID}")
-    
+
     try:
         response = requests.get(
             f'https://api.github.com/gists/{GIST_ID}',
             headers={'Accept': 'application/vnd.github.v3+json'}
         )
-        
+
         if response.status_code == 200:
             gist_data = response.json()
             content = gist_data['files']['comfyui_url.json']['content']
             data = json.loads(content)
             url = data.get('url')
-            
+
             if url:
-                print(f"✅ URL obtida do Gist: {url}")
+                print("✅ URL obtida do Gist")
                 return url
         else:
             print(f"⚠️ Erro ao ler Gist: {response.status_code}")
-    except Exception as e:
-        print(f"❌ Erro: {e}")
-    
+    except (requests.RequestException, KeyError, json.JSONDecodeError) as exc:
+        print(f"❌ Erro ao ler URL do Gist: {exc}")
+
     return None
 
 
 def update_github_secret(secret_name: str, secret_value: str) -> bool:
     """
     Atualiza um secret do GitHub usando a API
-    
+
     Args:
         secret_name: Nome do secret
         secret_value: Valor do secret
-        
+
     Returns:
         True se sucesso
     """
     print(f"🔐 Atualizando secret {secret_name}...")
-    
+
     try:
         # Usar gh CLI para atualizar secret
-        import subprocess
-        
         result = subprocess.run(
             ['gh', 'secret', 'set', secret_name, '--body', secret_value],
             capture_output=True,
             text=True
         )
-        
+
         if result.returncode == 0:
             print(f"✅ Secret {secret_name} atualizado!")
             return True
         else:
             print(f"❌ Erro ao atualizar secret: {result.stderr}")
             return False
-    except Exception as e:
-        print(f"❌ Erro: {e}")
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        print(f"❌ Erro ao atualizar secret: {exc}")
         return False
 
 
 def wait_for_url_in_gist(max_wait: int = 300) -> Optional[str]:
     """
     Aguarda URL aparecer no Gist (polling)
-    
+
     Args:
         max_wait: Tempo máximo de espera em segundos
-        
+
     Returns:
         URL ou None
     """
     print(f"⏳ Aguardando URL no Gist (máx {max_wait}s)...")
-    
+
     start_time = time.time()
     attempt = 0
-    
+
     while (time.time() - start_time) < max_wait:
         attempt += 1
         url = read_url_from_gist()
-        
+
         if url and url.startswith('https://'):
             return url
-        
+
         print(f"   Tentativa {attempt}... (aguardando)")
         time.sleep(10)
-    
+
     print("⏰ Timeout aguardando URL")
     return None
 
@@ -180,33 +185,33 @@ def main():
     print("🔄 AUTO UPDATE COMFYUI URL")
     print("=" * 70)
     print()
-    
+
     # Verificar se deve atualizar (quando vem do Colab) ou ler (no workflow)
     mode = os.getenv('MODE', 'read')  # 'read' ou 'write'
-    
+
     if mode == 'write':
         # Modo escrita: Colab envia URL
         url = os.getenv('COMFYUI_URL')
         if not url:
             print("❌ COMFYUI_URL não fornecida")
             sys.exit(1)
-        
+
         gist_id = create_or_update_gist(url)
         if gist_id:
             print(f"\n✅ URL armazenada com sucesso!")
             print(f"Gist ID: {gist_id}")
-            # Exportar para GitHub Actions
+            # Exportar status para GitHub Actions
             github_output = os.getenv('GITHUB_OUTPUT')
             if github_output:
-                with open(github_output, 'a') as f:
+                with open(github_output, 'a', encoding="utf-8") as f:
                     f.write(f"gist_id={gist_id}\n")
         else:
             sys.exit(1)
-    
+
     else:
         # Modo leitura: Workflow lê URL do Gist
         url = wait_for_url_in_gist(max_wait=300)
-        
+
         if not url:
             print("\n❌ Não foi possível obter URL")
             print("\n📋 SOLUÇÕES:")
@@ -214,19 +219,15 @@ def main():
             print("2. Aguarde o túnel Cloudflare ser criado")
             print("3. A URL será capturada automaticamente")
             sys.exit(1)
-        
-        # Atualizar secret
-        if update_github_secret('COMFYUI_FALLBACK_URL', url):
-            print(f"\n✅ URL atualizada automaticamente: {url}")
-            
-            # Exportar para GitHub Actions
-            github_output = os.getenv('GITHUB_OUTPUT')
-            if github_output:
-                with open(github_output, 'a') as f:
-                    f.write(f"url={url}\n")
-                    f.write(f"status=success\n")
-        else:
-            sys.exit(1)
+
+        persist_url_artifact(url)
+        print("\n✅ URL salva para o workflow")
+
+        # Exportar apenas status para GitHub Actions. A URL fica em artifact.
+        github_output = os.getenv('GITHUB_OUTPUT')
+        if github_output:
+            with open(github_output, 'a', encoding="utf-8") as f:
+                f.write("status=success\n")
 
 
 if __name__ == "__main__":
