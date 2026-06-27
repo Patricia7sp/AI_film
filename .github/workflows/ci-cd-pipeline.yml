@@ -36,7 +36,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install black flake8 mypy pylint isort bandit "safety<3"
+          pip install black==24.10.0 flake8==7.1.1 mypy pylint isort bandit
 
       - name: Run Black (Code Formatting)
         run: |
@@ -61,6 +61,7 @@ jobs:
 
       - name: Run Safety (Dependency Security)
         run: |
+          pip install "safety<3"
           safety check -r open3d_implementation/orchestration/requirements_dagster.txt --json
 
       - name: Type Checking with MyPy
