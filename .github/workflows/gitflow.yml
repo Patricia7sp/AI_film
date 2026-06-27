@@ -24,14 +24,14 @@ jobs:
     steps:
       - name: Check branch name
         run: |
-          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          BRANCH_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
           echo "Branch: $BRANCH_NAME"
           
-          if [[ "$BRANCH_NAME" =~ ^(main|develop|feature/.*|hotfix/.*|release/.*)$ ]]; then
+          if [[ "$BRANCH_NAME" =~ ^(main|develop|automation-only|feature/.*|hotfix/.*|release/.*)$ ]]; then
             echo "✅ Branch name válido: $BRANCH_NAME"
           else
             echo "❌ Branch name inválido: $BRANCH_NAME"
-            echo "Padrões aceitos: main, develop, feature/*, hotfix/*, release/*"
+            echo "Padrões aceitos: main, develop, automation-only, feature/*, hotfix/*, release/*"
             exit 1
           fi
 
