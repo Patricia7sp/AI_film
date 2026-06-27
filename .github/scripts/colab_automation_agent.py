@@ -9,9 +9,19 @@ import os
 import sys
 import time
 import json
+import base64
+import binascii
 import requests
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, TypedDict
+
+
+class HealthStatus(TypedDict, total=False):
+    status: str
+    accessible: bool
+    response_time: float | None
+    timestamp: str
+    error: str
 
 class ColabAutomationAgent:
     
@@ -29,147 +39,30 @@ class ColabAutomationAgent:
         print(f"[{timestamp}] [{level}] {message}")
     def trigger_colab_execution(self) -> bool:
         """
-        Trigger Colab notebook execution
-        Tenta múltiplos métodos em ordem de preferência
+        Trigger Colab notebook execution via Google Drive API
+        Usa credenciais OAuth2 para iniciar notebook automaticamente
         """
         self.log("🚀 Iniciando execução do Colab notebook...")
         
-        # Método 1: Playwright (RECOMENDADO - Executa notebook automaticamente)
-        if self._trigger_via_playwright():
-            return True
-        
-        # Método 2: Google API (apenas autentica, não executa)
+        # Tentar método 1: Google Colab API (via credentials)
         if self._trigger_via_google_api():
             return True
         
-        # Método 3: Webhook
+        # Tentar método 2: Webhook
         if self._trigger_via_webhook():
             return True
         
-        # Método 4: Assumir que Colab já está rodando
+        # Método 3: Assumir que Colab já está rodando
         self.log("⚠️ Nenhum método de trigger funcionou", "WARN")
         self.log("💡 Assumindo que Colab já está rodando manualmente")
         return True
     
-    def _trigger_via_playwright(self) -> bool:
-        """
-        Método 1: Trigger via Playwright (RECOMENDADO)
-        Executa notebook Colab automaticamente usando browser automation
-        """
-        try:
-            import subprocess
-            
-            self.log("=" * 60)
-            self.log("🔍 VALIDAÇÃO DE CREDENCIAIS PARA PLAYWRIGHT")
-            self.log("=" * 60)
-            
-            # Verificar se temos credenciais Google
-            google_email = os.getenv('GOOGLE_EMAIL')
-            google_password = os.getenv('GOOGLE_PASSWORD')
-            
-            # Log detalhado de validação
-            self.log(f"📧 GOOGLE_EMAIL: {'✅ Configurado' if google_email else '❌ NÃO CONFIGURADO'}")
-            if google_email:
-                # Mostrar parte do email para debug (mascarar parte sensível)
-                masked_email = google_email[:3] + "***" + google_email[google_email.find('@'):] if '@' in google_email else "***"
-                self.log(f"   Email (masked): {masked_email}")
-            
-            self.log(f"🔑 GOOGLE_PASSWORD: {'✅ Configurado' if google_password else '❌ NÃO CONFIGURADO'}")
-            if google_password:
-                self.log(f"   Tamanho: {len(google_password)} caracteres")
-            
-            self.log(f"📓 COLAB_NOTEBOOK_ID: {'✅ Configurado' if self.colab_notebook_id else '❌ NÃO CONFIGURADO'}")
-            if self.colab_notebook_id:
-                self.log(f"   ID: {self.colab_notebook_id}")
-            
-            # Validar credenciais
-            if not google_email:
-                self.log("❌ GOOGLE_EMAIL não configurado", "ERROR")
-                self.log("💡 Configure o secret GOOGLE_EMAIL no GitHub", "WARN")
-                return False
-                
-            if not google_password:
-                self.log("❌ GOOGLE_PASSWORD não configurado", "ERROR")
-                self.log("💡 Configure o secret GOOGLE_PASSWORD no GitHub", "WARN")
-                return False
-            
-            if not self.colab_notebook_id:
-                self.log("❌ COLAB_NOTEBOOK_ID não configurado", "ERROR")
-                return False
-            
-            self.log("=" * 60)
-            self.log("🎭 Iniciando Colab via Playwright AVANÇADO...")
-            self.log("=" * 60)
-            
-            # Executar script Playwright AVANÇADO (com stealth manual)
-            playwright_script = ".github/scripts/advanced_playwright_colab.py"
-            
-            if not os.path.exists(playwright_script):
-                self.log(f"❌ Script Playwright não encontrado: {playwright_script}", "ERROR")
-                return False
-            
-            self.log(f"📄 Script encontrado: {playwright_script}")
-            self.log(f"🐍 Python: {sys.executable}")
-            self.log("⏳ Executando Playwright (timeout: 5 minutos)...")
-            self.log("")
-            
-            # Executar em subprocesso
-            result = subprocess.run(
-                [sys.executable, playwright_script],
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minutos timeout
-            )
-            
-            self.log("=" * 60)
-            self.log("📊 RESULTADO DO PLAYWRIGHT")
-            self.log("=" * 60)
-            self.log(f"Return Code: {result.returncode}")
-            
-            # Mostrar STDOUT (logs do Playwright)
-            if result.stdout:
-                self.log("📤 STDOUT:")
-                for line in result.stdout.strip().split('\n'):
-                    self.log(f"   {line}")
-            else:
-                self.log("📤 STDOUT: (vazio)")
-            
-            # Mostrar STDERR (erros do Playwright)
-            if result.stderr:
-                self.log("📥 STDERR:")
-                for line in result.stderr.strip().split('\n'):
-                    self.log(f"   {line}")
-            else:
-                self.log("📥 STDERR: (vazio)")
-            
-            self.log("=" * 60)
-            
-            if result.returncode == 0:
-                self.log("✅ Playwright executou notebook com sucesso!")
-                self.log("📡 Notebook está rodando, aguardando URL no Gist...")
-                return True
-            else:
-                self.log(f"❌ Playwright falhou com código: {result.returncode}", "ERROR")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            self.log("❌ Playwright timeout (5 minutos)", "ERROR")
-            self.log("⚠️ Processo demorou mais que o esperado", "WARN")
-            return False
-        except Exception as e:
-            self.log(f"❌ Erro no método Playwright: {e}", "ERROR")
-            import traceback
-            self.log(f"Traceback: {traceback.format_exc()}", "ERROR")
-            return False
-    
     def _trigger_via_google_api(self) -> bool:
         """
-        Método 2: Trigger via Google Colab API
-        Usa GOOGLE_COLAB_CREDENTIALS para autenticar (apenas valida, não executa)
+        Método 1: Trigger via Google Colab API
+        Usa GOOGLE_COLAB_CREDENTIALS para autenticar
         """
         try:
-            import base64
-            
             # Buscar credenciais do secret
             colab_creds = os.getenv('GOOGLE_COLAB_CREDENTIALS')
             if not colab_creds:
@@ -183,7 +76,7 @@ class ColabAutomationAgent:
             # Decodificar credenciais (se estiver em base64)
             try:
                 creds_json = base64.b64decode(colab_creds).decode('utf-8')
-            except:
+            except (binascii.Error, UnicodeDecodeError):
                 creds_json = colab_creds
             
             creds_data = json.loads(creds_json)
@@ -201,7 +94,7 @@ class ColabAutomationAgent:
             
             return True
             
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             self.log(f"⚠️ Erro no método Google API: {e}", "WARN")
             return False
     
@@ -235,7 +128,7 @@ class ColabAutomationAgent:
                 self.log(f"⚠️ Webhook retornou {response.status_code}", "WARN")
                 return True  # Continue mesmo assim
                 
-        except Exception as e:
+        except requests.RequestException as e:
             self.log(f"⚠️ Erro no webhook: {e}", "WARN")
             return True  # Continue mesmo assim
     
@@ -299,7 +192,7 @@ class ColabAutomationAgent:
             
             return None
             
-        except Exception as e:
+        except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError) as e:
             self.log(f"⚠️ Erro ao buscar Gist: {e}", "WARN")
             return None
     
@@ -308,19 +201,20 @@ class ColabAutomationAgent:
         try:
             response = requests.get(url, timeout=10)
             return response.status_code == 200
-        except:
+        except requests.RequestException:
             return False
     
-    def _export_url_to_github_output(self, url: str):
-        """Exporta URL para GitHub Actions output"""
+    def _persist_url_for_workflow(self, url: str):
+        """Persist ComfyUI URL as an artifact input without using job outputs."""
+        with open("comfyui_url.txt", "w", encoding="utf-8") as f:
+            f.write(url.strip())
+
         github_output = os.getenv('GITHUB_OUTPUT')
         if github_output:
             with open(github_output, 'a') as f:
-                f.write(f"comfyui_url={url}\n")
-            self.log("✅ URL exportada para GitHub Actions")
-        
-        # Também exportar como variável de ambiente
-        print(f"::set-output name=comfyui_url::{url}")
+                f.write("status=ready\n")
+
+        self.log("✅ URL persistida para artifact do GitHub Actions")
     
     def capture_and_export_url(self) -> Optional[str]:
         """
@@ -335,19 +229,19 @@ class ColabAutomationAgent:
             self.log("❌ Não foi possível capturar URL", "ERROR")
             return None
         
-        self.log(f"✅ URL capturada: {url}")
-        self._export_url_to_github_output(url)
+        self.log("✅ URL capturada")
+        self._persist_url_for_workflow(url)
         
         return url
     
-    def monitor_colab_health(self, url: str) -> Dict[str, Any]:
+    def monitor_colab_health(self, url: str) -> HealthStatus:
         """
         Monitora saúde do Colab e ComfyUI
         Retorna métricas para decisões inteligentes
         """
         self.log("🏥 Monitorando saúde do sistema...")
         
-        health = {
+        health: HealthStatus = {
             'status': 'unknown',
             'accessible': False,
             'response_time': None,
@@ -365,7 +259,7 @@ class ColabAutomationAgent:
             
             self.log(f"✅ Status: {health['status']} (tempo: {health['response_time']}s)")
             
-        except Exception as e:
+        except requests.RequestException as e:
             health['status'] = 'error'
             health['error'] = str(e)
             self.log(f"❌ Erro no health check: {e}", "ERROR")
@@ -395,9 +289,9 @@ class ColabAutomationAgent:
             
             # Usar fallback URL se disponível
             if self.fallback_url:
-                self.log(f"🔄 Usando fallback URL: {self.fallback_url}")
+                self.log("🔄 Usando fallback URL configurada")
                 url = self.fallback_url
-                self._export_url_to_github_output(url)
+                self._persist_url_for_workflow(url)
             else:
                 self.log("❌ Nenhum fallback URL configurado", "ERROR")
                 return False
@@ -416,7 +310,7 @@ class ColabAutomationAgent:
         
         self.log("=" * 60)
         self.log("✅ Automação completa executada com sucesso!")
-        self.log(f"🌐 ComfyUI URL: {url}")
+        self.log("🌐 ComfyUI URL pronta")
         self.log(f"🏥 Status: {health['status']}")
         self.log(f"⏱️ Tempo de resposta: {health['response_time']}s")
         

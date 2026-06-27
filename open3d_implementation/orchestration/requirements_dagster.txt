@@ -1,0 +1,26 @@
+# Dagster Pipeline Requirements
+dagster>=1.5.0
+dagster-webserver>=1.5.0
+dagster-graphql>=1.5.0
+dagster-postgres>=0.21.0
+dagster-docker>=0.21.0
+
+# Core dependencies
+requests>=2.31.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# LangGraph integration
+langgraph>=0.0.1
+langchain>=0.1.0
+langchain-core>=0.1.0
+
+# Open3D
+open3d>=0.18.0
+
+# Logging
+structlog>=23.1.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0

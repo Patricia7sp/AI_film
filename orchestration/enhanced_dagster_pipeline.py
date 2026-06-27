@@ -108,14 +108,14 @@ def enhanced_multimodal_input_asset(
         if not story_text:
             raise ValueError("Nenhuma história fornecida via arquivo ou texto direto")
         
-        # Preparar estado inicial com logger estruturado
-        initial_state = Open3DAgentState(
-            session_id=config.session_id,
-            story_text=story_text,
-            input_type=config.input_type,
-            structured_logger=structured_logger,  # Adicionar logger ao estado
-            max_scenes=config.max_scenes,
-            metadata={
+        # Preparar estado inicial como dict (não usar Open3DAgentState)
+        initial_state = {
+            'session_id': config.session_id,
+            'story_text': story_text,
+            'input_type': config.input_type,
+            'structured_logger': structured_logger,
+            'max_scenes': config.max_scenes,
+            'metadata': {
                 "input_source": input_source,
                 "story_file_path": config.story_file_path if config.story_file_path else None,
                 "file_format": file_format,
@@ -124,7 +124,7 @@ def enhanced_multimodal_input_asset(
                 "quality_threshold": config.quality_threshold,
                 "structured_logging_enabled": config.enable_structured_logging
             }
-        )
+        }
         
         execution_time = time.time() - start_time
         
@@ -144,7 +144,18 @@ def enhanced_multimodal_input_asset(
         
         dagster_logger.info(f"✅ Entrada multimodal processada com sucesso em {execution_time:.2f}s")
         
-        return initial_state
+        # Retornar como dicionário para compatibilidade com LangGraph
+        return {
+            'session_id': initial_state['session_id'],
+            'story_text': initial_state['story_text'],
+            'input_type': initial_state['input_type'],
+            'structured_logger': initial_state.get('structured_logger'),
+            'max_scenes': initial_state.get('max_scenes', 8),
+            'metadata': initial_state.get('metadata', {}),
+            'input_source': input_source,
+            'file_format': file_format,
+            'story_length': len(story_text)
+        }
         
     except Exception as e:
         structured_logger.log_error("multimodal_input", str(e))
@@ -154,8 +165,7 @@ def enhanced_multimodal_input_asset(
 @asset(
     description="Workflow LangGraph com logs estruturados integrados",
     retry_policy=ai_model_retry,
-    compute_kind="langgraph_workflow",
-    deps=[enhanced_multimodal_input_asset]
+    compute_kind="langgraph_workflow"
 )
 def enhanced_langgraph_workflow_asset(
     context: AssetExecutionContext,
@@ -180,10 +190,33 @@ def enhanced_langgraph_workflow_asset(
         # Criar workflow
         workflow = create_open3d_workflow()
         
+        if workflow is None:
+            raise ValueError("Não foi possível criar o workflow LangGraph")
+        
+        # Preparar estado inicial para o workflow
+        story_text = enhanced_multimodal_input_asset.get('story_text', '')
+        
+        # Debug
+        print(f"🔍 DEBUG - enhanced_multimodal_input_asset keys: {list(enhanced_multimodal_input_asset.keys())}")
+        print(f"🔍 DEBUG - story_text extraído: {len(story_text)} caracteres")
+        
+        if not story_text:
+            dagster_logger.warning("⚠️ AVISO: story_text está vazio no enhanced_multimodal_input_asset!")
+            dagster_logger.warning(f"⚠️ Conteúdo: {enhanced_multimodal_input_asset}")
+        
+        initial_state = {
+            'story_text': story_text,
+            'messages': [],
+            'current_step': 'initialized',
+            'scene_data': {},
+            'generated_content': {},
+            'enhanced_multimodal_input_asset': enhanced_multimodal_input_asset
+        }
+        
         # Executar com logs detalhados
         dagster_logger.info("🚀 Iniciando execução do workflow LangGraph...")
         
-        final_state = workflow.invoke(enhanced_multimodal_input_asset)
+        final_state = workflow.invoke(initial_state)
         
         # Coletar estatísticas finais
         scenes_count = len(final_state.get('scenes', []))
