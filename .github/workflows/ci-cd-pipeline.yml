@@ -255,6 +255,7 @@ jobs:
           terraform validate
 
       - name: Terraform Plan
+        if: github.event_name != 'pull_request'
         run: |
           cd terraform/
           terraform plan -out=tfplan
@@ -262,6 +263,7 @@ jobs:
           TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       - name: Upload Terraform Plan
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: terraform-plan
