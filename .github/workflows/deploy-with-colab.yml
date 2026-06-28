@@ -60,10 +60,10 @@ jobs:
         run: |
           URL="${{ steps.get-url.outputs.url }}"
           echo "🧪 Testando conectividade: $URL"
-          
+
           MAX_RETRIES=10
           RETRY_COUNT=0
-          
+
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
             if curl -f -s "$URL" > /dev/null; then
               echo "✅ ComfyUI está acessível!"
@@ -73,7 +73,7 @@ jobs:
             sleep 10
             RETRY_COUNT=$((RETRY_COUNT + 1))
           done
-          
+
           echo "❌ ComfyUI não ficou acessível após $MAX_RETRIES tentativas"
           exit 1
 
@@ -109,17 +109,17 @@ jobs:
         run: |
           COMFYUI_URL=$(head -n 1 artifacts/comfyui_url.txt)
           echo "📝 Atualizando configuração com URL: $COMFYUI_URL"
-          
+
           # Atualizar .env
           if [ -f "open3d_implementation/.env" ]; then
             sed -i "s|COMFYUI_URL=.*|COMFYUI_URL=$COMFYUI_URL|g" open3d_implementation/.env
           else
             echo "COMFYUI_URL=$COMFYUI_URL" > open3d_implementation/.env
           fi
-          
+
           # Atualizar deploy script
           sed -i "s|export COMFYUI_URL=.*|export COMFYUI_URL=\"$COMFYUI_URL\"|g" deploy_alternative_ports.sh
-          
+
           # Criar arquivo de configuração para Kubernetes
           mkdir -p k8s/secrets
           cat > k8s/secrets/comfyui-url-secret.yaml <<EOF
@@ -133,7 +133,7 @@ jobs:
             COMFYUI_URL: "$COMFYUI_URL"
             COMFYUI_UPDATED_AT: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           EOF
-          
+
           echo "✅ Configuração atualizada!"
 
       - name: Commit and push changes
@@ -141,9 +141,9 @@ jobs:
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          
+
           git add open3d_implementation/.env deploy_alternative_ports.sh k8s/secrets/comfyui-url-secret.yaml
-          
+
           if git diff --staged --quiet; then
             echo "Nenhuma mudança para commitar"
           else
@@ -229,7 +229,7 @@ jobs:
       - name: Update Kubernetes secrets
         run: |
           COMFYUI_URL=$(head -n 1 artifacts/comfyui_url.txt)
-          
+
           kubectl create secret generic comfyui-url-secret \
             --from-literal=COMFYUI_URL="$COMFYUI_URL" \
             --from-literal=COMFYUI_UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -263,6 +263,6 @@ jobs:
           echo "🎉 Deploy completo!"
           echo "ComfyUI URL: ${{ needs.start-comfyui-colab.outputs.comfyui_url }}"
           echo "Status: ${{ job.status }}"
-          
+
           # Aqui você pode adicionar notificação para Slack, Discord, etc
           # curl -X POST ${{ secrets.SLACK_WEBHOOK }} -d "..."
