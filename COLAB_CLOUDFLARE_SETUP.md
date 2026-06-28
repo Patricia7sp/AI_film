@@ -2,6 +2,8 @@
 
 **GPU Colab Pro | Cloudflare Tunnel Ativo 24/7**
 
+> ⚠️ **Legado.** Este documento descreve a automação via Colab + Cloudflare, substituída pelo RunPod Serverless. Veja `RUNPOD_COMFYUI_SETUP.md`.
+
 ---
 
 ## 📋 Pré-requisitos

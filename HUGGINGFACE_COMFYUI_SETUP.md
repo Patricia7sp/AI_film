@@ -2,6 +2,12 @@
 
 **GPU T4 Gratuita | URL Permanente | 24/7 Disponível**
 
+> ⚠️ **Legado — não usar.** A Hugging Face deixou de oferecer GPU
+> gratuita para Spaces Docker (só ZeroGPU, que não serve para um servidor
+> ComfyUI persistente); usar GPU paga aqui cobra pelo tempo do Space
+> ligado, não pelo tempo de geração real, o que sai mais caro que a
+> alternativa atual. Veja `RUNPOD_COMFYUI_SETUP.md`.
+
 ---
 
 ## 🎯 Por que Hugging Face?
@@ -32,7 +38,7 @@
    - **License:** MIT
    - **Select the Space SDK:** Docker
    - **Space hardware:** GPU T4 (gratuito)
-   - **Visibility:** Public (ou Private se preferir)
+   - **Visibility:** **Private** (uso automatizado contínuo — não deixe a GPU exposta publicamente)
 4. Clique em **"Create Space"**
 
 ---

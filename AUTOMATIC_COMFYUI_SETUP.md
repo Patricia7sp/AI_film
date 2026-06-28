@@ -1,5 +1,7 @@
 # 🤖 Setup AUTOMÁTICO ComfyUI + GitHub Actions
 
+> ⚠️ **Legado.** Este documento descreve a automação via Colab + Cloudflare + Gist, substituída pelo RunPod Serverless. Veja `RUNPOD_COMFYUI_SETUP.md`.
+
 ## 🎯 **Solução 100% Automática**
 
 Esta solução **ELIMINA a necessidade de atualizar secrets manualmente**. A URL do ComfyUI é capturada e atualizada automaticamente usando GitHub Gist como intermediário.

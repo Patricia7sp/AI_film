@@ -204,45 +204,34 @@ Retorne em formato JSON:
             return state
         
         def generate_images(state: Open3DAgentState) -> Open3DAgentState:
-            """Generate images for scenes using ComfyUI"""
+            """Generate images for scenes using ComfyUI on a RunPod Serverless endpoint"""
             scenes = state.get('scenes', [])
-            comfyui_url = os.getenv('COMFYUI_URL', '')
-            
-            print("🖼️ Gerando imagens com ComfyUI...")
-            
+            runpod_api_key = os.getenv('RUNPOD_API_KEY', '')
+            runpod_endpoint_id = os.getenv('RUNPOD_ENDPOINT_ID', '')
+
+            print("🖼️ Gerando imagens com ComfyUI (RunPod Serverless)...")
+
             scene_images = []
-            
+
             for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
                 try:
                     print(f"🎨 Gerando imagem para cena {scene['scene_id']}...")
-                    
+
                     # Create output directory
                     os.makedirs('output', exist_ok=True)
                     image_path = f"output/scene_{scene['scene_id']}_image.png"
-                    
-                    # Generate image using ComfyUI
-                    if comfyui_url:
+
+                    # Generate image using ComfyUI via RunPod Serverless
+                    if runpod_api_key and runpod_endpoint_id:
                         import requests
-                        import json
                         import time
                         import base64
-                        from PIL import Image
-                        import io
-                        
-                        print(f"🔗 Tentando ComfyUI em: {comfyui_url}")
-                        
-                        # Testar conexão primeiro
-                        try:
-                            test_response = requests.get(f"{comfyui_url}/system_stats", timeout=5)
-                            if test_response.status_code == 200:
-                                print(f"✅ ComfyUI conectado!")
-                            else:
-                                print(f"⚠️ ComfyUI respondeu com status: {test_response.status_code}")
-                        except Exception as conn_e:
-                            print(f"⚠️ Erro ao conectar ComfyUI: {conn_e}")
-                            raise Exception("ComfyUI não acessível")
-                        
-                        # ComfyUI workflow simplificado para maior compatibilidade
+
+                        run_url = f"https://api.runpod.ai/v2/{runpod_endpoint_id}/run"
+                        status_url_template = f"https://api.runpod.ai/v2/{runpod_endpoint_id}/status/{{job_id}}"
+                        headers = {"Authorization": f"Bearer {runpod_api_key}"}
+
+                        # Workflow no formato "API" do ComfyUI (Workflow > Export (API))
                         workflow = {
                             "1": {
                                 "inputs": {
@@ -302,71 +291,74 @@ Retorne em formato JSON:
                                 "class_type": "SaveImage"
                             }
                         }
-                        
-                        # Submit workflow to ComfyUI
-                        print(f"📤 Enviando workflow para ComfyUI...")
-                        response = requests.post(f"{comfyui_url}/prompt", json={"prompt": workflow}, timeout=30)
-                        
+
+                        print("📤 Enviando job para o endpoint RunPod Serverless...")
+                        response = requests.post(
+                            run_url,
+                            json={"input": {"workflow": workflow}},
+                            headers=headers,
+                            timeout=30,
+                        )
+
                         if response.status_code == 200:
-                            result = response.json()
-                            prompt_id = result.get('prompt_id')
-                            
-                            if prompt_id:
-                                print(f"🆔 Prompt ID: {prompt_id}")
-                                
-                                # Wait for completion with polling
-                                max_wait = 60  # 60 seconds max
-                                wait_time = 0
-                                while wait_time < max_wait:
-                                    time.sleep(3)
-                                    wait_time += 3
-                                    
-                                    history_response = requests.get(f"{comfyui_url}/history/{prompt_id}", timeout=10)
-                                    if history_response.status_code == 200:
-                                        history = history_response.json()
-                                        if prompt_id in history:
-                                            outputs = history[prompt_id].get('outputs', {})
-                                            if '7' in outputs:
-                                                images = outputs['7']['images']
-                                                if images:
-                                                    print(f"🖼️ Imagem gerada! Baixando...")
-                                                    
-                                                    # Download image
-                                                    image_data = images[0]
-                                                    image_response = requests.get(f"{comfyui_url}/view?filename={image_data['filename']}", timeout=30)
-                                                    
-                                                    if image_response.status_code == 200:
-                                                        # Save image as binary
-                                                        with open(image_path, 'wb') as f:
-                                                            f.write(image_response.content)
-                                                        
-                                                        # Verify it's a real image
-                                                        if os.path.exists(image_path) and os.path.getsize(image_path) > 1000:
-                                                            scene_images.append({
-                                                                'scene_id': scene['scene_id'],
-                                                                'image_path': image_path,
-                                                                'prompt': scene['prompt'],
-                                                                'comfyui_prompt_id': prompt_id,
-                                                                'generation_method': 'comfyui'
-                                                            })
-                                                            
-                                                            print(f"✅ Imagem ComfyUI REAL gerada: cena {scene['scene_id']} ({os.path.getsize(image_path)} bytes)")
-                                                            continue
-                                                        else:
-                                                            print(f"⚠️ Arquivo baixado não é uma imagem válida")
-                                            else:
-                                                print(f"⏳ Aguardando geração... ({wait_time}s)")
+                            job_id = response.json().get('id')
+                            print(f"🆔 Job ID: {job_id}")
+
+                            # Poll status: worker escala de zero, então o cold start pode levar
+                            # de alguns segundos a ~1 minuto além do tempo de geração em si.
+                            max_wait = 180
+                            wait_time = 0
+                            while wait_time < max_wait:
+                                time.sleep(3)
+                                wait_time += 3
+
+                                status_response = requests.get(
+                                    status_url_template.format(job_id=job_id),
+                                    headers=headers,
+                                    timeout=10,
+                                )
+                                if status_response.status_code != 200:
+                                    print(f"⚠️ Erro ao consultar status: {status_response.status_code}")
+                                    continue
+
+                                status_payload = status_response.json()
+                                job_status = status_payload.get('status')
+
+                                if job_status == 'COMPLETED':
+                                    images = status_payload.get('output', {}).get('images', [])
+                                    if images:
+                                        image_b64 = images[0].get('data', '')
+                                        with open(image_path, 'wb') as f:
+                                            f.write(base64.b64decode(image_b64))
+
+                                        if os.path.exists(image_path) and os.path.getsize(image_path) > 1000:
+                                            scene_images.append({
+                                                'scene_id': scene['scene_id'],
+                                                'image_path': image_path,
+                                                'prompt': scene['prompt'],
+                                                'runpod_job_id': job_id,
+                                                'generation_method': 'comfyui'
+                                            })
+                                            print(f"✅ Imagem ComfyUI REAL gerada: cena {scene['scene_id']} ({os.path.getsize(image_path)} bytes)")
                                         else:
-                                            print(f"⏳ Prompt ainda não encontrado no histórico... ({wait_time}s)")
+                                            print("⚠️ Arquivo decodificado não é uma imagem válida")
                                     else:
-                                        print(f"⚠️ Erro ao consultar histórico: {history_response.status_code}")
+                                        print("⚠️ Job concluído sem imagens no output")
+                                    break
+                                elif job_status in ('FAILED', 'CANCELLED', 'TIMED_OUT'):
+                                    print(f"⚠️ Job RunPod terminou com status: {job_status} — {status_payload.get('error')}")
+                                    break
                                 else:
-                                    print(f"⏱️ Timeout após {max_wait}s")
+                                    print(f"⏳ Status: {job_status} ({wait_time}s)")
                             else:
-                                print(f"⚠️ Nenhum prompt_id retornado")
+                                print(f"⏱️ Timeout após {max_wait}s aguardando o job RunPod")
                         else:
-                            print(f"⚠️ Erro ao enviar workflow: {response.status_code} - {response.text}")
-                    
+                            print(f"⚠️ Erro ao enviar job: {response.status_code} - {response.text}")
+
+                    # Verifica se a imagem já foi gerada com sucesso acima; se não, cai no mock
+                    if any(img['scene_id'] == scene['scene_id'] and img['generation_method'] == 'comfyui' for img in scene_images):
+                        continue
+
                     # Fallback mock generation se ComfyUI falhar
                     print(f"💡 Usando mock de imagem para cena {scene['scene_id']}")
                     with open(image_path, 'w') as f:

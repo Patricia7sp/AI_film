@@ -1,5 +1,7 @@
 # 🎮 Setup ComfyUI com GPU (Colab) + CI/CD Automático
 
+> ⚠️ **Legado.** Este documento descreve a automação via Colab + Cloudflare, substituída pelo RunPod Serverless. Veja `RUNPOD_COMFYUI_SETUP.md`.
+
 ## 🎯 **Arquitetura Correta**
 
 ```

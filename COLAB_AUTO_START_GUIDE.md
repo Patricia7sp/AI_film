@@ -1,5 +1,7 @@
 # 🚀 Guia Completo: Iniciar Colab Automaticamente
 
+> ⚠️ **Legado.** Este documento descreve a automação via Colab + Cloudflare, substituída pelo RunPod Serverless. Veja `RUNPOD_COMFYUI_SETUP.md`.
+
 ## 🎯 Objetivo
 
 Fazer o Google Colab iniciar **100% automaticamente** quando o GitHub Actions executar, sem intervenção manual.
