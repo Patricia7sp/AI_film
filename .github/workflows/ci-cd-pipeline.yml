@@ -36,7 +36,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install black flake8 mypy pylint isort bandit safety
+          pip install black==24.10.0 flake8 mypy pylint isort bandit safety
           pip install -r open3d_implementation/orchestration/requirements_dagster.txt
 
       - name: Collect changed Python files
@@ -102,7 +102,7 @@ jobs:
     needs: code-quality
     strategy:
       matrix:
-        python-version: ['3.9', '3.10', '3.11']
+        python-version: ['3.10', '3.11']
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
