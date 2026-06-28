@@ -1,5 +1,7 @@
 # 🚀 Como Iniciar o Pipeline Manualmente
 
+> ⚠️ **Legado.** Este documento descreve a automação via Colab + Cloudflare, substituída pelo RunPod Serverless. Veja `RUNPOD_COMFYUI_SETUP.md`.
+
 ## ❌ **Problema:**
 O workflow esperou pela URL do ComfyUI, mas o Colab não foi iniciado automaticamente.
 
@@ -97,5 +99,5 @@ Após seguir os passos:
 
 ---
 
-**Tempo total:** ~5 minutos  
+**Tempo total:** ~5 minutos
 **Próximo passo:** Iniciar o notebook do Colab

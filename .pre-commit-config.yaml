@@ -19,7 +19,7 @@ repos:
     rev: 24.4.2
     hooks:
       - id: black
-        language_version: python3.9
+        language_version: python3.10
         args: [--line-length=88, --target-version=py39]
         types_or: [python, pyi]
         exclude: >-
@@ -65,7 +65,7 @@ repos:
         description: "Verificação de estilo e qualidade do código Python"
         entry: flake8
         language: python
-        language_version: python3.9
+        language_version: python3.10
         types: [python]
         exclude: >-
           (?x)^(
@@ -108,7 +108,7 @@ repos:
         description: 'Verificação de tipos estáticos para Python'
         entry: mypy
         language: python
-        language_version: python3.9
+        language_version: python3.10
         types: [python]
         exclude: >-
           (?x)^(
@@ -153,7 +153,7 @@ repos:
         description: 'Linter rápido para Python escrito em Rust'
         entry: ruff check --fix --show-fixes
         language: python
-        language_version: python3.9
+        language_version: python3.10
         types: [python]
         exclude: >-
           (?x)^(

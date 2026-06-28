@@ -2,6 +2,8 @@
 
 **GPU Colab Pro | Cloudflare Tunnel Ativo 24/7**
 
+> ⚠️ **Legado.** Este documento descreve a automação via Colab + Cloudflare, substituída pelo RunPod Serverless. Veja `RUNPOD_COMFYUI_SETUP.md`.
+
 ---
 
 ## 📋 Pré-requisitos
@@ -112,7 +114,7 @@ for _ in range(30):
 if cloudflare_url:
     print(f"\n✅ Cloudflare Tunnel ativo!")
     print(f"🔗 URL: {cloudflare_url}")
-    
+
     # Mostrar URL em destaque
     display(HTML(f"""
     <div style="background: #1a1a1a; padding: 20px; border-radius: 10px; margin: 20px 0;">
@@ -144,17 +146,17 @@ print("⚠️ NÃO FECHE ESTE NOTEBOOK!\n")
 def keep_alive():
     """Mantém ComfyUI e Cloudflare ativos"""
     iteration = 0
-    
+
     while True:
         iteration += 1
-        
+
         try:
             # Testar ComfyUI local
             response = requests.get("http://localhost:8188", timeout=5)
             comfyui_status = "✅" if response.status_code == 200 else "❌"
         except:
             comfyui_status = "❌"
-        
+
         try:
             # Testar Cloudflare público
             if cloudflare_url:
@@ -164,7 +166,7 @@ def keep_alive():
                 tunnel_status = "❌"
         except:
             tunnel_status = "❌"
-        
+
         # Mostrar status
         clear_output(wait=True)
         print("═" * 70)
@@ -178,7 +180,7 @@ def keep_alive():
         print("\n💡 Mantenha este notebook aberto para manter o tunnel ativo")
         print("⚠️ Se o status ficar ❌, reinicie o notebook")
         print("\n" + "═" * 70)
-        
+
         # Aguardar 30 segundos
         time.sleep(30)
 
@@ -340,8 +342,8 @@ Após configurar:
 
 ---
 
-**Tempo de setup:** 5 minutos  
-**Custo:** Colab Pro (você já paga)  
+**Tempo de setup:** 5 minutos
+**Custo:** Colab Pro (você já paga)
 **Uptime:** ~24h (com keep-alive)
 
 ---
