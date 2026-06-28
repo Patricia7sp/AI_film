@@ -30,7 +30,7 @@ jobs:
             BRANCH_NAME="${GITHUB_REF#refs/heads/}"
           fi
           echo "Branch: $BRANCH_NAME"
-          
+
           if [[ "$BRANCH_NAME" =~ ^(main|develop|feature/.*|hotfix/.*|release/.*|codex/.*)$ ]]; then
             echo "✅ Branch name válido: $BRANCH_NAME"
           else

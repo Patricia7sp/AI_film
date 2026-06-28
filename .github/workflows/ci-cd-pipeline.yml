@@ -52,7 +52,7 @@ jobs:
       - name: Run Black (Code Formatting)
         run: |
           if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
-            black --check ${{ steps.changed-python.outputs.files }}
+            black --check --target-version py310 ${{ steps.changed-python.outputs.files }}
           else
             echo "No Python files changed."
           fi

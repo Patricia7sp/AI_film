@@ -79,7 +79,7 @@ jobs:
         run: |
           URL="${{ steps.final-url.outputs.url }}"
           echo "🧪 Verificando ComfyUI: $URL"
-          
+
           if [ -z "$URL" ]; then
             echo "❌ URL não disponível"
             echo ""
@@ -90,7 +90,7 @@ jobs:
             echo "4. OU configure manualmente: gh secret set COMFYUI_FALLBACK_URL --body 'URL_AQUI'"
             exit 1
           fi
-          
+
           # Testar conectividade
           for i in {1..5}; do
             if curl -f -s "$URL" > /dev/null 2>&1; then
@@ -100,7 +100,7 @@ jobs:
             echo "   Tentativa $i/5..."
             sleep 3
           done
-          
+
           echo "⚠️ ComfyUI não está respondendo"
           echo "URL testada: $URL"
           exit 1
@@ -118,16 +118,16 @@ jobs:
         run: |
           URL="${{ needs.get-comfyui-url.outputs.comfyui_url }}"
           echo "🔄 Atualizando configurações com URL: $URL"
-          
+
           # Atualizar .env.example
           if [ -f .env.example ]; then
             sed -i "s|COMFYUI_URL=.*|COMFYUI_URL=$URL|g" .env.example
           fi
-          
+
           # Criar arquivo de configuração
           echo "COMFYUI_URL=$URL" > .env.auto
           echo "UPDATED_AT=$(date)" >> .env.auto
-          
+
           echo "✅ Configurações atualizadas!"
 
       - name: Update Kubernetes Secret
@@ -167,31 +167,31 @@ jobs:
           echo "🧪 Testando integração com ComfyUI..."
           echo "URL: $COMFYUI_URL"
           echo "URL length: ${#COMFYUI_URL}"
-          
+
           # Fallback para secret se output estiver vazio
           if [ -z "$COMFYUI_URL" ]; then
             echo "⚠️ Output está vazio, tentando usar secret diretamente..."
             COMFYUI_URL="${{ secrets.COMFYUI_FALLBACK_URL }}"
             echo "URL do secret: $COMFYUI_URL"
           fi
-          
+
           # Criar teste básico
           cat > test_comfyui.py << 'EOF'
           import os
           import requests
-          
+
           def test_comfyui_available():
               url = os.getenv('COMFYUI_URL')
               assert url, "COMFYUI_URL not set"
-              
+
               response = requests.get(url, timeout=10)
               assert response.status_code == 200, f"ComfyUI not accessible: {response.status_code}"
               print(f"✅ ComfyUI is accessible at {url}")
-          
+
           if __name__ == "__main__":
               test_comfyui_available()
           EOF
-          
+
           python test_comfyui.py
 
       - name: Run Pipeline Tests
@@ -228,7 +228,7 @@ jobs:
             --from-literal=COMFYUI_URL=$COMFYUI_URL \
             --namespace=ai-film \
             --dry-run=client -o yaml | kubectl apply -f -
-          
+
           echo "✅ Secret atualizado!"
 
       - name: Deploy to Kubernetes
@@ -236,7 +236,7 @@ jobs:
           echo "🚀 Deploying to Kubernetes..."
           cd k8s/
           kubectl apply -f deploy-dev.yaml
-          
+
           echo "✅ Deploy completo!"
 
       - name: Wait for Rollout
@@ -261,6 +261,6 @@ jobs:
           echo "🎉 Pipeline completo!"
           echo "ComfyUI URL: ${{ needs.get-comfyui-url.outputs.comfyui_url }}"
           echo "Status: ${{ job.status }}"
-          
+
           # Aqui você pode adicionar notificação por email
           # usando secrets.SMTP_*
