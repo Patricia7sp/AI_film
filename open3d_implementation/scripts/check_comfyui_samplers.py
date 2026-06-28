@@ -24,7 +24,7 @@ def check_available_samplers():
 
     try:
         # Endpoint para obter informações sobre os nós disponíveis
-        response = requests.get(f"{comfyui_url}/object_info")
+        response = requests.get(f"{comfyui_url}/object_info", timeout=10)
 
         if response.status_code == 200:
             data = response.json()
