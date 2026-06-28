@@ -3,8 +3,9 @@
 Script para verificar quais samplers estão disponíveis no ComfyUI
 """
 
-import requests
 import os
+
+import requests
 from dotenv import load_dotenv
 
 # Carregar variáveis de ambiente

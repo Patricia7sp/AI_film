@@ -13,7 +13,6 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / "open3d_implementation" / ".env"
 DOCKERFILE_PATH = ROOT / "runpod_worker" / "Dockerfile"
