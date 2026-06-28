@@ -68,19 +68,19 @@ import json
 
 def capture_and_send_comfyui_url_auto():
     """Captura URL e envia automaticamente para GitHub Gist"""
-    
+
     # CONFIGURE AQUI COM SEU TOKEN
     GITHUB_TOKEN = "ghp_YOUR_TOKEN_HERE"  # ⚠️ SUBSTITUA!
     GIST_ID = None  # Na primeira execução, deixe None
-    
+
     print("="*70)
     print("🎬 CAPTURA AUTOMÁTICA DE URL")
     print("="*70)
-    
+
     # Aguardar túnel
     print("\n⏳ Aguardando túnel Cloudflare...")
     time.sleep(30)
-    
+
     # Capturar URL do log
     tunnel_url = None
     try:
@@ -93,19 +93,19 @@ def capture_and_send_comfyui_url_auto():
     except Exception as e:
         print(f"❌ Erro: {e}")
         return
-    
+
     if not tunnel_url:
         print("❌ URL não encontrada")
         return
-    
+
     # Enviar para Gist
     print("\n📤 Enviando para GitHub Gist...")
-    
+
     headers = {
         'Authorization': f'token {GITHUB_TOKEN}',
         'Accept': 'application/vnd.github.v3+json'
     }
-    
+
     gist_data = {
         "description": "ComfyUI URL - AI Film Pipeline",
         "public": False,
@@ -119,7 +119,7 @@ def capture_and_send_comfyui_url_auto():
             }
         }
     }
-    
+
     try:
         if GIST_ID:
             response = requests.patch(
@@ -133,12 +133,12 @@ def capture_and_send_comfyui_url_auto():
                 headers=headers,
                 json=gist_data
             )
-        
+
         if response.status_code in [200, 201]:
             gist_id = response.json()['id']
             print(f"✅ Enviado para Gist!")
             print(f"   Gist ID: {gist_id}")
-            
+
             if not GIST_ID:
                 print(f"\n⚠️ PRIMEIRA EXECUÇÃO:")
                 print(f"   1. Copie este ID: {gist_id}")
@@ -149,7 +149,7 @@ def capture_and_send_comfyui_url_auto():
             print(response.text)
     except Exception as e:
         print(f"❌ Erro: {e}")
-    
+
     print("\n" + "="*70)
     print("✅ AUTOMAÇÃO CONFIGURADA!")
     print("="*70)
@@ -176,7 +176,7 @@ capture_and_send_comfyui_url_auto()
 ```
 ✅ Enviado para Gist!
    Gist ID: abc123def456
-   
+
 ⚠️ PRIMEIRA EXECUÇÃO:
    1. Copie este ID: abc123def456
    2. Atualize GIST_ID no código

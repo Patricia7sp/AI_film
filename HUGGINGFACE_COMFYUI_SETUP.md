@@ -342,7 +342,7 @@ Após configurar o ComfyUI:
 
 ---
 
-**Tempo estimado de setup:** 15-20 minutos  
+**Tempo estimado de setup:** 15-20 minutos
 **Custo:** $0 (gratuito) 🎉
 
 ---
@@ -358,5 +358,5 @@ Se encontrar problemas:
 
 ---
 
-**Última atualização:** 2026-02-15  
+**Última atualização:** 2026-02-15
 **Status:** Testado e funcionando ✅

@@ -24,14 +24,18 @@ jobs:
     steps:
       - name: Check branch name
         run: |
-          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BRANCH_NAME="${{ github.head_ref }}"
+          else
+            BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          fi
           echo "Branch: $BRANCH_NAME"
           
-          if [[ "$BRANCH_NAME" =~ ^(main|develop|feature/.*|hotfix/.*|release/.*)$ ]]; then
+          if [[ "$BRANCH_NAME" =~ ^(main|develop|feature/.*|hotfix/.*|release/.*|codex/.*)$ ]]; then
             echo "✅ Branch name válido: $BRANCH_NAME"
           else
             echo "❌ Branch name inválido: $BRANCH_NAME"
-            echo "Padrões aceitos: main, develop, feature/*, hotfix/*, release/*"
+            echo "Padrões aceitos: main, develop, feature/*, hotfix/*, release/*, codex/*"
             exit 1
           fi
 

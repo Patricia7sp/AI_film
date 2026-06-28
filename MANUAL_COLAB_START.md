@@ -99,5 +99,5 @@ Após seguir os passos:
 
 ---
 
-**Tempo total:** ~5 minutos  
+**Tempo total:** ~5 minutos
 **Próximo passo:** Iniciar o notebook do Colab

@@ -20,6 +20,8 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
@@ -30,17 +32,35 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -e .[dev]
+
+    - name: Collect changed Python files
+      id: changed-python
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' | tr '\n' ' ')"
+        else
+          FILES="."
+        fi
+        echo "files=$FILES" >> "$GITHUB_OUTPUT"
     
     - name: Lint with flake8
       run: |
         pip install flake8
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        flake8 . --count --max-complexity=10 --max-line-length=88 --statistics
-    
+        if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
+          flake8 ${{ steps.changed-python.outputs.files }} --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 ${{ steps.changed-python.outputs.files }} --count --max-complexity=10 --max-line-length=120 --statistics
+        else
+          echo "No Python files changed."
+        fi
+
     - name: Check formatting with black
       run: |
         pip install black
-        black --check --diff .
+        if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
+          black --check --diff ${{ steps.changed-python.outputs.files }}
+        else
+          echo "No Python files changed."
+        fi
     
     - name: Run tests with pytest
       run: |

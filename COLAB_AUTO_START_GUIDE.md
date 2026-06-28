@@ -87,7 +87,7 @@ Fazer o Google Colab iniciar **100% automaticamente** quando o GitHub Actions ex
    ```bash
    # No terminal:
    cat service-account-key.json | base64 > credentials.txt
-   
+
    # Ou online: https://www.base64encode.org/
    ```
 
@@ -95,7 +95,7 @@ Fazer o Google Colab iniciar **100% automaticamente** quando o GitHub Actions ex
    ```bash
    # 1. GOOGLE_COLAB_CREDENTIALS (conteúdo base64 do JSON)
    gh secret set GOOGLE_COLAB_CREDENTIALS --body "$(cat credentials.txt)"
-   
+
    # 2. COLAB_NOTEBOOK_ID (ID do notebook)
    gh secret set COLAB_NOTEBOOK_ID --body "XXXXX-SEU-NOTEBOOK-ID-XXXXX"
    ```
@@ -117,7 +117,7 @@ AUTO_RUN = os.getenv('AUTO_RUN', 'false') == 'true'
 if AUTO_RUN:
     print("🤖 Modo AUTO-RUN ativado!")
     print("📡 Executando todas as células automaticamente...")
-    
+
     # Executar todas as células
     from IPython.display import Javascript
     display(Javascript('IPython.notebook.execute_all_cells()'))
@@ -408,6 +408,6 @@ gh run view --log
 
 ---
 
-**Data:** 2025-10-11  
-**Status:** Guia Completo  
-**Próximo:** Configurar Service Account  
+**Data:** 2025-10-11
+**Status:** Guia Completo
+**Próximo:** Configurar Service Account

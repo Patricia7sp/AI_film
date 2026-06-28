@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -87,6 +87,10 @@ def validate_dockerfile() -> List[str]:
 
 def test_runpod(api_key: str, endpoint_id: str) -> Tuple[bool, str]:
     url = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
+    parsed_url = urllib.parse.urlparse(url)
+    if parsed_url.scheme != "https" or parsed_url.netloc != "api.runpod.ai":
+        return False, "RunPod URL validation failed"
+
     payload = json.dumps({"input": {"workflow": {}}}).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -98,13 +102,16 @@ def test_runpod(api_key: str, endpoint_id: str) -> Tuple[bool, str]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=45) as response:
+        with urllib.request.urlopen(req, timeout=45) as response:  # nosec B310
             body = response.read().decode("utf-8", errors="replace")
             return True, f"HTTP {response.status}: {body[:300]}"
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         if exc.code in {400, 422, 500} and "auth" not in body.lower():
-            return True, f"HTTP {exc.code}: endpoint reached; response was not auth failure"
+            return (
+                True,
+                f"HTTP {exc.code}: endpoint reached; response was not auth failure",
+            )
         return False, f"HTTP {exc.code}: {body[:300]}"
     except urllib.error.URLError as exc:
         return False, f"URL error: {exc.reason}"
@@ -112,7 +119,11 @@ def test_runpod(api_key: str, endpoint_id: str) -> Tuple[bool, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate RunPod ComfyUI setup.")
-    parser.add_argument("--test-endpoint", action="store_true", help="Call the RunPod runsync endpoint with an empty workflow.")
+    parser.add_argument(
+        "--test-endpoint",
+        action="store_true",
+        help="Call the RunPod runsync endpoint with an empty workflow.",
+    )
     args = parser.parse_args()
 
     failures: List[str] = []
@@ -121,7 +132,9 @@ def main() -> int:
     endpoint_id = env.get("RUNPOD_ENDPOINT_ID", "")
 
     print("RunPod setup validation")
-    print(f"- Env file: {ENV_PATH.relative_to(ROOT)} {'present' if ENV_PATH.exists() else 'missing'}")
+    print(
+        f"- Env file: {ENV_PATH.relative_to(ROOT)} {'present' if ENV_PATH.exists() else 'missing'}"
+    )
     print(f"- RUNPOD_API_KEY: {'present' if api_key else 'missing'}")
     print(f"- RUNPOD_ENDPOINT_ID: {'present' if endpoint_id else 'missing'}")
     if endpoint_id:
@@ -150,7 +163,9 @@ def main() -> int:
             if not ok:
                 failures.append("RunPod endpoint test failed")
         else:
-            failures.append("RunPod endpoint test skipped because credentials are missing")
+            failures.append(
+                "RunPod endpoint test skipped because credentials are missing"
+            )
 
     if failures:
         print("\nStatus: BLOCKED")

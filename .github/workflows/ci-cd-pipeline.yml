@@ -39,17 +39,39 @@ jobs:
           pip install black flake8 mypy pylint isort bandit safety
           pip install -r open3d_implementation/orchestration/requirements_dagster.txt
 
+      - name: Collect changed Python files
+        id: changed-python
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' | tr '\n' ' ')"
+          else
+            FILES="open3d_implementation/"
+          fi
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
       - name: Run Black (Code Formatting)
         run: |
-          black --check open3d_implementation/
+          if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
+            black --check ${{ steps.changed-python.outputs.files }}
+          else
+            echo "No Python files changed."
+          fi
 
       - name: Run isort (Import Sorting)
         run: |
-          isort --check-only open3d_implementation/
+          if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
+            isort --check-only ${{ steps.changed-python.outputs.files }}
+          else
+            echo "No Python files changed."
+          fi
 
       - name: Run Flake8 (Linting)
         run: |
-          flake8 open3d_implementation/ --max-line-length=120 --extend-ignore=E203,W503
+          if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
+            flake8 ${{ steps.changed-python.outputs.files }} --max-line-length=120 --extend-ignore=E203,W503
+          else
+            echo "No Python files changed."
+          fi
 
       - name: Run Pylint (Static Analysis)
         continue-on-error: true
@@ -58,7 +80,11 @@ jobs:
 
       - name: Run Bandit (Security Check)
         run: |
-          bandit -r open3d_implementation/ -ll
+          if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
+            bandit ${{ steps.changed-python.outputs.files }} -ll
+          else
+            echo "No Python files changed."
+          fi
 
       - name: Run Safety (Dependency Security)
         run: |

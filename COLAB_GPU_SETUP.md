@@ -52,16 +52,16 @@ import re, time, requests, json, subprocess
 
 def auto_update_comfyui_url():
     """Captura URL do ComfyUI e envia para GitHub Gist automaticamente"""
-    
+
     # ⚠️ COLE SEU TOKEN AQUI!
     GITHUB_TOKEN = "ghp_SEU_TOKEN_AQUI"
-    
+
     # Deixe None na primeira execução
     GIST_ID = None  # Depois atualize com o ID gerado
-    
+
     print("🎬 Capturando URL do ComfyUI...")
     time.sleep(30)  # Aguardar túnel estabilizar
-    
+
     # Capturar URL do log do Cloudflare
     try:
         with open('/content/cloudflared.log', 'r') as f:
@@ -71,19 +71,19 @@ def auto_update_comfyui_url():
     except Exception as e:
         print(f"❌ Erro ao ler log: {e}")
         return
-    
+
     if not url:
         print("❌ URL não encontrada no log")
         return
-    
+
     print(f"✅ URL capturada: {url}")
-    
+
     # Criar/Atualizar Gist
     headers = {
         'Authorization': f'token {GITHUB_TOKEN}',
         'Accept': 'application/vnd.github.v3+json'
     }
-    
+
     gist_data = {
         "description": "ComfyUI URL - AI Film Pipeline",
         "public": False,
@@ -97,7 +97,7 @@ def auto_update_comfyui_url():
             }
         }
     }
-    
+
     if GIST_ID:
         # Atualizar Gist existente
         response = requests.patch(
@@ -112,12 +112,12 @@ def auto_update_comfyui_url():
             headers=headers,
             json=gist_data
         )
-    
+
     if response.status_code in [200, 201]:
         gist_id = response.json()['id']
         print(f"✅ URL enviada para Gist!")
         print(f"🔗 Gist: https://gist.github.com/{gist_id}")
-        
+
         if not GIST_ID:
             print(f"\n⚠️ IMPORTANTE - FAÇA ISSO AGORA:")
             print(f"1. Atualize GIST_ID = '{gist_id}' neste código")
@@ -279,12 +279,12 @@ curl https://sua-url.trycloudflare.com
 
 ## 💡 **Vantagens desta Arquitetura**
 
-✅ **GPU Grátis:** Colab oferece GPU T4 gratuitamente  
-✅ **Zero Config:** Após setup inicial, tudo automático  
-✅ **Robusto:** Fallback manual se necessário  
-✅ **Flexível:** Pode trocar URL sem reconfigurar tudo  
-✅ **Escalável:** Adicione mais Colabs se necessário  
-✅ **CI/CD:** Totalmente integrado com GitHub Actions  
+✅ **GPU Grátis:** Colab oferece GPU T4 gratuitamente
+✅ **Zero Config:** Após setup inicial, tudo automático
+✅ **Robusto:** Fallback manual se necessário
+✅ **Flexível:** Pode trocar URL sem reconfigurar tudo
+✅ **Escalável:** Adicione mais Colabs se necessário
+✅ **CI/CD:** Totalmente integrado com GitHub Actions
 
 ---
 
