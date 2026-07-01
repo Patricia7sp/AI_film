@@ -3,11 +3,18 @@ LangGraph Adapter for Open3D Implementation
 Integrates LangGraph workflows with Open3D visualization
 """
 
+import json
+import ast
+import hashlib
+import os
+import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
 
-class Open3DAgentState(TypedDict):
+class Open3DAgentState(TypedDict, total=False):
     """State for Open3D Agent workflow"""
 
     messages: List[str]
@@ -19,7 +26,1488 @@ class Open3DAgentState(TypedDict):
     session_id: str
     input_type: str
     max_scenes: int
+    image_style: str
+    image_quality_preset: str
+    visual_bible: Dict[str, Any]
     enhanced_multimodal_input_asset: Dict[str, Any]
+    cinematic_prompt: str
+    scenes: List[Dict[str, Any]]
+    scenes_count: int
+    scene_images: List[Dict[str, Any]]
+    images_count: int
+    audio_files: List[Dict[str, Any]]
+    audio_count: int
+    video_path: str
+    video_size: int
+    generation_method: str
+    status: str
+    runpod_jobs: List[Dict[str, Any]]
+    quality_metrics: Dict[str, Any]
+    cost_estimate: Dict[str, Any]
+
+
+IMAGE_STYLE_PRESETS: Dict[str, Dict[str, str]] = {
+    "cinematic_realism": {
+        "label": "Cinematic realism",
+        "prompt": (
+            "premium cinematic realism, historically accurate production design, "
+            "natural human proportions, expressive but believable face, soft film grain, "
+            "ARRI Alexa look, 35mm lens, controlled depth of field"
+        ),
+    },
+    "storybook_animation": {
+        "label": "Storybook animation",
+        "prompt": (
+            "premium storybook animation, family feature film look, handcrafted character design, "
+            "soft expressive faces, elegant shapes, painterly backgrounds, warm whimsical lighting"
+        ),
+    },
+    "editorial_black_white": {
+        "label": "Editorial black and white",
+        "prompt": (
+            "editorial black and white cinema, silver gelatin tonal range, high contrast, "
+            "classic portrait composition, refined film still, precise lighting"
+        ),
+    },
+    "watercolor_illustration": {
+        "label": "Watercolor illustration",
+        "prompt": (
+            "premium watercolor book illustration, delicate paper texture, transparent washes, "
+            "controlled linework, charming character proportions, illustrated historical setting"
+        ),
+    },
+    "anime_cinematic": {
+        "label": "Anime cinematic",
+        "prompt": (
+            "cinematic anime film still, elegant character design, detailed background art, "
+            "clean facial structure, soft rim light, premium animation composition"
+        ),
+    },
+}
+
+DEFAULT_IMAGE_STYLE = "cinematic_realism"
+
+IMAGE_QUALITY_PRESETS: Dict[str, Dict[str, Any]] = {
+    "balanced": {
+        "width": 768,
+        "height": 1024,
+        "steps": 28,
+        "cfg": 6.5,
+        "sampler_name": "euler",
+        "scheduler": "normal",
+    },
+    "high": {
+        "width": 832,
+        "height": 1216,
+        "steps": 40,
+        "cfg": 7.2,
+        "sampler_name": "dpmpp_2m",
+        "scheduler": "karras",
+    },
+}
+
+IMAGE_NEGATIVE_PROMPT = (
+    "low quality, worst quality, blurry, distorted, deformed, bad anatomy, malformed face, "
+    "asymmetrical eyes, crossed eyes, broken nose, melted facial features, extra fingers, "
+    "missing fingers, fused hands, extra limbs, long neck, dislocated neck, cropped head, "
+    "out of frame, duplicate person, duplicate girl, duplicate child, duplicate face, twins, clones, "
+    "multiple versions of the same character, repeated character, doll face, plastic skin, uncanny, "
+    "second Alice, extra Victorian girl, extra young woman, replacing a male professor with a girl, "
+    "princess costume, fantasy ball gown, blue princess dress, adult Alice, dog when the story asks for cats, "
+    "unrequested rabbit, unrequested bunny, unrequested white rabbit, kitten beside the lap when the prompt says in lap, "
+    "oversaturated grass, random modern clothing, incorrect era clothing, text, letters, words, captions, "
+    "subtitles, title card, fake typography, poster layout, book page layout, page border, decorative frame, "
+    "watermark, logo, signature, artist mark, UI overlay, label, sign, banner, credits"
+)
+
+
+def _resolve_image_style(style_key: str | None) -> Dict[str, str]:
+    return IMAGE_STYLE_PRESETS.get(style_key or DEFAULT_IMAGE_STYLE, IMAGE_STYLE_PRESETS[DEFAULT_IMAGE_STYLE])
+
+
+def _resolve_quality_preset(preset_key: str | None) -> Dict[str, Any]:
+    return IMAGE_QUALITY_PRESETS.get(preset_key or "high", IMAGE_QUALITY_PRESETS["high"])
+
+
+def _resolve_comfyui_checkpoint(style_key: str | None) -> str:
+    style_specific_key = f"COMFYUI_CHECKPOINT_{(style_key or DEFAULT_IMAGE_STYLE).upper()}"
+    return (
+        os.getenv(style_specific_key)
+        or os.getenv("COMFYUI_DEFAULT_CHECKPOINT")
+        or "v1-5-pruned-emaonly.safetensors"
+    )
+
+
+def _cancel_runpod_job(endpoint_id: str, api_key: str, job_id: str) -> None:
+    if not endpoint_id or not api_key or not job_id:
+        return
+    try:
+        import requests
+
+        headers = {"Authorization": f"Bearer {api_key}"}
+        requests.post(
+            f"https://api.runpod.ai/v2/{endpoint_id}/cancel/{job_id}",
+            headers=headers,
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        print(f"⚠️ Não foi possível cancelar job RunPod {job_id}: {exc}")
+
+
+def _write_fallback_scene_image(
+    image_path: str,
+    scene: Dict[str, Any],
+    style_label: str,
+) -> None:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        width, height = 1280, 720
+        img = Image.new("RGB", (width, height), (18, 20, 24))
+        draw = ImageDraw.Draw(img)
+
+        for y in range(height):
+            shade = int(18 + (y / height) * 38)
+            draw.line((0, y, width, y), fill=(shade, shade + 3, shade + 8))
+
+        try:
+            font_title = ImageFont.truetype("Arial.ttf", 52)
+            font_body = ImageFont.truetype("Arial.ttf", 30)
+        except OSError:
+            font_title = ImageFont.load_default()
+            font_body = ImageFont.load_default()
+
+        title = f"Cena {scene.get('scene_id', '')}".strip()
+        prompt = str(scene.get("prompt") or scene.get("description") or "")[:220]
+        lines = [prompt[i : i + 58] for i in range(0, len(prompt), 58)][:4]
+
+        draw.rectangle((72, 72, width - 72, height - 72), outline=(220, 176, 92), width=3)
+        draw.text((112, 118), title, fill=(242, 205, 128), font=font_title)
+        draw.text((112, 190), style_label, fill=(180, 190, 205), font=font_body)
+        y = 280
+        for line in lines:
+            draw.text((112, y), line, fill=(232, 234, 238), font=font_body)
+            y += 44
+
+        os.makedirs(os.path.dirname(image_path) or ".", exist_ok=True)
+        img.save(image_path, "PNG")
+    except (OSError, ValueError, ImportError) as exc:
+        print(f"⚠️ Falha ao criar fallback PNG real: {exc}")
+        raise
+
+
+def _scene_seed(session_id: str, style_key: str, scene_id: Any) -> int:
+    seed_source = f"{session_id}:{style_key}:{scene_id}"
+    digest = hashlib.sha256(seed_source.encode("utf-8")).hexdigest()
+    return int(digest[:12], 16) % 2_147_483_647
+
+
+def _story_has_any(story_text: str, terms: List[str]) -> bool:
+    lowered = story_text.lower()
+    return any(term in lowered for term in terms)
+
+
+def _scene_text(scene: Dict[str, Any]) -> str:
+    must_include = " ".join(str(item) for item in scene.get("must_include", []) if item)
+    must_not_include = " ".join(
+        str(item) for item in scene.get("must_not_include", []) if item
+    )
+    return " ".join(
+        [
+            str(scene.get("description") or ""),
+            str(scene.get("prompt") or ""),
+            must_include,
+            must_not_include,
+        ]
+    ).lower()
+
+
+def _scene_positive_text(scene: Dict[str, Any]) -> str:
+    must_include = " ".join(str(item) for item in scene.get("must_include", []) if item)
+    return " ".join(
+        [
+            str(scene.get("description") or ""),
+            str(scene.get("prompt") or ""),
+            must_include,
+        ]
+    ).lower()
+
+
+def _scene_visual_object_text(scene: Dict[str, Any]) -> str:
+    must_include = " ".join(str(item) for item in scene.get("must_include", []) if item)
+    return " ".join(
+        [
+            str(scene.get("prompt") or ""),
+            must_include,
+        ]
+    ).lower()
+
+
+def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
+    scene_text = _scene_positive_text(scene)
+    visual_object_text = _scene_visual_object_text(scene)
+    full_scene_text = _scene_text(scene)
+    required: List[str] = []
+    forbidden: List[str] = [
+        "visible text, typography, subtitles, captions, watermark, signature",
+        "duplicate protagonist, cloned face, repeated same person",
+        "unrelated extra people not explicitly required by this scene",
+        "style switch, illustration/engraving/cartoon when cinematic realism is selected",
+    ]
+    character_rules: List[str] = []
+    animal_rules: List[str] = []
+
+    if "alice" in scene_text:
+        required.append(
+            "exactly one Alice, same approximately 10-year-old Victorian child across the whole film, brown hair, ivory modest day dress"
+        )
+        forbidden.extend(
+            [
+                "adult Alice",
+                "toddler Alice",
+                "preschool Alice",
+                "much younger Alice than the reference",
+                "older teenage Alice",
+                "princess Alice",
+                "blue fantasy gown",
+                "second girl replacing Alice",
+            ]
+        )
+        character_rules.append(
+            "Alice must keep the same approximate age, face family, hair color, dress color and body proportions as the visual reference; do not make her younger in interior scenes."
+        )
+
+    if "ludovico" in scene_text or "professor" in scene_text:
+        required.append(
+            "one adult male mathematics professor only if the scene names Ludovico or professor"
+        )
+        character_rules.append(
+            "The adult male may appear only when named by this scene; never replace him with a second Alice."
+        )
+
+    has_cat = any(
+        term in scene_text
+        for term in ("gato", "gatos", "gatinho", "gatinhos", "cat", "cats", "kitten")
+    )
+    visually_requires_cat = any(
+        term in visual_object_text
+        for term in ("gato", "gatos", "gatinho", "gatinhos", "cat", "cats", "kitten")
+    )
+    has_rabbit_hole = "toca de coelho" in scene_text or "rabbit hole" in scene_text
+    has_rabbit = any(term in scene_text for term in ("coelho", "rabbit", "bunny"))
+
+    if visually_requires_cat:
+        required.append("cat or kitten only where this scene explicitly requests it")
+        forbidden.extend(["dog", "rabbit replacing the cat", "plush toy animal"])
+        animal_rules.append(
+            "Any requested kitten must be visibly feline, correctly placed, and not replaced by another animal."
+        )
+    elif not has_cat:
+        forbidden.extend(["unrequested cat", "unrequested kitten"])
+    else:
+        forbidden.extend(["visible cat not requested by visual prompt", "visible kitten not requested by visual prompt"])
+        animal_rules.append(
+            "Narrative mentions of cats are context only; do not force a cat into the image unless prompt or must_include requires it."
+        )
+
+    if has_rabbit_hole:
+        required.append(
+            "dark rabbit hole opening in the ground, roots or grassy embankment"
+        )
+        forbidden.extend(["cat at the rabbit hole", "kitten at the rabbit hole"])
+        animal_rules.append(
+            "The rabbit hole is the required subject; do not add a cat/kitten unless the scene explicitly asks for one."
+        )
+
+    if has_rabbit and not has_rabbit_hole:
+        animal_rules.append(
+            "Rabbit elements may appear only if the scene explicitly names a rabbit."
+        )
+    elif not has_rabbit:
+        forbidden.extend(["unrequested rabbit", "unrequested white rabbit", "bunny"])
+
+    if "colo" in scene_text or "lap" in scene_text:
+        required.append("requested kitten physically resting on Alice's lap")
+        animal_rules.append(
+            "If a kitten is in Alice's lap, it must touch the dress and sit on the lap, not beside her."
+        )
+
+    if "chá" in scene_text or "tea" in scene_text:
+        required.append("Victorian tea table props explicitly described by the scene")
+        forbidden.append("modern tea room objects or unrelated guests")
+
+    return {
+        "required": required or ["literal subject described by the scene"],
+        "forbidden": sorted(set(forbidden)),
+        "character_rules": character_rules,
+        "animal_rules": animal_rules,
+        "raw_scene_terms": full_scene_text[:1200],
+    }
+
+
+def _scene_negative_prompt(scene: Dict[str, Any]) -> str:
+    contract = _build_scene_contract(scene)
+    return f"{IMAGE_NEGATIVE_PROMPT}, {', '.join(contract['forbidden'])}"
+
+
+def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
+    style = _resolve_image_style(style_key)
+    protagonist = (
+        "Alice, one curious approximately 10-year-old Victorian child, modest ivory-white day dress, brown hair, natural child proportions, consistent face family across scenes"
+        if _story_has_any(story_text, ["alice"])
+        else "the single main character named in the scene, consistent age, wardrobe and proportions"
+    )
+    animals = (
+        "cats or kittens only when animals are requested; never dogs"
+        if _story_has_any(story_text, ["gato", "gatos", "gatinho", "gatinhos", "cat", "cats", "kitten"])
+        else "only animals explicitly named by the story"
+    )
+    return {
+        "style_key": style_key,
+        "style_label": style["label"],
+        "style_prompt": style["prompt"],
+        "aspect_ratio": "portrait 9:16 vertical film frame",
+        "visual_continuity": [
+            "every scene belongs to the same film, same medium, same palette, same character design",
+            "do not switch between watercolor, engraving, black-and-white, photorealism, anime or cartoon unless the selected style says so",
+            "same protagonist face, age, wardrobe logic and silhouette across every scene",
+        ],
+        "protagonist": protagonist,
+        "animals": animals,
+        "palette": "muted woodland greens, warm ivory fabric, restrained cinematic contrast, no saturated fantasy colors",
+        "lens": "eye-level 35mm film frame, medium-wide composition, clear subject separation",
+        "forbidden": [
+            "duplicate Alice or duplicate main character",
+            "adult Alice",
+            "toddler Alice, preschool Alice, much younger Alice, older teenage Alice",
+            "princess gown, blue fantasy dress, ball gown, fashion pose",
+            "dog when the story asks for cats or kittens",
+            "unrelated extra people",
+            "mixed art styles between scenes",
+        ],
+    }
+
+
+def _visual_bible_text(visual_bible: Dict[str, Any]) -> str:
+    return (
+        f"FILM VISUAL BIBLE: style={visual_bible.get('style_label')}; "
+        f"medium={visual_bible.get('style_prompt')}; "
+        f"aspect={visual_bible.get('aspect_ratio')}; "
+        f"protagonist={visual_bible.get('protagonist')}; "
+        f"animals={visual_bible.get('animals')}; "
+        f"palette={visual_bible.get('palette')}; "
+        f"lens={visual_bible.get('lens')}; "
+        f"continuity={'; '.join(visual_bible.get('visual_continuity', []))}; "
+        f"forbidden={'; '.join(visual_bible.get('forbidden', []))}."
+    )
+
+
+def _motion_plan(scene: Dict[str, Any]) -> Dict[str, str]:
+    scene_id = _safe_int(scene.get("scene_id"), 1)
+    profiles = [
+        {
+            "profile": "slow_push_in",
+            "description": "slow cinematic push-in toward the main subject",
+            "zoompan": "z='min(zoom+0.0012\\,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+        },
+        {
+            "profile": "gentle_pan_right",
+            "description": "gentle rightward pan with subtle push-in",
+            "zoompan": "z='min(zoom+0.0009\\,1.06)':x='(iw-iw/zoom)*(on/(duration_frames))':y='ih/2-(ih/zoom/2)'",
+        },
+        {
+            "profile": "gentle_pan_left",
+            "description": "gentle leftward pan with subtle push-in",
+            "zoompan": "z='min(zoom+0.0009\\,1.06)':x='(iw-iw/zoom)*(1-on/(duration_frames))':y='ih/2-(ih/zoom/2)'",
+        },
+    ]
+    return profiles[(scene_id - 1) % len(profiles)]
+
+
+def _ffmpeg_zoompan_filter(scene: Dict[str, Any], duration: float, fps: int = 30) -> str:
+    frames = max(1, int(duration * fps))
+    plan = _motion_plan(scene)
+    zoompan = plan["zoompan"].replace("duration_frames", str(frames))
+    return (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        f"zoompan={zoompan}:d={frames}:s=1080x1920:fps={fps},"
+        "format=yuv420p"
+    )
+
+
+def _scene_audio_duration(audio_files: List[Dict[str, Any]], scene_id: Any) -> float:
+    for audio in audio_files:
+        if audio.get("scene_id") != scene_id:
+            continue
+        audio_path = str(audio.get("audio_path", ""))
+        if not audio_path:
+            continue
+        metrics = _probe_media_quality(audio_path, "audio")
+        duration = _safe_float(metrics.get("duration_seconds"))
+        if duration > 0:
+            return duration
+    return 0.0
+
+
+def _build_image_prompt(
+    scene: Dict[str, Any],
+    style_key: str,
+    visual_bible: Dict[str, Any] | None = None,
+    retry_instruction: str = "",
+) -> str:
+    style = _resolve_image_style(style_key)
+    base_prompt = str(scene.get("prompt") or scene.get("description") or "").strip()
+    description = str(scene.get("description") or "").strip()
+    must_include = ", ".join(str(item) for item in scene.get("must_include", []) if item)
+    must_not_include = ", ".join(str(item) for item in scene.get("must_not_include", []) if item)
+    bible_text = _visual_bible_text(visual_bible or _build_visual_bible("", style_key))
+    scene_text = _scene_text(scene)
+    scene_contract = _build_scene_contract(scene)
+    contract_rules = []
+    if "alice" in scene_text:
+        contract_rules.append(
+            "Show exactly one Alice: one Victorian child girl in a modest white day dress; no second girl, no adult woman, no duplicate Alice."
+        )
+    if "ludovico" in scene_text or "professor" in scene_text:
+        contract_rules.append(
+            "If Ludovico or the professor appears, he is one adult male mathematics professor, never a second girl or young woman."
+        )
+    if any(term in scene_text for term in ("gato", "gatos", "gatinho", "gatinhos", "cat", "kitten")):
+        contract_rules.append(
+            "Cats/kittens must be visibly cats only; do not add dogs, rabbits, plush toys, or unrelated animals."
+        )
+    if "toca de coelho" in scene_text or "rabbit hole" in scene_text:
+        contract_rules.append(
+            "A rabbit hole may be visible as a dark opening in the ground or roots, but no rabbit or white rabbit should appear unless explicitly requested."
+        )
+    if "colo" in scene_text or "lap" in scene_text:
+        contract_rules.append(
+            "If the scene says the kitten is in Alice's lap, the kitten must physically rest on her lap, touching the dress, not standing beside her."
+        )
+    if "chá" in scene_text or "tea" in scene_text:
+        contract_rules.append(
+            "Tea-table scenes must show the requested tea table props and characters; do not replace named characters with another Victorian girl."
+        )
+    retry_clause = (
+        f" Previous QA correction to apply strictly: {retry_instruction.strip()}."
+        if retry_instruction.strip()
+        else ""
+    )
+    return (
+        f"{bible_text} "
+        f"{style['prompt']}. "
+        "Full-bleed clean film still only: no text, no letters, no subtitles, no captions, "
+        "no title card, no poster typography, no book page, no decorative border, no watermark, "
+        "no signature, no UI overlay anywhere in the frame. "
+        "Single coherent scene, exactly one instance of the main character, one clear focal subject, "
+        "do not repeat the same person anywhere else in the image, anatomically correct body, "
+        "symmetrical face, natural eyes, natural hands, full head visible, no cropped face. "
+        "If a child appears: fully clothed Victorian child, modest historical dress, "
+        "age-appropriate pose, non-sexual framing, exactly one child unless the scene explicitly asks for siblings. "
+        "If the story asks for Alice, she is a curious Victorian child, not an adult, not a princess, "
+        "not wearing a fantasy ball gown. If the story asks for cats or kittens, do not show dogs. "
+        f"Scene contract: {' '.join(contract_rules) if contract_rules else 'Obey must_include and must_not_include literally.'} "
+        f"Structured required elements: {'; '.join(scene_contract['required'])}. "
+        f"Structured forbidden elements: {'; '.join(scene_contract['forbidden'])}. "
+        f"Character continuity rules: {'; '.join(scene_contract['character_rules']) or 'keep the protagonist visually consistent with the film bible'}. "
+        f"Animal/object rules: {'; '.join(scene_contract['animal_rules']) or 'only show animals and objects explicitly requested by this scene'}. "
+        f"Scene description: {description}. "
+        f"Must include: {must_include or 'the exact subject and objects described by the scene'}. "
+        f"Must not include: {must_not_include or 'duplicate characters, wrong animals, unrelated people, fantasy costumes'}. "
+        f"Visual prompt: {base_prompt}. "
+        f"Camera motion intent for video: {_motion_plan(scene)['description']}. "
+        "Composition: vertical 9:16 frame, clear subject separation from background, rule of thirds, "
+        "no random close-up unless explicitly requested, no isolated body parts."
+        f"{retry_clause}"
+    )
+
+
+def _image_semantic_min_score() -> int:
+    return _safe_int(os.getenv("IMAGE_SEMANTIC_MIN_SCORE", "88"), 88)
+
+
+def _image_generation_max_attempts() -> int:
+    return max(1, min(3, _safe_int(os.getenv("IMAGE_GENERATION_MAX_ATTEMPTS", "3"), 3)))
+
+
+def _image_generation_provider() -> str:
+    provider = os.getenv("IMAGE_GENERATION_PROVIDER", "gemini").strip().lower()
+    if provider not in {"gemini", "comfyui"}:
+        return "gemini"
+    return provider
+
+
+def _gemini_image_model(quality_preset_key: str) -> str:
+    if quality_preset_key == "balanced":
+        return os.getenv(
+            "GEMINI_IMAGE_FAST_MODEL",
+            os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image"),
+        )
+    return os.getenv("GEMINI_IMAGE_QUALITY_MODEL", "gemini-3-pro-image")
+
+
+def _gemini_image_usd_per_image(quality_preset_key: str) -> float:
+    default = "0.04" if quality_preset_key == "balanced" else "0.12"
+    return _safe_float(os.getenv("GEMINI_IMAGE_USD_PER_IMAGE", default), _safe_float(default))
+
+
+def _build_comfyui_workflow(
+    directed_prompt: str,
+    checkpoint_name: str,
+    quality_preset: Dict[str, Any],
+    scene_seed: int,
+    scene_id: Any,
+) -> Dict[str, Any]:
+    return {
+        "1": {
+            "inputs": {"text": directed_prompt, "clip": ["4", 1]},
+            "class_type": "CLIPTextEncode",
+        },
+        "2": {
+            "inputs": {"text": IMAGE_NEGATIVE_PROMPT, "clip": ["4", 1]},
+            "class_type": "CLIPTextEncode",
+        },
+        "3": {
+            "inputs": {
+                "seed": scene_seed,
+                "steps": quality_preset["steps"],
+                "cfg": quality_preset["cfg"],
+                "sampler_name": quality_preset["sampler_name"],
+                "scheduler": quality_preset["scheduler"],
+                "denoise": 1,
+                "model": ["4", 0],
+                "positive": ["1", 0],
+                "negative": ["2", 0],
+                "latent_image": ["5", 0],
+            },
+            "class_type": "KSampler",
+        },
+        "4": {
+            "inputs": {"ckpt_name": checkpoint_name},
+            "class_type": "CheckpointLoaderSimple",
+        },
+        "5": {
+            "inputs": {
+                "width": quality_preset["width"],
+                "height": quality_preset["height"],
+                "batch_size": 1,
+            },
+            "class_type": "EmptyLatentImage",
+        },
+        "6": {
+            "inputs": {"samples": ["3", 0], "vae": ["4", 2]},
+            "class_type": "VAEDecode",
+        },
+        "7": {
+            "inputs": {
+                "filename_prefix": f"scene_{scene_id}",
+                "images": ["6", 0],
+            },
+            "class_type": "SaveImage",
+        },
+    }
+
+
+def _run_comfyui_image_attempt(
+    *,
+    scene: Dict[str, Any],
+    image_path: str,
+    directed_prompt: str,
+    image_style: str,
+    style_label: str,
+    quality_preset_key: str,
+    quality_preset: Dict[str, Any],
+    checkpoint_name: str,
+    scene_seed: int,
+    visual_bible: Dict[str, Any],
+    runpod_endpoint_id: str,
+    runpod_api_key: str,
+    runpod_gpu_usd_per_second: float,
+    attempt: int,
+) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    import base64
+    import binascii
+    import time
+
+    import requests
+
+    run_url = f"https://api.runpod.ai/v2/{runpod_endpoint_id}/run"
+    status_url_template = (
+        f"https://api.runpod.ai/v2/{runpod_endpoint_id}/status/{{job_id}}"
+    )
+    headers = {"Authorization": f"Bearer {runpod_api_key}"}
+    workflow = _build_comfyui_workflow(
+        directed_prompt=directed_prompt,
+        checkpoint_name=checkpoint_name,
+        quality_preset=quality_preset,
+        scene_seed=scene_seed,
+        scene_id=scene["scene_id"],
+    )
+
+    print(
+        "📤 Enviando job para o endpoint RunPod Serverless "
+        f"(cena {scene['scene_id']}, tentativa {attempt})..."
+    )
+    job_started_at = time.monotonic()
+    job_monitor: Dict[str, Any] = {
+        "scene_id": scene["scene_id"],
+        "endpoint_id": runpod_endpoint_id,
+        "job_id": None,
+        "status": "SUBMITTED",
+        "attempt": attempt,
+        "style": image_style,
+        "style_label": style_label,
+        "quality_preset": quality_preset_key,
+        "checkpoint": checkpoint_name,
+        "seed": scene_seed,
+        "width": quality_preset["width"],
+        "height": quality_preset["height"],
+        "elapsed_seconds": 0.0,
+        "polls": [],
+        "error": None,
+        "image_path": None,
+        "estimated_cost_usd": 0.0,
+    }
+
+    try:
+        response = requests.post(
+            run_url,
+            json={"input": {"workflow": workflow}},
+            headers=headers,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        job_monitor["status"] = "SUBMIT_FAILED"
+        job_monitor["error"] = f"{type(exc).__name__}: {exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+        job_monitor["estimated_cost_usd"] = round(
+            job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
+            6,
+        )
+        return job_monitor, None, None
+
+    if response.status_code != 200:
+        job_monitor["status"] = "SUBMIT_FAILED"
+        job_monitor["error"] = f"HTTP {response.status_code}: {response.text[:300]}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+        job_monitor["estimated_cost_usd"] = round(
+            job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
+            6,
+        )
+        return job_monitor, None, None
+
+    job_id = response.json().get("id")
+    job_monitor["job_id"] = job_id
+    print(f"🆔 Job ID: {job_id}")
+
+    max_wait = int(os.getenv("COMFYUI_RUNPOD_MAX_WAIT_SECONDS", "120"))
+    wait_time = 0
+    while wait_time < max_wait:
+        time.sleep(3)
+        wait_time += 3
+
+        try:
+            status_response = requests.get(
+                status_url_template.format(job_id=job_id),
+                headers=headers,
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            job_monitor["polls"].append(
+                {"status": f"POLL_FAILED:{type(exc).__name__}", "wait_seconds": wait_time}
+            )
+            continue
+
+        if status_response.status_code != 200:
+            print(f"⚠️ Erro ao consultar status: {status_response.status_code}")
+            continue
+
+        status_payload = status_response.json()
+        job_status = status_payload.get("status")
+        job_monitor["status"] = job_status
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+        job_monitor["polls"].append({"status": job_status, "wait_seconds": wait_time})
+
+        if job_status == "COMPLETED":
+            images = status_payload.get("output", {}).get("images", [])
+            if not images:
+                job_monitor["error"] = "completed_without_images"
+                break
+
+            image_b64 = images[0].get("data", "")
+            try:
+                with open(image_path, "wb") as output_file:
+                    output_file.write(base64.b64decode(image_b64))
+            except (OSError, ValueError, binascii.Error) as exc:
+                job_monitor["error"] = f"decode_failed:{type(exc).__name__}"
+                break
+
+            if not (os.path.exists(image_path) and os.path.getsize(image_path) > 1000):
+                job_monitor["error"] = "invalid_decoded_image"
+                break
+
+            image_record = {
+                "scene_id": scene["scene_id"],
+                "image_path": image_path,
+                "prompt": directed_prompt,
+                "base_prompt": scene["prompt"],
+                "style": image_style,
+                "quality_preset": quality_preset_key,
+                "checkpoint": checkpoint_name,
+                "seed": scene_seed,
+                "duration": scene.get("duration", 6),
+                "camera_motion": scene.get(
+                    "camera_motion",
+                    _motion_plan(scene)["description"],
+                ),
+                "runpod_job_id": job_id,
+                "generation_method": "comfyui",
+            }
+            job_monitor["image_path"] = image_path
+            technical_metrics = _probe_image_quality(image_path)
+            semantic_metrics = _evaluate_image_semantics(
+                image_path,
+                scene,
+                directed_prompt,
+                image_style,
+                visual_bible,
+            )
+            combined_metrics = _combine_image_quality(
+                technical_metrics,
+                semantic_metrics,
+            )
+            image_metric = {
+                "scene_id": scene["scene_id"],
+                "generation_method": "comfyui",
+                "attempt": attempt,
+                "style": image_style,
+                "quality_preset": quality_preset_key,
+                "checkpoint": checkpoint_name,
+                "seed": scene_seed,
+                **combined_metrics,
+            }
+            job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
+            job_monitor["quality_score"] = combined_metrics.get("quality_score")
+            job_monitor["semantic_accepted"] = combined_metrics.get(
+                "semantic_accepted"
+            )
+            job_monitor["quality_issues"] = combined_metrics.get("issues", [])
+            job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+            job_monitor["estimated_cost_usd"] = round(
+                job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
+                6,
+            )
+            return job_monitor, image_record, image_metric
+
+        if job_status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+            job_monitor["error"] = status_payload.get("error")
+            break
+
+        print(f"⏳ Status: {job_status} ({wait_time}s)")
+
+    else:
+        job_monitor["status"] = "LOCAL_TIMEOUT"
+        job_monitor["error"] = f"timeout_after_{max_wait}s"
+        if job_id:
+            _cancel_runpod_job(runpod_endpoint_id, runpod_api_key, job_id)
+
+    job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+    job_monitor["estimated_cost_usd"] = round(
+        job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
+        6,
+    )
+    return job_monitor, None, None
+
+
+def _extract_gemini_image_bytes(response: Any) -> bytes | None:
+    output_image = getattr(response, "output_image", None)
+    if output_image is not None:
+        data = getattr(output_image, "data", None)
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, str):
+            import base64
+            import binascii
+
+            try:
+                return base64.b64decode(data)
+            except binascii.Error:
+                return None
+
+    generated_images = getattr(response, "generated_images", None) or getattr(
+        response,
+        "generatedImages",
+        None,
+    )
+    if generated_images:
+        first_image = generated_images[0]
+        image = getattr(first_image, "image", None)
+        image_bytes = getattr(image, "image_bytes", None) or getattr(
+            image,
+            "imageBytes",
+            None,
+        )
+        if isinstance(image_bytes, bytes):
+            return image_bytes
+
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            inline_data = getattr(part, "inline_data", None) or getattr(
+                part,
+                "inlineData",
+                None,
+            )
+            if inline_data is None:
+                continue
+            data = getattr(inline_data, "data", None)
+            if isinstance(data, bytes):
+                return data
+            if isinstance(data, str):
+                import base64
+                import binascii
+
+                try:
+                    return base64.b64decode(data)
+                except binascii.Error:
+                    return None
+    return None
+
+
+def _run_gemini_image_attempt(
+    *,
+    scene: Dict[str, Any],
+    image_path: str,
+    directed_prompt: str,
+    image_style: str,
+    style_label: str,
+    quality_preset_key: str,
+    scene_seed: int,
+    visual_bible: Dict[str, Any],
+    attempt: int,
+    reference_image_path: str | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    import time
+
+    model_name = _gemini_image_model(quality_preset_key)
+    job_started_at = time.monotonic()
+    job_monitor: Dict[str, Any] = {
+        "scene_id": scene["scene_id"],
+        "provider": "gemini",
+        "job_id": f"gemini:{scene['scene_id']}:{attempt}:{scene_seed}",
+        "status": "SUBMITTED",
+        "attempt": attempt,
+        "style": image_style,
+        "style_label": style_label,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "elapsed_seconds": 0.0,
+        "polls": [],
+        "error": None,
+        "image_path": None,
+        "reference_image_path": reference_image_path,
+        "estimated_cost_usd": _gemini_image_usd_per_image(quality_preset_key),
+    }
+
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        job_monitor["status"] = "SUBMIT_FAILED"
+        job_monitor["error"] = "missing_gemini_key"
+        return job_monitor, None, None
+
+    try:
+        from google import genai
+        from google.genai import errors, types
+    except ImportError as exc:
+        job_monitor["status"] = "SUBMIT_FAILED"
+        job_monitor["error"] = f"missing_google_genai:{type(exc).__name__}"
+        return job_monitor, None, None
+
+    generation_prompt = (
+        f"{directed_prompt}\n\n"
+        f"Negative constraints: {_scene_negative_prompt(scene)}\n\n"
+        "Output one portrait 9:16 cinematic image only. No text. "
+        "If a reference image is provided, preserve the protagonist identity, age, wardrobe logic, color palette, lens language and cinematic finish while changing only the scene action and setting."
+    )
+
+    try:
+        client = genai.Client(api_key=api_key)
+        contents: Any = generation_prompt
+        if reference_image_path:
+            reference_path = Path(reference_image_path)
+            if reference_path.exists() and reference_path.stat().st_size > 1000:
+                contents = [
+                    generation_prompt,
+                    "Reference image for identity and style continuity. Do not copy the pose or scene; keep the same protagonist identity and film language.",
+                    types.Part.from_bytes(
+                        data=reference_path.read_bytes(),
+                        mime_type="image/png",
+                    ),
+                ]
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                responseModalities=["IMAGE"],
+                imageConfig=types.ImageConfig(
+                    aspectRatio="9:16",
+                    imageSize="2K" if quality_preset_key == "high" else "1K",
+                ),
+            ),
+        )
+        image_bytes = _extract_gemini_image_bytes(response)
+    except (
+        TypeError,
+        ValueError,
+        errors.APIError,
+        errors.ClientError,
+        errors.ServerError,
+        errors.UnknownApiResponseError,
+    ) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"{type(exc).__name__}: {exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+        return job_monitor, None, None
+
+    job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+    if image_bytes is None:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "gemini_completed_without_image"
+        return job_monitor, None, None
+
+    try:
+        with open(image_path, "wb") as output_file:
+            output_file.write(image_bytes)
+    except OSError as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"write_failed:{type(exc).__name__}"
+        return job_monitor, None, None
+
+    if not (os.path.exists(image_path) and os.path.getsize(image_path) > 1000):
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "invalid_gemini_image"
+        return job_monitor, None, None
+
+    job_monitor["status"] = "COMPLETED"
+    job_monitor["image_path"] = image_path
+    image_record = {
+        "scene_id": scene["scene_id"],
+        "image_path": image_path,
+        "prompt": directed_prompt,
+        "base_prompt": scene["prompt"],
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "duration": scene.get("duration", 6),
+        "camera_motion": scene.get(
+            "camera_motion",
+            _motion_plan(scene)["description"],
+        ),
+        "runpod_job_id": None,
+        "generation_method": "gemini_image",
+    }
+    technical_metrics = _probe_image_quality(image_path)
+    semantic_metrics = _evaluate_image_semantics(
+        image_path,
+        scene,
+        directed_prompt,
+        image_style,
+        visual_bible,
+    )
+    combined_metrics = _combine_image_quality(technical_metrics, semantic_metrics)
+    image_metric = {
+        "scene_id": scene["scene_id"],
+        "generation_method": "gemini_image",
+        "attempt": attempt,
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        **combined_metrics,
+    }
+    job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
+    job_monitor["quality_score"] = combined_metrics.get("quality_score")
+    job_monitor["semantic_accepted"] = combined_metrics.get("semantic_accepted")
+    job_monitor["quality_issues"] = combined_metrics.get("issues", [])
+    return job_monitor, image_record, image_metric
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap token estimate for monitoring and cost approximation."""
+    return max(1, len(text) // 4)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_json_object(raw_text: str) -> Dict[str, Any]:
+    text = raw_text.replace("```json", "").replace("```", "").strip()
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in model response")
+    parsed = json.loads(match.group())
+    if not isinstance(parsed, dict):
+        raise ValueError("Model response JSON is not an object")
+    return parsed
+
+
+def _extract_response_text(response: Any) -> str:
+    text = getattr(response, "text", "")
+    if text:
+        return str(text)
+
+    chunks: List[str] = []
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            part_text = getattr(part, "text", "")
+            if part_text:
+                chunks.append(str(part_text))
+    if chunks:
+        return "\n".join(chunks)
+    return str(response)
+
+
+def _semantic_qa_enabled() -> bool:
+    return os.getenv("IMAGE_SEMANTIC_QA_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _evaluate_image_semantics(
+    image_path: str,
+    scene: Dict[str, Any],
+    directed_prompt: str,
+    style_key: str,
+    visual_bible: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "semantic_score": 0,
+        "semantic_qa_enabled": _semantic_qa_enabled(),
+        "accepted": False,
+        "issues": [],
+        "retry_prompt": "",
+        "model": os.getenv("GEMINI_VISION_QA_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash")),
+    }
+    if not metrics["semantic_qa_enabled"]:
+        metrics.update({"semantic_score": 100, "accepted": True})
+        return metrics
+
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        metrics["issues"].append("semantic_qa_missing_gemini_key")
+        return metrics
+
+    path = Path(image_path)
+    if not path.exists():
+        metrics["issues"].append("semantic_qa_missing_image")
+        return metrics
+
+    scene_contract = _build_scene_contract(scene)
+    try:
+        from google import genai
+        from google.genai import errors, types
+    except ImportError as exc:
+        metrics["issues"].append(f"semantic_qa_failed:{type(exc).__name__}")
+        return metrics
+
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = f"""
+Você é o diretor de qualidade visual do pipeline AI Film.
+Avalie se a imagem segue a cena e o prompt. Penalize severamente:
+- qualquer texto visível, letras, legenda falsa, assinatura, marca d'água, borda de página ou moldura ornamental;
+- personagem principal duplicada;
+- Alice adulta, princesa, vestido de baile ou fantasia quando a cena pede criança vitoriana;
+- cachorro quando a cena pede gato/gatinhos;
+- estilo visual diferente do estilo escolhido;
+- pessoas, animais ou objetos que não aparecem na cena;
+- composição cortada, rosto ruim, anatomia ruim ou imagem que pareça colagem.
+
+Cena JSON:
+{json.dumps(scene, ensure_ascii=False)}
+
+Bíblia visual fixa:
+{json.dumps(visual_bible or {}, ensure_ascii=False)}
+
+Contrato estruturado da cena:
+{json.dumps(scene_contract, ensure_ascii=False, indent=2)}
+
+Estilo escolhido: {_resolve_image_style(style_key)["label"]}
+Prompt enviado ao gerador:
+{directed_prompt}
+
+Regras de aceite:
+- Uma imagem tecnicamente bonita deve ser reprovada se violar o contrato estruturado.
+- Se houver personagem extra não pedido, objeto/animal errado, idade/rosto da protagonista fora da bíblia ou animal inventado, accepted=false.
+- Se a cena pede rabbit hole, não aceite gato/filhote como substituto visual.
+- Se a cena pede gato/filhote no colo, não aceite animal fora do colo.
+- Se a cena não pede gato/filhote, qualquer gato/filhote é critical failure.
+- Se a cena inclui Alice, avalie se ela preserva idade, cabelo, figurino e família facial do filme.
+
+Retorne somente JSON válido, sem markdown:
+{{
+  "semantic_score": 0-100,
+  "accepted": true/false,
+  "issues": ["issue_code"],
+  "critical_failures": ["failure_code"],
+  "retry_prompt": "correção objetiva em inglês para regenerar a imagem"
+}}
+"""
+        response = client.models.generate_content(
+            model=str(metrics["model"]),
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=path.read_bytes(), mime_type="image/png"),
+            ],
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        try:
+            parsed = _extract_json_object(_extract_response_text(response))
+        except ValueError:
+            compact_prompt = f"""
+Return only valid JSON.
+Evaluate this image against this scene contract:
+{json.dumps(scene_contract, ensure_ascii=False)}
+
+Selected style: {_resolve_image_style(style_key)["label"]}
+Scene: {json.dumps(scene, ensure_ascii=False)}
+
+JSON schema:
+{{
+  "semantic_score": 0-100,
+  "accepted": true/false,
+  "issues": ["issue_code"],
+  "critical_failures": ["failure_code"],
+  "retry_prompt": "short English regeneration instruction"
+}}
+"""
+            fallback_response = client.models.generate_content(
+                model=str(metrics["model"]),
+                contents=[
+                    compact_prompt,
+                    types.Part.from_bytes(
+                        data=path.read_bytes(),
+                        mime_type="image/png",
+                    ),
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                ),
+            )
+            parsed = _extract_json_object(_extract_response_text(fallback_response))
+        score = max(0, min(100, _safe_int(parsed.get("semantic_score"))))
+        issues = parsed.get("issues", [])
+        critical_failures = parsed.get("critical_failures", [])
+        issue_codes = [str(issue) for issue in issues if issue]
+        critical_codes = [str(issue) for issue in critical_failures if issue]
+        if critical_codes:
+            score = min(score, 79)
+        metrics.update(
+            {
+                "semantic_score": score,
+                "accepted": bool(parsed.get("accepted"))
+                and not critical_codes
+                and score >= _image_semantic_min_score(),
+                "issues": [*issue_codes, *critical_codes],
+                "critical_failures": critical_codes,
+                "retry_prompt": str(parsed.get("retry_prompt", ""))[:1000],
+            }
+        )
+    except (
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        errors.APIError,
+        errors.ClientError,
+        errors.ServerError,
+        errors.UnknownApiResponseError,
+    ) as exc:
+        metrics["issues"].append(f"semantic_qa_failed:{type(exc).__name__}")
+
+    return metrics
+
+
+def _combine_image_quality(
+    technical_metrics: Dict[str, Any],
+    semantic_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    technical_score = float(technical_metrics.get("quality_score", 0) or 0)
+    semantic_score = float(semantic_metrics.get("semantic_score", 0) or 0)
+    if not semantic_metrics.get("semantic_qa_enabled", True):
+        combined_score = technical_score
+    else:
+        combined_score = (technical_score * 0.4) + (semantic_score * 0.6)
+
+    issues = [
+        *technical_metrics.get("issues", []),
+        *semantic_metrics.get("issues", []),
+    ]
+    if semantic_metrics.get("semantic_qa_enabled", True) and not semantic_metrics.get("accepted"):
+        issues.append("semantic_quality_below_threshold")
+
+    return {
+        **technical_metrics,
+        "technical_score": round(technical_score, 1),
+        "semantic_score": round(semantic_score, 1),
+        "semantic_accepted": bool(semantic_metrics.get("accepted")),
+        "semantic_critical_failures": semantic_metrics.get("critical_failures", []),
+        "semantic_retry_prompt": semantic_metrics.get("retry_prompt", ""),
+        "semantic_qa_model": semantic_metrics.get("model"),
+        "quality_score": round(min(100, combined_score), 1),
+        "issues": issues,
+    }
+
+
+def _evaluate_image_set_consistency(
+    scene_images: List[Dict[str, Any]],
+    visual_bible: Dict[str, Any],
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "consistency_score": 0,
+        "accepted": False,
+        "issues": [],
+        "model": os.getenv("GEMINI_VISION_QA_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash")),
+    }
+    if not _semantic_qa_enabled():
+        metrics.update({"consistency_score": 100, "accepted": True})
+        return metrics
+
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    valid_images = [
+        Path(item["image_path"])
+        for item in scene_images
+        if item.get("image_path")
+        and Path(item["image_path"]).exists()
+        and Path(item["image_path"]).stat().st_size > 1000
+    ]
+    if not api_key or len(valid_images) < 2:
+        metrics["issues"].append("consistency_qa_insufficient_inputs")
+        return metrics
+
+    try:
+        from google import genai
+        from google.genai import errors, types
+    except ImportError as exc:
+        metrics["issues"].append(f"consistency_qa_failed:{type(exc).__name__}")
+        return metrics
+
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = f"""
+Avalie se estas imagens pertencem ao mesmo filme.
+Use a bíblia visual abaixo como fonte da verdade:
+{json.dumps(visual_bible, ensure_ascii=False)}
+
+Penalize: mudança de estilo/medium entre cenas, mudança de idade/figurino da protagonista,
+paleta incompatível, cenas com acabamento de gravura enquanto outras são aquarela/foto,
+e composição que pareça gerada por prompts sem direção de arte compartilhada.
+
+Retorne somente JSON válido:
+{{
+  "consistency_score": 0-100,
+  "accepted": true/false,
+  "issues": ["issue_code"],
+  "style_notes": "diagnóstico curto"
+}}
+"""
+        contents: List[Any] = [prompt]
+        for path in valid_images[:5]:
+            contents.append(
+                types.Part.from_bytes(data=path.read_bytes(), mime_type="image/png")
+            )
+        response = client.models.generate_content(
+            model=str(metrics["model"]),
+            contents=contents,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        parsed = _extract_json_object(_extract_response_text(response))
+        score = max(0, min(100, _safe_int(parsed.get("consistency_score"))))
+        metrics.update(
+            {
+                "consistency_score": score,
+                "accepted": bool(parsed.get("accepted")) and score >= 80,
+                "issues": [str(issue) for issue in parsed.get("issues", []) if issue],
+                "style_notes": str(parsed.get("style_notes", ""))[:1000],
+            }
+        )
+    except (
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        errors.APIError,
+        errors.ClientError,
+        errors.ServerError,
+        errors.UnknownApiResponseError,
+    ) as exc:
+        metrics["issues"].append(f"consistency_qa_failed:{type(exc).__name__}")
+
+    return metrics
+
+
+def _probe_image_quality(image_path: str) -> Dict[str, Any]:
+    path = Path(image_path)
+    metrics: Dict[str, Any] = {
+        "path": image_path,
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "valid": False,
+        "width": 0,
+        "height": 0,
+        "quality_score": 0,
+        "issues": [],
+    }
+    if not path.exists():
+        metrics["issues"].append("missing_file")
+        return metrics
+
+    try:
+        from PIL import Image, ImageStat
+
+        with Image.open(path) as image:
+            image.load()
+            metrics["width"], metrics["height"] = image.size
+            metrics["mode"] = image.mode
+            grayscale = image.convert("L")
+            stat = ImageStat.Stat(grayscale)
+            contrast = stat.stddev[0] if stat.stddev else 0.0
+            metrics["contrast"] = round(contrast, 2)
+
+        pixel_count = int(metrics["width"]) * int(metrics["height"])
+        size_score = min(35, metrics["size_bytes"] / 12000)
+        resolution_score = min(35, pixel_count / (512 * 512) * 35)
+        contrast_score = min(30, contrast / 64 * 30)
+        score = round(size_score + resolution_score + contrast_score, 1)
+        metrics["quality_score"] = min(100, score)
+        metrics["valid"] = metrics["size_bytes"] > 1000 and pixel_count > 0
+        if int(metrics["width"]) < 512 or int(metrics["height"]) < 512:
+            metrics["issues"].append("low_resolution")
+        if contrast < 8:
+            metrics["issues"].append("low_contrast")
+    except (OSError, ValueError) as exc:
+        metrics["issues"].append(f"invalid_image:{type(exc).__name__}")
+    return metrics
+
+
+def _probe_media_quality(media_path: str, media_type: str) -> Dict[str, Any]:
+    path = Path(media_path)
+    metrics: Dict[str, Any] = {
+        "path": media_path,
+        "type": media_type,
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "valid": False,
+        "duration_seconds": 0.0,
+        "bit_rate": 0,
+        "quality_score": 0,
+        "issues": [],
+    }
+    if not path.exists():
+        metrics["issues"].append("missing_file")
+        return metrics
+
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration,size,bit_rate",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        metrics["issues"].append("ffprobe_failed")
+        return metrics
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        metrics["issues"].append("ffprobe_invalid_json")
+        return metrics
+
+    fmt = payload.get("format", {})
+    duration = _safe_float(fmt.get("duration"))
+    bit_rate = int(_safe_float(fmt.get("bit_rate")))
+    metrics["duration_seconds"] = round(duration, 3)
+    metrics["bit_rate"] = bit_rate
+    metrics["valid"] = metrics["size_bytes"] > 1000 and duration > 0
+
+    if media_type == "audio":
+        duration_score = min(45, duration / 6 * 45)
+        bitrate_score = min(35, bit_rate / 64000 * 35) if bit_rate else 0
+        size_score = min(20, metrics["size_bytes"] / 100000 * 20)
+    else:
+        duration_score = min(30, duration / 10 * 30)
+        bitrate_score = min(35, bit_rate / 250000 * 35) if bit_rate else 0
+        size_score = min(35, metrics["size_bytes"] / 300000 * 35)
+
+    metrics["quality_score"] = min(
+        100, round(duration_score + bitrate_score + size_score, 1)
+    )
+    if duration <= 0:
+        metrics["issues"].append("zero_duration")
+    if bit_rate and bit_rate < 32000:
+        metrics["issues"].append("low_bitrate")
+    return metrics
+
+
+def _aggregate_quality(
+    image_metrics: List[Dict[str, Any]],
+    audio_metrics: List[Dict[str, Any]],
+    video_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    def average(items: List[Dict[str, Any]]) -> float:
+        scores = [float(item.get("quality_score", 0)) for item in items]
+        return round(sum(scores) / len(scores), 1) if scores else 0.0
+
+    categories = {
+        "images": average(image_metrics),
+        "audio": average(audio_metrics),
+        "video": float(video_metrics.get("quality_score", 0) or 0),
+    }
+    if categories["images"] > 0:
+        overall = round(
+            (categories["images"] * 0.6)
+            + (categories["video"] * 0.25)
+            + (categories["audio"] * 0.15),
+            1,
+        )
+    else:
+        available = [score for score in categories.values() if score > 0]
+        overall = round(sum(available) / len(available), 1) if available else 0.0
+    return {
+        "overall_score": overall,
+        "categories": categories,
+        "images": image_metrics,
+        "audio": audio_metrics,
+        "video": video_metrics,
+    }
 
 
 def create_open3d_workflow():
@@ -63,11 +1551,36 @@ def create_open3d_workflow():
 
             # Generate cinematic prompt using Flash model (Pro exceeded quota)
             prompt = generate_cinematic_prompt(story_text, use_pro_model=False)
+            image_style = state.get("image_style", DEFAULT_IMAGE_STYLE)
+            visual_bible = _build_visual_bible(story_text, image_style)
+            input_tokens = _estimate_tokens(story_text)
+            output_tokens = _estimate_tokens(prompt)
+            gemini_input_usd_per_1m = _safe_float(
+                os.getenv("GEMINI_INPUT_USD_PER_1M_TOKENS", "0.30")
+            )
+            gemini_output_usd_per_1m = _safe_float(
+                os.getenv("GEMINI_OUTPUT_USD_PER_1M_TOKENS", "2.50")
+            )
 
             state.update(
                 {
                     "story_text": story_text,
                     "cinematic_prompt": prompt,
+                    "visual_bible": visual_bible,
+                    "cost_estimate": {
+                        **state.get("cost_estimate", {}),
+                        "llm_input_tokens": input_tokens,
+                        "llm_output_tokens": output_tokens,
+                        "llm_usd": round(
+                            (input_tokens / 1_000_000 * gemini_input_usd_per_1m)
+                            + (
+                                output_tokens
+                                / 1_000_000
+                                * gemini_output_usd_per_1m
+                            ),
+                            6,
+                        ),
+                    },
                     "current_step": "story_extracted",
                 }
             )
@@ -79,8 +1592,14 @@ def create_open3d_workflow():
             story_text = state.get("story_text", "")
             cinematic_prompt = state.get("cinematic_prompt", "")
             max_scenes = state.get("max_scenes", 8)
+            image_style = state.get("image_style", DEFAULT_IMAGE_STYLE)
+            style_label = _resolve_image_style(image_style)["label"]
+            visual_bible = state.get("visual_bible") or _build_visual_bible(
+                story_text,
+                image_style,
+            )
 
-            print("🎬 Gerando cenas...")
+            print(f"🎬 Gerando cenas com estilo visual: {style_label}...")
 
             if not story_text:
                 print("⚠️ História vazia, usando cenas mock")
@@ -90,18 +1609,21 @@ def create_open3d_workflow():
                         "description": "Mock scene",
                         "prompt": cinematic_prompt,
                         "duration": 5,
+                        "camera_motion": _motion_plan({"scene_id": 1})["description"],
                     },
                     {
                         "scene_id": 2,
                         "description": "Mock scene",
                         "prompt": cinematic_prompt,
                         "duration": 5,
+                        "camera_motion": _motion_plan({"scene_id": 2})["description"],
                     },
                     {
                         "scene_id": 3,
                         "description": "Mock scene",
                         "prompt": cinematic_prompt,
                         "duration": 5,
+                        "camera_motion": _motion_plan({"scene_id": 3})["description"],
                     },
                 ]
             else:
@@ -112,18 +1634,45 @@ def create_open3d_workflow():
                     scene_prompt = f"""
 Divida esta história em {max_scenes} cenas cinematográficas.
 
+ESTILO VISUAL ESCOLHIDO:
+{style_label}
+
+BÍBLIA VISUAL FIXA DO FILME:
+{json.dumps(visual_bible, ensure_ascii=False, indent=2)}
+
 HISTÓRIA:
 {story_text}
 
 Para cada cena, forneça:
 1. ID da cena (número)
 2. Descrição detalhada (2-3 frases)
-3. Prompt visual para geração de imagem (estilo cinematográfico)
+3. Prompt visual para geração de imagem, respeitando o estilo escolhido e evitando faces/anatomia deformadas
 4. Duração sugerida (5-10 segundos)
+5. must_include: lista curta de elementos que precisam aparecer na imagem
+6. must_not_include: lista curta de elementos proibidos para manter fidelidade à história
+7. camera_motion: movimento de câmera discreto para animar a imagem no vídeo
+
+Regras visuais obrigatórias:
+- Cada prompt deve descrever uma única imagem, não uma sequência.
+- Todas as cenas precisam parecer frames do mesmo filme: mesmo meio, paleta, personagem, figurino, proporção e acabamento.
+- Não repita a mesma personagem várias vezes na mesma imagem.
+- Se Alice aparecer, descreva exatamente uma Alice, totalmente vestida, em pose natural.
+- Alice não é princesa, adulta, modelo de moda, nem personagem em vestido de baile.
+- Se a história pedir gatos/gatinhos, não inclua cachorro.
+- Evite inserir pessoas extras que não existem na cena.
+- Evite close-ups extremos, corpo cortado, mãos em destaque e rostos parcialmente ocultos.
 
 Retorne em formato JSON:
 [
-  {{"scene_id": 1, "description": "...", "prompt": "...", "duration": 6}},
+  {{
+    "scene_id": 1,
+    "description": "...",
+    "prompt": "...",
+    "duration": 6,
+    "must_include": ["..."],
+    "must_not_include": ["..."],
+    "camera_motion": "slow cinematic push-in toward the main subject"
+  }},
   ...
 ]
 """
@@ -131,10 +1680,6 @@ Retorne em formato JSON:
                     response = llm.invoke(scene_prompt)
 
                     # Parse response
-                    import ast
-                    import json
-                    import re
-
                     # Extrair conteúdo da resposta - tratar diferentes formatos
                     raw_content = (
                         response.content
@@ -227,6 +1772,11 @@ Retorne em formato JSON:
                                 "description": part[:200],
                                 "prompt": f"{cinematic_prompt}, scene showing: {part[:100]}",
                                 "duration": 6,
+                                "must_include": ["exact scene subject"],
+                                "must_not_include": visual_bible.get("forbidden", []),
+                                "camera_motion": _motion_plan({"scene_id": i})[
+                                    "description"
+                                ],
                             }
                         )
                     print(f"✅ {len(scenes)} cenas criadas (fallback)")
@@ -235,6 +1785,7 @@ Retorne em formato JSON:
                 {
                     "scenes": scenes,
                     "scenes_count": len(scenes),
+                    "visual_bible": visual_bible,
                     "current_step": "scenes_generated",
                 }
             )
@@ -247,10 +1798,32 @@ Retorne em formato JSON:
             scenes = state.get("scenes", [])
             runpod_api_key = os.getenv("RUNPOD_API_KEY", "")
             runpod_endpoint_id = os.getenv("RUNPOD_ENDPOINT_ID", "")
+            image_style = state.get("image_style", DEFAULT_IMAGE_STYLE)
+            quality_preset_key = state.get("image_quality_preset", "high")
+            quality_preset = _resolve_quality_preset(quality_preset_key)
+            session_id = state.get("session_id", "default")
+            style_label = _resolve_image_style(image_style)["label"]
+            checkpoint_name = _resolve_comfyui_checkpoint(image_style)
+            image_provider = _image_generation_provider()
+            visual_bible = state.get("visual_bible") or _build_visual_bible(
+                state.get("story_text", ""),
+                image_style,
+            )
 
-            print("🖼️ Gerando imagens com ComfyUI (RunPod Serverless)...")
+            print(
+                "🖼️ Gerando imagens... "
+                f"provider={image_provider}, estilo={style_label}, "
+                f"qualidade={quality_preset_key}, checkpoint={checkpoint_name}"
+            )
 
             scene_images = []
+            runpod_jobs = []
+            image_metrics = []
+            reference_image_path: str | None = None
+            runpod_gpu_usd_per_second = _safe_float(
+                os.getenv("RUNPOD_GPU_USD_PER_SECOND", "0.00044")
+            )
+            max_attempts = _image_generation_max_attempts()
 
             for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
                 try:
@@ -260,155 +1833,211 @@ Retorne em formato JSON:
                     os.makedirs("output", exist_ok=True)
                     image_path = f"output/scene_{scene['scene_id']}_image.png"
 
+                    if image_provider == "gemini":
+                        retry_instruction = ""
+                        best_candidate: tuple[
+                            float,
+                            str,
+                            Dict[str, Any],
+                            Dict[str, Any],
+                        ] | None = None
+                        selected_scene = False
+                        for attempt in range(1, max_attempts + 1):
+                            attempt_seed = _scene_seed(
+                                session_id,
+                                image_style,
+                                f"gemini:{scene['scene_id']}:{attempt}",
+                            )
+                            directed_prompt = _build_image_prompt(
+                                scene,
+                                image_style,
+                                visual_bible,
+                                retry_instruction,
+                            )
+                            attempt_path = (
+                                image_path
+                                if attempt == max_attempts
+                                else f"output/scene_{scene['scene_id']}_gemini_attempt_{attempt}.png"
+                            )
+                            job_monitor, image_record, image_metric = (
+                                _run_gemini_image_attempt(
+                                    scene=scene,
+                                    image_path=attempt_path,
+                                    directed_prompt=directed_prompt,
+                                    image_style=image_style,
+                                    style_label=style_label,
+                                    quality_preset_key=quality_preset_key,
+                                    scene_seed=attempt_seed,
+                                    visual_bible=visual_bible,
+                                    attempt=attempt,
+                                    reference_image_path=reference_image_path,
+                                )
+                            )
+                            runpod_jobs.append(job_monitor)
+                            if not image_record or not image_metric:
+                                continue
+
+                            quality_score = _safe_float(
+                                image_metric.get("quality_score"),
+                                0.0,
+                            )
+                            if (
+                                best_candidate is None
+                                or quality_score > best_candidate[0]
+                            ):
+                                best_candidate = (
+                                    quality_score,
+                                    attempt_path,
+                                    image_record,
+                                    image_metric,
+                                )
+
+                            accepted = bool(image_metric.get("semantic_accepted"))
+                            if accepted:
+                                if attempt_path != image_path:
+                                    os.replace(attempt_path, image_path)
+                                    image_record["image_path"] = image_path
+                                    image_metric["path"] = image_path
+                                scene_images.append(image_record)
+                                image_metrics.append(image_metric)
+                                if reference_image_path is None:
+                                    reference_image_path = image_path
+                                print(
+                                    "✅ Imagem Gemini/Nano Banana "
+                                    f"aceita: cena {scene['scene_id']} "
+                                    f"(tentativa {attempt}, score={image_metric.get('quality_score')})"
+                                )
+                                selected_scene = True
+                                break
+
+                            retry_instruction = str(
+                                image_metric.get("semantic_retry_prompt")
+                                or "Remove duplicated characters, wrong objects, missing required objects, style drift and visible text. Obey the scene contract exactly."
+                            )
+                            print(
+                                "🔁 QA visual reprovou a cena "
+                                f"{scene['scene_id']} no Gemini na tentativa {attempt}; regenerando."
+                            )
+                        if not selected_scene and best_candidate:
+                            _, best_path, image_record, image_metric = best_candidate
+                            if best_path != image_path:
+                                os.replace(best_path, image_path)
+                                image_record["image_path"] = image_path
+                                image_metric["path"] = image_path
+                            scene_images.append(image_record)
+                            image_metrics.append(image_metric)
+                            if reference_image_path is None:
+                                reference_image_path = image_path
+                            print(
+                                "✅ Imagem Gemini/Nano Banana mantida com melhor score: "
+                                f"cena {scene['scene_id']} "
+                                f"(tentativa {image_metric.get('attempt')}, "
+                                f"score={image_metric.get('quality_score')})"
+                            )
+
+                    if any(
+                        img["scene_id"] == scene["scene_id"]
+                        and img["generation_method"] == "gemini_image"
+                        for img in scene_images
+                    ):
+                        continue
+
                     # Generate image using ComfyUI via RunPod Serverless
                     if runpod_api_key and runpod_endpoint_id:
-                        import base64
-                        import time
-
-                        import requests
-
-                        run_url = f"https://api.runpod.ai/v2/{runpod_endpoint_id}/run"
-                        status_url_template = f"https://api.runpod.ai/v2/{runpod_endpoint_id}/status/{{job_id}}"
-                        headers = {"Authorization": f"Bearer {runpod_api_key}"}
-
-                        # Workflow no formato "API" do ComfyUI (Workflow > Export (API))
-                        workflow = {
-                            "1": {
-                                "inputs": {"text": scene["prompt"], "clip": ["4", 1]},
-                                "class_type": "CLIPTextEncode",
-                            },
-                            "2": {
-                                "inputs": {
-                                    "text": "blurry, bad quality, distorted",
-                                    "clip": ["4", 1],
-                                },
-                                "class_type": "CLIPTextEncode",
-                            },
-                            "3": {
-                                "inputs": {
-                                    "seed": 123456789,
-                                    "steps": 20,
-                                    "cfg": 7,
-                                    "sampler_name": "euler",
-                                    "scheduler": "normal",
-                                    "denoise": 1,
-                                    "model": ["4", 0],
-                                    "positive": ["1", 0],
-                                    "negative": ["2", 0],
-                                    "latent_image": ["5", 0],
-                                },
-                                "class_type": "KSampler",
-                            },
-                            "4": {
-                                "inputs": {
-                                    "ckpt_name": "v1-5-pruned-emaonly.safetensors"
-                                },
-                                "class_type": "CheckpointLoaderSimple",
-                            },
-                            "5": {
-                                "inputs": {
-                                    "width": 512,
-                                    "height": 512,
-                                    "batch_size": 1,
-                                },
-                                "class_type": "EmptyLatentImage",
-                            },
-                            "6": {
-                                "inputs": {"samples": ["3", 0], "vae": ["4", 2]},
-                                "class_type": "VAEDecode",
-                            },
-                            "7": {
-                                "inputs": {
-                                    "filename_prefix": f"scene_{scene['scene_id']}",
-                                    "images": ["6", 0],
-                                },
-                                "class_type": "SaveImage",
-                            },
-                        }
-
-                        print("📤 Enviando job para o endpoint RunPod Serverless...")
-                        response = requests.post(
-                            run_url,
-                            json={"input": {"workflow": workflow}},
-                            headers=headers,
-                            timeout=30,
-                        )
-
-                        if response.status_code == 200:
-                            job_id = response.json().get("id")
-                            print(f"🆔 Job ID: {job_id}")
-
-                            # Poll status: worker escala de zero, então o cold start pode levar
-                            # de alguns segundos a ~1 minuto além do tempo de geração em si.
-                            max_wait = 180
-                            wait_time = 0
-                            while wait_time < max_wait:
-                                time.sleep(3)
-                                wait_time += 3
-
-                                status_response = requests.get(
-                                    status_url_template.format(job_id=job_id),
-                                    headers=headers,
-                                    timeout=10,
+                        retry_instruction = ""
+                        best_candidate = None
+                        selected_scene = False
+                        for attempt in range(1, max_attempts + 1):
+                            attempt_seed = _scene_seed(
+                                session_id,
+                                image_style,
+                                f"{scene['scene_id']}:{attempt}",
+                            )
+                            directed_prompt = _build_image_prompt(
+                                scene,
+                                image_style,
+                                visual_bible,
+                                retry_instruction,
+                            )
+                            attempt_path = (
+                                image_path
+                                if attempt == max_attempts
+                                else f"output/scene_{scene['scene_id']}_attempt_{attempt}.png"
+                            )
+                            job_monitor, image_record, image_metric = (
+                                _run_comfyui_image_attempt(
+                                    scene=scene,
+                                    image_path=attempt_path,
+                                    directed_prompt=directed_prompt,
+                                    image_style=image_style,
+                                    style_label=style_label,
+                                    quality_preset_key=quality_preset_key,
+                                    quality_preset=quality_preset,
+                                    checkpoint_name=checkpoint_name,
+                                    scene_seed=attempt_seed,
+                                    visual_bible=visual_bible,
+                                    runpod_endpoint_id=runpod_endpoint_id,
+                                    runpod_api_key=runpod_api_key,
+                                    runpod_gpu_usd_per_second=runpod_gpu_usd_per_second,
+                                    attempt=attempt,
                                 )
-                                if status_response.status_code != 200:
-                                    print(
-                                        f"⚠️ Erro ao consultar status: {status_response.status_code}"
-                                    )
-                                    continue
+                            )
+                            runpod_jobs.append(job_monitor)
+                            if not image_record or not image_metric:
+                                continue
 
-                                status_payload = status_response.json()
-                                job_status = status_payload.get("status")
+                            quality_score = _safe_float(
+                                image_metric.get("quality_score"),
+                                0.0,
+                            )
+                            if (
+                                best_candidate is None
+                                or quality_score > best_candidate[0]
+                            ):
+                                best_candidate = (
+                                    quality_score,
+                                    attempt_path,
+                                    image_record,
+                                    image_metric,
+                                )
 
-                                if job_status == "COMPLETED":
-                                    images = status_payload.get("output", {}).get(
-                                        "images", []
-                                    )
-                                    if images:
-                                        image_b64 = images[0].get("data", "")
-                                        with open(image_path, "wb") as f:
-                                            f.write(base64.b64decode(image_b64))
-
-                                        if (
-                                            os.path.exists(image_path)
-                                            and os.path.getsize(image_path) > 1000
-                                        ):
-                                            scene_images.append(
-                                                {
-                                                    "scene_id": scene["scene_id"],
-                                                    "image_path": image_path,
-                                                    "prompt": scene["prompt"],
-                                                    "runpod_job_id": job_id,
-                                                    "generation_method": "comfyui",
-                                                }
-                                            )
-                                            print(
-                                                "✅ Imagem ComfyUI REAL gerada: "
-                                                f"cena {scene['scene_id']} "
-                                                f"({os.path.getsize(image_path)} bytes)"
-                                            )
-                                        else:
-                                            print(
-                                                "⚠️ Arquivo decodificado não é uma imagem válida"
-                                            )
-                                    else:
-                                        print("⚠️ Job concluído sem imagens no output")
-                                    break
-                                elif job_status in ("FAILED", "CANCELLED", "TIMED_OUT"):
-                                    print(
-                                        "⚠️ Job RunPod terminou com status: "
-                                        f"{job_status} — {status_payload.get('error')}"
-                                    )
-                                    break
-                                else:
-                                    print(f"⏳ Status: {job_status} ({wait_time}s)")
-                            else:
+                            accepted = bool(image_metric.get("semantic_accepted"))
+                            if accepted:
+                                if attempt_path != image_path:
+                                    os.replace(attempt_path, image_path)
+                                    image_record["image_path"] = image_path
+                                    image_metric["path"] = image_path
+                                scene_images.append(image_record)
+                                image_metrics.append(image_metric)
                                 print(
-                                    f"⏱️ Timeout após {max_wait}s aguardando o job RunPod"
+                                    "✅ Imagem ComfyUI REAL "
+                                    f"aceita: cena {scene['scene_id']} "
+                                    f"(tentativa {attempt}, score={image_metric.get('quality_score')})"
                                 )
-                        else:
+                                selected_scene = True
+                                break
+
+                            retry_instruction = str(
+                                image_metric.get("semantic_retry_prompt")
+                                or "Remove all visible text, captions, borders, watermarks, duplicated characters and style drift. Keep the same protagonist and selected film style."
+                            )
                             print(
-                                f"⚠️ Erro ao enviar job: {response.status_code} - {response.text}"
+                                "🔁 QA visual reprovou a cena "
+                                f"{scene['scene_id']} na tentativa {attempt}; regenerando."
+                            )
+                        if not selected_scene and best_candidate:
+                            _, best_path, image_record, image_metric = best_candidate
+                            if best_path != image_path:
+                                os.replace(best_path, image_path)
+                                image_record["image_path"] = image_path
+                                image_metric["path"] = image_path
+                            scene_images.append(image_record)
+                            image_metrics.append(image_metric)
+                            print(
+                                "✅ Imagem ComfyUI REAL mantida com melhor score: "
+                                f"cena {scene['scene_id']} "
+                                f"(tentativa {image_metric.get('attempt')}, "
+                                f"score={image_metric.get('quality_score')})"
                             )
 
                     # Verifica se a imagem já foi gerada com sucesso acima; se não, cai no mock
@@ -420,18 +2049,47 @@ Retorne em formato JSON:
                         continue
 
                     # Fallback mock generation se ComfyUI falhar
-                    print(f"💡 Usando mock de imagem para cena {scene['scene_id']}")
-                    with open(image_path, "w") as f:
-                        f.write(
-                            f"Mock image for scene {scene['scene_id']}: {scene['prompt']}"
-                        )
+                    print(
+                        f"💡 Usando fallback PNG real para cena {scene['scene_id']}"
+                    )
+                    _write_fallback_scene_image(image_path, scene, style_label)
 
                     scene_images.append(
                         {
                             "scene_id": scene["scene_id"],
                             "image_path": image_path,
                             "prompt": scene["prompt"],
+                            "style": image_style,
+                            "quality_preset": quality_preset_key,
+                            "checkpoint": checkpoint_name,
+                            "duration": scene.get("duration", 6),
+                            "camera_motion": scene.get(
+                                "camera_motion",
+                                _motion_plan(scene)["description"],
+                            ),
                             "generation_method": "mock",
+                        }
+                    )
+                    technical_metrics = _probe_image_quality(image_path)
+                    semantic_metrics = {
+                        "semantic_score": 0,
+                        "semantic_qa_enabled": _semantic_qa_enabled(),
+                        "accepted": False,
+                        "issues": ["mock_image"],
+                        "retry_prompt": "",
+                        "model": None,
+                    }
+                    image_metrics.append(
+                        {
+                            "scene_id": scene["scene_id"],
+                            "generation_method": "mock",
+                            "style": image_style,
+                            "quality_preset": quality_preset_key,
+                            "checkpoint": checkpoint_name,
+                            **_combine_image_quality(
+                                technical_metrics,
+                                semantic_metrics,
+                            ),
                         }
                     )
 
@@ -441,10 +2099,21 @@ Retorne em formato JSON:
                     print(f"⚠️ Erro ao gerar imagem para cena {scene['scene_id']}: {e}")
                     # Continue with next scene
 
+            visual_consistency = _evaluate_image_set_consistency(
+                scene_images,
+                visual_bible,
+            )
+
             state.update(
                 {
                     "scene_images": scene_images,
                     "images_count": len(scene_images),
+                    "runpod_jobs": runpod_jobs,
+                    "quality_metrics": {
+                        **state.get("quality_metrics", {}),
+                        "images": image_metrics,
+                        "visual_consistency": visual_consistency,
+                    },
                     "current_step": "images_generated",
                 }
             )
@@ -458,6 +2127,12 @@ Retorne em formato JSON:
             print("🎙️ Gerando áudio com ElevenLabs...")
 
             audio_files = []
+            audio_metrics = []
+            voice_metrics = []
+            elevenlabs_usd_per_1k_chars = _safe_float(
+                os.getenv("ELEVENLABS_USD_PER_1K_CHARS", "0.30")
+            )
+            estimated_elevenlabs_cost = 0.0
 
             for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
                 try:
@@ -469,6 +2144,12 @@ Retorne em formato JSON:
 
                     # Generate audio using ElevenLabs
                     elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+                    narration_text = (
+                        f"Cena {scene['scene_id']}: {scene['description']}"
+                    )
+                    estimated_elevenlabs_cost += (
+                        len(narration_text) / 1000 * elevenlabs_usd_per_1k_chars
+                    )
 
                     if elevenlabs_api_key:
                         import requests
@@ -477,10 +2158,6 @@ Retorne em formato JSON:
                             f"🔑 ElevenLabs API Key: {'✅ Configurada' if elevenlabs_api_key else '❌ Não encontrada'}"
                         )
 
-                        # Prepare text for narration (scene description)
-                        narration_text = (
-                            f"Cena {scene['scene_id']}: {scene['description']}"
-                        )
                         print(f"📝 Texto para narração: {narration_text[:100]}...")
 
                         # ElevenLabs API call
@@ -499,10 +2176,12 @@ Retorne em formato JSON:
                             },
                         }
 
-                        # Use a default voice (you can customize this)
+                        voice_id = os.getenv(
+                            "ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us"
+                        )
                         voice_url = (
                             "https://api.elevenlabs.io/v1/text-to-speech/"
-                            "21m00Tcm4TlvDq8ikWAM"
+                            f"{voice_id}"
                         )
 
                         print("🎤 Chamando ElevenLabs API...")
@@ -530,8 +2209,30 @@ Retorne em formato JSON:
                                             "scene_id": scene["scene_id"],
                                             "audio_path": audio_path,
                                             "text": narration_text,
-                                            "voice_id": "21m00Tcm4TlvDq8ikWAM",
+                                            "voice_id": voice_id,
                                             "generation_method": "elevenlabs",
+                                        }
+                                    )
+                                    media_quality = _probe_media_quality(
+                                        audio_path, "audio"
+                                    )
+                                    audio_metrics.append(
+                                        {
+                                            "scene_id": scene["scene_id"],
+                                            "generation_method": "elevenlabs",
+                                            **media_quality,
+                                        }
+                                    )
+                                    voice_metrics.append(
+                                        {
+                                            "scene_id": scene["scene_id"],
+                                            "voice_id": voice_id,
+                                            "model_id": data["model_id"],
+                                            "text_characters": len(narration_text),
+                                            "quality_score": media_quality.get(
+                                                "quality_score", 0
+                                            ),
+                                            "issues": media_quality.get("issues", []),
                                         }
                                     )
 
@@ -577,6 +2278,24 @@ Retorne em formato JSON:
                             "generation_method": "mock",
                         }
                     )
+                    media_quality = _probe_media_quality(audio_path, "audio")
+                    audio_metrics.append(
+                        {
+                            "scene_id": scene["scene_id"],
+                            "generation_method": "mock",
+                            **media_quality,
+                        }
+                    )
+                    voice_metrics.append(
+                        {
+                            "scene_id": scene["scene_id"],
+                            "voice_id": "mock",
+                            "model_id": "mock",
+                            "text_characters": len(narration_text),
+                            "quality_score": media_quality.get("quality_score", 0),
+                            "issues": media_quality.get("issues", []),
+                        }
+                    )
 
                     print(f"✅ Áudio gerado (mock): cena {scene['scene_id']}")
 
@@ -588,6 +2307,15 @@ Retorne em formato JSON:
                 {
                     "audio_files": audio_files,
                     "audio_count": len(audio_files),
+                    "quality_metrics": {
+                        **state.get("quality_metrics", {}),
+                        "audio": audio_metrics,
+                        "voices": voice_metrics,
+                    },
+                    "cost_estimate": {
+                        **state.get("cost_estimate", {}),
+                        "elevenlabs_usd": round(estimated_elevenlabs_cost, 6),
+                    },
                     "current_step": "audio_generated",
                 }
             )
@@ -622,23 +2350,75 @@ Retorne em formato JSON:
                     print("⚠️ FFmpeg não disponível, usando mock")
 
                 if ffmpeg_available and scene_images:
-                    print("🔧 Usando FFmpeg real para compilação...")
+                    print("🔧 Usando FFmpeg real com animação de câmera...")
 
-                    # Create a temporary file list for FFmpeg
+                    clip_paths = []
+                    for index, img in enumerate(scene_images, 1):
+                        img_path = img["image_path"]
+                        if not (
+                            os.path.exists(img_path)
+                            and os.path.getsize(img_path) > 1000
+                        ):
+                            continue
+
+                        audio_duration = _scene_audio_duration(
+                            audio_files,
+                            img.get("scene_id"),
+                        )
+                        duration = max(
+                            3.0,
+                            audio_duration,
+                            _safe_float(img.get("duration"), 5.0),
+                        )
+                        clip_path = f"output/scene_{img['scene_id']}_motion.mp4"
+                        scene_for_motion = {
+                            "scene_id": img.get("scene_id", index),
+                            "camera_motion": img.get("camera_motion", ""),
+                        }
+                        motion_filter = _ffmpeg_zoompan_filter(
+                            scene_for_motion,
+                            duration,
+                        )
+                        cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-loop",
+                            "1",
+                            "-i",
+                            img_path,
+                            "-vf",
+                            motion_filter,
+                            "-t",
+                            str(duration),
+                            "-r",
+                            "30",
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "slow",
+                            "-crf",
+                            "18",
+                            "-profile:v",
+                            "high",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-movflags",
+                            "+faststart",
+                            clip_path,
+                        ]
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        if result.returncode == 0 and os.path.exists(clip_path):
+                            clip_paths.append(clip_path)
+                        else:
+                            print(
+                                "⚠️ Erro ao animar cena "
+                                f"{img.get('scene_id')}: {result.stderr[:500]}"
+                            )
+
                     filelist_path = "output/filelist.txt"
                     with open(filelist_path, "w") as f:
-                        for img in scene_images:
-                            # Check if it's a real image file (not mock)
-                            img_path = img["image_path"]
-                            if (
-                                os.path.exists(img_path)
-                                and os.path.getsize(img_path) > 1000
-                            ):  # Real image
-                                duration = img.get(
-                                    "duration", 5
-                                )  # Default 5 seconds per scene
-                                f.write(f"file '{img_path}'\n")
-                                f.write(f"duration {duration}\n")
+                        for clip_path in clip_paths:
+                            f.write(f"file '{os.path.abspath(clip_path)}'\n")
 
                     # Compile video with images
                     if (
@@ -658,35 +2438,65 @@ Retorne em formato JSON:
                             "-i",
                             filelist_path,  # Input file list
                             "-c:v",
-                            "libx264",  # Video codec
+                            "copy",  # Clips are already encoded consistently
                             "-pix_fmt",
                             "yuv420p",  # Pixel format for compatibility
-                            "-r",
-                            "30",  # Frame rate
                             temp_video,
                         ]
 
                         result = subprocess.run(cmd, capture_output=True, text=True)
 
                         if result.returncode == 0 and audio_files:
-                            # Add audio to video
-                            audio_path = None
-                            for audio in audio_files:
-                                if (
-                                    os.path.exists(audio["audio_path"])
-                                    and os.path.getsize(audio["audio_path"]) > 1000
-                                ):
-                                    audio_path = audio["audio_path"]
-                                    break
+                            # Concatenate every valid scene narration before muxing.
+                            audio_list_path = "output/audio_filelist.txt"
+                            valid_audio_paths = [
+                                audio["audio_path"]
+                                for audio in audio_files
+                                if os.path.exists(audio.get("audio_path", ""))
+                                and os.path.getsize(audio["audio_path"]) > 1000
+                            ]
+                            combined_audio_path = "output/combined_audio.m4a"
+                            with open(audio_list_path, "w") as audio_list:
+                                for audio_path in valid_audio_paths:
+                                    audio_list.write(
+                                        f"file '{os.path.abspath(audio_path)}'\n"
+                                    )
 
-                            if audio_path:
+                            if valid_audio_paths:
+                                audio_cmd = [
+                                    "ffmpeg",
+                                    "-y",
+                                    "-f",
+                                    "concat",
+                                    "-safe",
+                                    "0",
+                                    "-i",
+                                    audio_list_path,
+                                    "-c:a",
+                                    "aac",
+                                    "-b:a",
+                                    "160k",
+                                    combined_audio_path,
+                                ]
+                                audio_result = subprocess.run(
+                                    audio_cmd,
+                                    capture_output=True,
+                                    text=True,
+                                )
+                                if audio_result.returncode != 0:
+                                    print(
+                                        "⚠️ Erro ao concatenar áudios: "
+                                        f"{audio_result.stderr[:500]}"
+                                    )
+                                    combined_audio_path = valid_audio_paths[0]
+
                                 cmd = [
                                     "ffmpeg",
                                     "-y",
                                     "-i",
                                     temp_video,  # Video input
                                     "-i",
-                                    audio_path,  # Audio input
+                                    combined_audio_path,  # Audio input
                                     "-c:v",
                                     "copy",  # Copy video stream
                                     "-c:a",
@@ -702,6 +2512,15 @@ Retorne em formato JSON:
                                 if result.returncode == 0:
                                     # Clean up temp file
                                     os.remove(temp_video)
+                                    for clip_path in clip_paths:
+                                        if os.path.exists(clip_path):
+                                            os.remove(clip_path)
+                                    for temp_path in (
+                                        audio_list_path,
+                                        "output/combined_audio.m4a",
+                                    ):
+                                        if os.path.exists(temp_path):
+                                            os.remove(temp_path)
                                     print(
                                         f"✅ Vídeo FFmpeg compilado com áudio: {video_path}"
                                     )
@@ -735,7 +2554,7 @@ Retorne em formato JSON:
                             if os.path.exists(video_path)
                             else 0
                         ),
-                        "generation_method": "ffmpeg",
+                        "generation_method": "ffmpeg_camera_motion",
                         "current_step": "video_compiled",
                         "status": "completed",
                     }
@@ -760,6 +2579,52 @@ Retorne em formato JSON:
                         "status": "completed",
                     }
                 )
+
+            runpod_jobs = state.get("runpod_jobs", [])
+            quality_metrics = state.get("quality_metrics", {})
+            image_metrics = quality_metrics.get("images", [])
+            audio_metrics = quality_metrics.get("audio", [])
+            video_metrics = _probe_media_quality(video_path, "video")
+            aggregate_quality = _aggregate_quality(
+                image_metrics=image_metrics,
+                audio_metrics=audio_metrics,
+                video_metrics=video_metrics,
+            )
+            cost_estimate = {
+                **state.get("cost_estimate", {}),
+                "runpod_usd": round(
+                    sum(
+                        _safe_float(job.get("estimated_cost_usd"))
+                        for job in runpod_jobs
+                        if job.get("provider") != "gemini"
+                    ),
+                    6,
+                ),
+                "gemini_image_usd": round(
+                    sum(
+                        _safe_float(job.get("estimated_cost_usd"))
+                        for job in runpod_jobs
+                        if job.get("provider") == "gemini"
+                    ),
+                    6,
+                ),
+            }
+            cost_estimate["total_usd"] = round(
+                _safe_float(cost_estimate.get("llm_usd"))
+                + _safe_float(cost_estimate.get("runpod_usd"))
+                + _safe_float(cost_estimate.get("gemini_image_usd"))
+                + _safe_float(cost_estimate.get("elevenlabs_usd")),
+                6,
+            )
+            state.update(
+                {
+                    "quality_metrics": {
+                        **quality_metrics,
+                        **aggregate_quality,
+                    },
+                    "cost_estimate": cost_estimate,
+                }
+            )
 
             print(f"✅ Vídeo finalizado: {video_path}")
             return state

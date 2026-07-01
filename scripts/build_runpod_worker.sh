@@ -23,7 +23,11 @@ fi
 "$DOCKER_BIN" info >/dev/null
 
 cd "$WORKER_DIR"
-"$DOCKER_BIN" build -t "$IMAGE" .
+"$DOCKER_BIN" build \
+  --build-arg "RUNPOD_COMFYUI_BASE_IMAGE=${RUNPOD_COMFYUI_BASE_IMAGE:-runpod/worker-comfyui:5.8.5-base}" \
+  --build-arg "AI_FILM_CHECKPOINT_NAME=${AI_FILM_CHECKPOINT_NAME:-ai-film-cinematic-realism.safetensors}" \
+  --build-arg "AI_FILM_CHECKPOINT_URL=${AI_FILM_CHECKPOINT_URL:-https://huggingface.co/SG161222/Realistic_Vision_V5.1_noVAE/resolve/main/Realistic_Vision_V5.1_fp16-no-ema.safetensors}" \
+  -t "$IMAGE" .
 "$DOCKER_BIN" push "$IMAGE"
 
 echo "Pushed $IMAGE"
