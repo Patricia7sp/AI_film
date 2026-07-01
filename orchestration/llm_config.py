@@ -1,6 +1,9 @@
 """
-Configuração de LLM - Gemini 2.0 Flash como Principal
-Migração de OpenAI para Google Gemini para melhor custo-benefício
+Configuração de LLM do pipeline.
+
+Gemini segue como provedor principal para tarefas de texto/agente. Modelos de
+imagem, incluindo Nano Banana, ficam declarados separadamente porque não devem
+ser usados como substitutos diretos do chat model do LangGraph.
 """
 
 import os
@@ -12,8 +15,32 @@ load_dotenv()
 
 # Configurações do LLM
 DEFAULT_LLM_PROVIDER = "gemini"  # gemini ou openai
-DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM", "gemini-3-flash-preview")
-FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM", "gpt-4o-mini")
+
+# Gemini text/chat model used by agents and prompt expansion.
+GEMINI_TEXT_MODEL = os.getenv(
+    "GEMINI_TEXT_MODEL",
+    os.getenv("GEMINI_MODEL", os.getenv("DEFAULT_LLM", "gemini-3.5-flash")),
+)
+
+# Gemini image generation models. Nano Banana is the image model family; keep it
+# separate from text/chat so LangChain chat calls do not route to an image model.
+GEMINI_IMAGE_FAST_MODEL = os.getenv(
+    "GEMINI_IMAGE_FAST_MODEL",
+    os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image"),
+)
+GEMINI_IMAGE_QUALITY_MODEL = os.getenv(
+    "GEMINI_IMAGE_QUALITY_MODEL",
+    "gemini-3-pro-image",
+)
+
+# Backwards-compatible aliases used by older code and docs.
+DEFAULT_LLM_MODEL = GEMINI_TEXT_MODEL
+OPENAI_TEXT_MODEL = os.getenv(
+    "OPENAI_TEXT_MODEL",
+    os.getenv("OPENAI_MODEL", os.getenv("FALLBACK_LLM", "gpt-5.4-mini")),
+)
+OPENAI_FAST_MODEL = os.getenv("OPENAI_FAST_MODEL", "gpt-5.4-nano")
+FALLBACK_LLM_MODEL = OPENAI_TEXT_MODEL
 
 # API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -118,20 +145,25 @@ NEGATIVE: [negative prompts aqui]
 
 # Custos estimados (por 1M tokens)
 COST_COMPARISON = {
-    "gemini-3-flash-preview": {
-        "input": 0.075,
-        "output": 0.30,
-        "description": "Gemini 3 Flash - Rápido e eficiente"
+    GEMINI_TEXT_MODEL: {
+        "role": "primary_text_agent",
+        "description": "Gemini text model - agente, cenas e prompts cinematográficos"
     },
-    "gemini-3-pro-image-preview": {
-        "input": 0.15,
-        "output": 0.60,
-        "description": "Gemini 3 Pro - Melhor para imagens e vídeos"
+    GEMINI_IMAGE_FAST_MODEL: {
+        "role": "image_fast",
+        "description": "Nano Banana image model - geração/edição rápida de imagem"
     },
-    "gpt-4o-mini": {
-        "input": 0.15,
-        "output": 0.60,
-        "description": "Fallback para casos específicos"
+    GEMINI_IMAGE_QUALITY_MODEL: {
+        "role": "image_quality",
+        "description": "Gemini image model - qualidade máxima quando latência/custo aceitam"
+    },
+    OPENAI_TEXT_MODEL: {
+        "role": "fallback_text_agent",
+        "description": "OpenAI fallback para tarefas de texto/agente"
+    },
+    OPENAI_FAST_MODEL: {
+        "role": "fast_text_utility",
+        "description": "OpenAI rápido/barato para classificação e extração"
     }
 }
 
@@ -149,20 +181,22 @@ def generate_cinematic_prompt(story_text: str, use_pro_model: bool = False):
     
     Args:
         story_text: Texto da história
-        use_pro_model: Se True, usa gemini-3-pro-image-preview para melhor qualidade
+        use_pro_model: Se True, usa o modelo Gemini de texto configurado para
+            prompts de maior qualidade. Modelos Nano Banana ficam reservados a
+            geração/edição de imagem, não a chat text.
         
     Returns:
         Prompt cinematográfico detalhado para geração de imagens
     """
     try:
-        # Usar modelo Pro para geração de prompts de imagem
+        # Usar Gemini direto para geração de prompts quando solicitado.
         if use_pro_model:
             from langchain_google_genai import ChatGoogleGenerativeAI
             llm = ChatGoogleGenerativeAI(
-                model="gemini-3-pro-image-preview",
-                google_api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
+                model=GEMINI_TEXT_MODEL,
+                google_api_key=GEMINI_API_KEY,
                 temperature=0.9,
-                max_tokens=2048
+                max_output_tokens=2048
             )
         else:
             llm = get_llm_with_fallback()
@@ -208,13 +242,15 @@ def print_llm_config():
     print(f"Provider Principal: {DEFAULT_LLM_PROVIDER}")
     print(f"Modelo Principal: {DEFAULT_LLM_MODEL}")
     print(f"Modelo Fallback: {FALLBACK_LLM_MODEL}")
+    print(f"Gemini Imagem Rápida: {GEMINI_IMAGE_FAST_MODEL}")
+    print(f"Gemini Imagem Qualidade: {GEMINI_IMAGE_QUALITY_MODEL}")
+    print(f"OpenAI Rápido: {OPENAI_FAST_MODEL}")
     print(f"Gemini API Key: {'✅ Configurada' if GEMINI_API_KEY else '❌ Não encontrada'}")
     print(f"OpenAI API Key: {'✅ Configurada' if OPENAI_API_KEY else '❌ Não encontrada'}")
     print("=" * 70)
-    print("\n💰 ECONOMIA ESTIMADA:")
-    print(f"Usando Gemini: ~95% mais barato que GPT-4")
-    print(f"Custo Gemini Input: ${COST_COMPARISON['gemini-3-flash-preview']['input']}/1M tokens")
-    print(f"Custo Gemini Output: ${COST_COMPARISON['gemini-3-flash-preview']['output']}/1M tokens")
+    print("\n📌 PERFIS DE MODELO:")
+    for model, metadata in COST_COMPARISON.items():
+        print(f"- {model}: {metadata['role']} — {metadata['description']}")
     print("=" * 70)
 
 

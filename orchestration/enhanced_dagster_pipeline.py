@@ -12,10 +12,11 @@ from dagster import (
     asset, 
     AssetExecutionContext, 
     Config, 
+    Definitions,
     RetryPolicy, 
     Backoff,
+    define_asset_job,
     get_dagster_logger,
-    MaterializeResult,
     MetadataValue
 )
 
@@ -37,6 +38,8 @@ class AIFilmPipelineConfig(Config):
     story_file_path: str = ""
     input_type: str = "text"
     max_scenes: int = 8
+    image_style: str = "cinematic_realism"
+    image_quality_preset: str = "high"
     quality_threshold: float = 0.9
     enable_structured_logging: bool = True
     log_level: str = "INFO"
@@ -115,6 +118,8 @@ def enhanced_multimodal_input_asset(
             'input_type': config.input_type,
             'structured_logger': structured_logger,
             'max_scenes': config.max_scenes,
+            'image_style': config.image_style,
+            'image_quality_preset': config.image_quality_preset,
             'metadata': {
                 "input_source": input_source,
                 "story_file_path": config.story_file_path if config.story_file_path else None,
@@ -122,6 +127,8 @@ def enhanced_multimodal_input_asset(
                 "story_length": len(story_text),
                 "timestamp": datetime.now().isoformat(),
                 "quality_threshold": config.quality_threshold,
+                "image_style": config.image_style,
+                "image_quality_preset": config.image_quality_preset,
                 "structured_logging_enabled": config.enable_structured_logging
             }
         }
@@ -151,6 +158,8 @@ def enhanced_multimodal_input_asset(
             'input_type': initial_state['input_type'],
             'structured_logger': initial_state.get('structured_logger'),
             'max_scenes': initial_state.get('max_scenes', 8),
+            'image_style': initial_state.get('image_style', 'cinematic_realism'),
+            'image_quality_preset': initial_state.get('image_quality_preset', 'high'),
             'metadata': initial_state.get('metadata', {}),
             'input_source': input_source,
             'file_format': file_format,
@@ -210,7 +219,10 @@ def enhanced_langgraph_workflow_asset(
             'current_step': 'initialized',
             'scene_data': {},
             'generated_content': {},
-            'enhanced_multimodal_input_asset': enhanced_multimodal_input_asset
+            'enhanced_multimodal_input_asset': enhanced_multimodal_input_asset,
+            'max_scenes': enhanced_multimodal_input_asset.get('max_scenes', 8),
+            'image_style': enhanced_multimodal_input_asset.get('image_style', 'cinematic_realism'),
+            'image_quality_preset': enhanced_multimodal_input_asset.get('image_quality_preset', 'high')
         }
         
         # Executar com logs detalhados
@@ -238,6 +250,9 @@ def enhanced_langgraph_workflow_asset(
             )
         
         # Metadata detalhada para Dagster
+        runpod_jobs = final_state.get("runpod_jobs", [])
+        quality_metrics = final_state.get("quality_metrics", {})
+        cost_estimate = final_state.get("cost_estimate", {})
         context.add_output_metadata({
             "scenes_generated": scenes_count,
             "images_generated": images_count,
@@ -245,9 +260,15 @@ def enhanced_langgraph_workflow_asset(
             "total_media_files": images_count + audio_count,
             "execution_time_seconds": execution_time,
             "workflow_status": "completed",
+            "runpod_jobs": MetadataValue.json(runpod_jobs),
+            "quality_metrics": MetadataValue.json(quality_metrics),
+            "cost_estimate": MetadataValue.json(cost_estimate),
+            "estimated_total_cost_usd": cost_estimate.get("total_usd", 0),
             "quality_scores": MetadataValue.json({
-                "average_scene_score": _calculate_average_scene_score(final_state),
-                "validation_pass_rate": _calculate_validation_pass_rate(final_state)
+                "overall_score": quality_metrics.get("overall_score", 0),
+                "image_score": quality_metrics.get("categories", {}).get("images", 0),
+                "audio_score": quality_metrics.get("categories", {}).get("audio", 0),
+                "video_score": quality_metrics.get("categories", {}).get("video", 0),
             }),
             "output_structure": MetadataValue.json({
                 "base_dir": final_state.get('output_dirs', {}).get('base'),
@@ -290,38 +311,66 @@ def enhanced_validation_asset(
     
     try:
         scenes = enhanced_langgraph_workflow_asset.get('scenes', [])
-        validation_results = enhanced_langgraph_workflow_asset.get('validation_results', {})
+        quality_metrics = enhanced_langgraph_workflow_asset.get('quality_metrics', {})
+        cost_estimate = enhanced_langgraph_workflow_asset.get('cost_estimate', {})
+        runpod_jobs = enhanced_langgraph_workflow_asset.get('runpod_jobs', [])
         
         # Calcular métricas detalhadas
         total_scenes = len(scenes)
-        approved_scenes = sum(1 for scene in scenes if scene.get('validation', {}).get('approved', False))
-        average_score = validation_results.get('average_score', 0)
+        image_metrics = quality_metrics.get("images", [])
+        approved_scenes = sum(
+            1
+            for item in image_metrics
+            if item.get("valid")
+            and item.get("semantic_accepted", True)
+            and item.get("quality_score", 0) >= 80
+        )
+        average_score = quality_metrics.get("overall_score", 0)
+        image_score = quality_metrics.get("categories", {}).get("images", 0)
         
         # Determinar status geral
-        quality_status = "HIGH" if average_score >= 85 else "MEDIUM" if average_score >= 70 else "LOW"
-        pipeline_success = approved_scenes >= (total_scenes * 0.8) and average_score >= 70
+        quality_status = (
+            "HIGH"
+            if average_score >= 85 and image_score >= 80 and approved_scenes == total_scenes
+            else "MEDIUM"
+            if average_score >= 70 and image_score >= 70
+            else "LOW"
+        )
+        pipeline_success = (
+            approved_scenes >= (total_scenes * 0.8)
+            and average_score >= 70
+            and image_score >= 70
+        )
         
         # Coletar caminhos de arquivos para links diretos
         file_paths = []
         
         # Adicionar imagens
-        for scene in scenes:
-            if scene.get('scene_image'):
+        for image in image_metrics:
+            if image.get('path'):
                 file_paths.append({
                     "type": "image",
-                    "scene_id": scene.get('id'),
-                    "path": scene.get('scene_image'),
-                    "description": f"Imagem da cena {scene.get('id')}"
+                    "scene_id": image.get('scene_id'),
+                    "path": image.get('path'),
+                    "description": f"Imagem da cena {image.get('scene_id')}"
                 })
         
         # Adicionar áudios
-        audio_files = enhanced_langgraph_workflow_asset.get('audio_files', [])
-        for audio in audio_files:
+        audio_metrics = quality_metrics.get("audio", [])
+        for audio in audio_metrics:
             file_paths.append({
                 "type": "audio",
                 "scene_id": audio.get('scene_id'),
-                "path": audio.get('main_audio_path'),
+                "path": audio.get('path'),
                 "description": f"Áudio da cena {audio.get('scene_id')}"
+            })
+        video_metrics = quality_metrics.get("video", {})
+        if video_metrics.get("path"):
+            file_paths.append({
+                "type": "video",
+                "scene_id": None,
+                "path": video_metrics.get("path"),
+                "description": "Vídeo final"
             })
         
         # Log estruturado de conclusão
@@ -337,15 +386,20 @@ def enhanced_validation_asset(
             "average_quality_score": average_score,
             "quality_status": quality_status,
             "pipeline_success": pipeline_success,
+            "runpod_jobs": MetadataValue.json(runpod_jobs),
+            "quality_metrics": MetadataValue.json(quality_metrics),
+            "cost_estimate": MetadataValue.json(cost_estimate),
+            "estimated_total_cost_usd": cost_estimate.get("total_usd", 0),
             "total_files_generated": len(file_paths),
             "file_breakdown": MetadataValue.json({
                 "images": len([f for f in file_paths if f["type"] == "image"]),
-                "audio": len([f for f in file_paths if f["type"] == "audio"])
+                "audio": len([f for f in file_paths if f["type"] == "audio"]),
+                "video": len([f for f in file_paths if f["type"] == "video"])
             }),
             "quality_distribution": MetadataValue.json({
-                "high_quality_scenes": len([s for s in scenes if s.get('validation', {}).get('score', 0) >= 85]),
-                "medium_quality_scenes": len([s for s in scenes if 70 <= s.get('validation', {}).get('score', 0) < 85]),
-                "low_quality_scenes": len([s for s in scenes if s.get('validation', {}).get('score', 0) < 70])
+                "high_quality_images": len([s for s in image_metrics if s.get('quality_score', 0) >= 85]),
+                "medium_quality_images": len([s for s in image_metrics if 70 <= s.get('quality_score', 0) < 85]),
+                "low_quality_images": len([s for s in image_metrics if s.get('quality_score', 0) < 70])
             })
         })
         
@@ -357,6 +411,9 @@ def enhanced_validation_asset(
                 "approved_scenes": approved_scenes,
                 "average_score": average_score
             },
+            "runpod_jobs": runpod_jobs,
+            "quality_metrics": quality_metrics,
+            "cost_estimate": cost_estimate,
             "file_paths": file_paths,
             "structured_logging_enabled": True
         }
@@ -390,3 +447,23 @@ def _calculate_validation_pass_rate(state: Dict[str, Any]) -> float:
     
     approved = sum(1 for scene in scenes if scene.get('validation', {}).get('approved', False))
     return (approved / len(scenes)) * 100
+
+
+ai_film_pipeline_job = define_asset_job(
+    name="ai_film_pipeline_job",
+    selection=[
+        "enhanced_multimodal_input_asset",
+        "enhanced_langgraph_workflow_asset",
+        "enhanced_validation_asset",
+    ],
+)
+
+
+defs = Definitions(
+    assets=[
+        enhanced_multimodal_input_asset,
+        enhanced_langgraph_workflow_asset,
+        enhanced_validation_asset,
+    ],
+    jobs=[ai_film_pipeline_job],
+)

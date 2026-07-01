@@ -28,10 +28,15 @@
 
 ### PASSO 2: Build da imagem customizada
 
-A imagem `runpod/worker-comfyui:5.8.6-base` não vem com nenhum checkpoint. O
-Dockerfile em `runpod_worker/Dockerfile` (neste repositório) baixa o
-checkpoint SD1.5 (`v1-5-pruned-emaonly.safetensors`, ~4GB) por cima da
-imagem base oficial.
+A imagem usa `runpod/worker-comfyui:5.8.5-base` por compatibilidade com os
+drivers CUDA disponíveis nos workers RTX A4000/A4500 do RunPod. A base
+`5.8.6-base` falhou no pre-flight de GPU com driver 12.6/12.8. O Dockerfile
+em `runpod_worker/Dockerfile` (neste repositório) baixa um
+checkpoint realista para produção cinematográfica
+(`ai-film-cinematic-realism.safetensors`) e mantém SD1.5
+(`v1-5-pruned-emaonly.safetensors`) apenas como fallback legado. Não use SD1.5
+como checkpoint principal para o pipeline final: ele falha em coerência de
+estilo, personagem e fidelidade visual.
 
 Valide o setup local antes do build:
 
@@ -53,6 +58,15 @@ Ou use o wrapper do repositório, que encontra o Docker CLI interno do Docker De
 scripts/build_runpod_worker.sh SEU_USUARIO/comfyui-ai-film-pipeline:latest
 ```
 
+Para testar outro checkpoint sem editar o Dockerfile:
+
+```bash
+RUNPOD_COMFYUI_BASE_IMAGE=runpod/worker-comfyui:5.8.5-base \
+AI_FILM_CHECKPOINT_NAME=meu-checkpoint.safetensors \
+AI_FILM_CHECKPOINT_URL=https://huggingface.co/org/model/resolve/main/model.safetensors \
+scripts/build_runpod_worker.sh SEU_USUARIO/comfyui-ai-film-pipeline:latest
+```
+
 ### PASSO 3: Criar o endpoint Serverless
 
 1. RunPod Console → Serverless → New Endpoint
@@ -69,6 +83,8 @@ scripts/build_runpod_worker.sh SEU_USUARIO/comfyui-ai-film-pipeline:latest
 ```bash
 RUNPOD_API_KEY=sua_api_key
 RUNPOD_ENDPOINT_ID=seu_endpoint_id
+COMFYUI_DEFAULT_CHECKPOINT=ai-film-cinematic-realism.safetensors
+COMFYUI_CHECKPOINT_CINEMATIC_REALISM=ai-film-cinematic-realism.safetensors
 ```
 
 ### PASSO 5: Testar

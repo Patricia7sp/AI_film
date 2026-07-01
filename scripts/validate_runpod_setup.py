@@ -74,8 +74,11 @@ def validate_dockerfile() -> List[str]:
         return ["runpod_worker/Dockerfile is missing"]
     text = DOCKERFILE_PATH.read_text(encoding="utf-8", errors="replace")
     required = (
-        "FROM runpod/worker-comfyui:5.8.6-base",
+        "RUNPOD_COMFYUI_BASE_IMAGE=runpod/worker-comfyui:5.8.5-base",
+        "FROM ${RUNPOD_COMFYUI_BASE_IMAGE}",
         "models/checkpoints",
+        "ai-film-cinematic-realism.safetensors",
+        "Realistic_Vision_V5.1",
         "v1-5-pruned-emaonly.safetensors",
     )
     for item in required:
