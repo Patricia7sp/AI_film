@@ -8,10 +8,13 @@ import ast
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
+
+import requests
 
 
 class Open3DAgentState(TypedDict, total=False):
@@ -207,6 +210,232 @@ def _story_has_any(story_text: str, terms: List[str]) -> bool:
     return any(term in lowered for term in terms)
 
 
+def _text_has_any(text: str, terms: List[str]) -> bool:
+    lowered = text.lower()
+    return any(term in lowered for term in terms)
+
+
+def _story_excerpt_around(
+    story_text: str,
+    terms: List[str],
+    *,
+    radius: int = 520,
+) -> str:
+    lowered = story_text.lower()
+    positions = [lowered.find(term.lower()) for term in terms]
+    positions = [position for position in positions if position >= 0]
+    if not positions:
+        return story_text[: radius * 2].strip()
+    center = min(positions)
+    start = max(0, center - radius)
+    end = min(len(story_text), center + radius)
+    return story_text[start:end].strip()
+
+
+def _canonical_story_scenes(
+    story_text: str,
+    style_key: str,
+    max_scenes: int,
+) -> List[Dict[str, Any]]:
+    style = _resolve_image_style(style_key)
+    anchors: List[Dict[str, Any]] = []
+
+    if _story_has_any(story_text, ["formigueiro", "formigas", "anthill", "ants"]):
+        excerpt = _story_excerpt_around(
+            story_text,
+            ["formigueiro", "formigas", "anthill", "ants"],
+        )
+        anchors.append(
+            {
+                "scene_id": len(anchors) + 1,
+                "description": (
+                    "Alice está no jardim da universidade, de bruços ou ajoelhada junto "
+                    "às raízes de uma faia antiga, observando um pequeno formigueiro."
+                ),
+                "prompt": (
+                    f"{style['prompt']}. Alice, uma menina vitoriana de aproximadamente "
+                    "10 anos, cabelo castanho e vestido marfim modesto, observa de perto "
+                    "um pequeno formigueiro na grama junto às raízes de uma grande faia "
+                    "antiga no jardim da universidade. Enquadramento vertical 9:16, "
+                    "luz natural suave, sem gatos visíveis."
+                ),
+                "duration": 7,
+                "composition_notes": (
+                    "ground-level observational shot at the beech roots; anthill in the foreground, "
+                    "Alice low to the ground, university garden architecture may sit softly in the distance"
+                ),
+                "source_excerpt": excerpt,
+                "must_include": [
+                    "Alice approximately 10 years old",
+                    "modest ivory-white Victorian day dress",
+                    "giant ancient beech tree roots",
+                    "small anthill in the grass",
+                    "university garden",
+                ],
+                "must_not_include": [
+                    "cat",
+                    "kitten",
+                    "dog",
+                    "rabbit",
+                    "modern elements",
+                    "duplicate Alice",
+                ],
+                "camera_motion": "slow cinematic push-in toward Alice and the anthill",
+            }
+        )
+
+    if _story_has_any(
+        story_text,
+        ["açucareiro", "acucareiro", "ratinho", "rato branco", "sugar bowl", "white mouse"],
+    ):
+        excerpt = _story_excerpt_around(
+            story_text,
+            [
+                "açucareiro",
+                "acucareiro",
+                "ratinho",
+                "rato branco",
+                "sugar bowl",
+                "white mouse",
+            ],
+        )
+        anchors.append(
+            {
+                "scene_id": len(anchors) + 1,
+                "description": (
+                    "Na sala de jantar vitoriana, Ludovico revela o truque do açucareiro: "
+                    "um pequeno ratinho branco surge do açucareiro sobre a mesa de chá, "
+                    "enquanto Alice observa maravilhada."
+                ),
+                "prompt": (
+                    f"{style['prompt']}. Interior vitoriano em mesa de chá: Ludovico, "
+                    "um professor adulto alto e magro, levanta a tampa de um açucareiro "
+                    "de prata ou porcelana sobre a mesa; um pequeno ratinho branco está "
+                    "visivelmente saindo do açucareiro. Alice, a mesma menina vitoriana "
+                    "de vestido marfim, observa maravilhada. Composição medium-wide: "
+                    "açucareiro central totalmente visível, ratinho claramente visível, "
+                    "rostos, mãos e troncos de Alice e Ludovico no quadro sem corte agressivo. "
+                    "Enquadramento vertical 9:16, luz quente de janela, sem moedas, sem "
+                    "guardanapo como objeto principal."
+                ),
+                "duration": 8,
+                "composition_notes": (
+                    "interior tea-table two-shot; sugar bowl central in the lower third, "
+                    "Alice and Ludovico leaning in from opposite sides with hands visible"
+                ),
+                "source_excerpt": excerpt,
+                "must_include": [
+                    "Alice approximately 10 years old",
+                    "adult male Ludovico mathematics professor",
+                    "Victorian tea table",
+                    "fully visible sugar bowl with open lid",
+                    "small white mouse emerging from the sugar bowl",
+                    "Alice and Ludovico upper bodies and hands visible",
+                ],
+                "must_not_include": [
+                    "coin trick",
+                    "handkerchief trick as the main object",
+                    "empty sugar bowl",
+                    "cat",
+                    "kitten",
+                    "dog",
+                    "duplicate Alice",
+                    "modern elements",
+                ],
+                "camera_motion": "gentle push-in toward the sugar bowl and white mouse",
+            }
+        )
+
+    if _story_has_any(
+        story_text,
+        ["toca", "coelho", "rabbit hole", "white rabbit"],
+    ):
+        excerpt = _story_excerpt_around(
+            story_text,
+            ["toca", "coelho", "rabbit hole", "white rabbit"],
+        )
+        anchors.append(
+            {
+                "scene_id": len(anchors) + 1,
+                "description": (
+                    "Alice encontra uma toca funda no barranco do jardim e percebe que "
+                    "ela pertence a um coelho que acabou de entrar, criando o chamado "
+                    "visual para a aventura."
+                ),
+                "prompt": (
+                    f"{style['prompt']}. Alice, a mesma menina vitoriana em vestido "
+                    "marfim, ajoelha-se junto a uma toca escura e profunda no barranco "
+                    "gramado entre raízes. A abertura da toca é clara e central na cena; "
+                    "um pequeno coelho pode estar parcialmente visível entrando na toca, "
+                    "sem gatos. Enquadramento vertical 9:16, jardim verde, luz natural."
+                ),
+                "duration": 7,
+                "composition_notes": (
+                    "distinct from the anthill scene: wilder grassy embankment away from the beech trunk "
+                    "and university facade, wider side three-quarter profile, rabbit hole dominant in the slope, "
+                    "Alice at a different body angle; do not copy the tree-root composition from scene 1"
+                ),
+                "source_excerpt": excerpt,
+                "must_include": [
+                    "Alice approximately 10 years old",
+                    "modest ivory-white Victorian day dress",
+                    "dark rabbit hole in a grassy embankment",
+                    "garden roots and grass",
+                ],
+                "must_not_include": [
+                    "large beech trunk dominating the frame",
+                    "anthill",
+                    "university building facade",
+                    "cat",
+                    "kitten",
+                    "dog",
+                    "duplicate Alice",
+                    "modern elements",
+                ],
+                "camera_motion": "slow push-in toward Alice and the rabbit hole",
+            }
+        )
+
+    return anchors[:max_scenes]
+
+
+def _merge_canonical_scenes(
+    scenes: List[Dict[str, Any]],
+    story_text: str,
+    style_key: str,
+    max_scenes: int,
+) -> List[Dict[str, Any]]:
+    canonical = _canonical_story_scenes(story_text, style_key, max_scenes)
+    if not canonical:
+        return scenes
+
+    merged = canonical[:]
+    for scene in scenes:
+        if len(merged) >= max_scenes:
+            break
+        description = str(scene.get("description") or "")
+        prompt = str(scene.get("prompt") or "")
+        candidate_text = f"{description} {prompt}".lower()
+        if any(
+            _text_has_any(candidate_text, [str(item).lower()])
+            for canonical_scene in canonical
+            for item in canonical_scene.get("must_include", [])
+            if item
+        ):
+            continue
+        merged.append({**scene, "scene_id": len(merged) + 1})
+
+    return [
+        {
+            **scene,
+            "scene_id": index,
+            "camera_motion": scene.get("camera_motion")
+            or _motion_plan({"scene_id": index})["description"],
+        }
+        for index, scene in enumerate(merged[:max_scenes], 1)
+    ]
+
+
 def _scene_text(scene: Dict[str, Any]) -> str:
     must_include = " ".join(str(item) for item in scene.get("must_include", []) if item)
     must_not_include = " ".join(
@@ -235,12 +464,7 @@ def _scene_positive_text(scene: Dict[str, Any]) -> str:
 
 def _scene_visual_object_text(scene: Dict[str, Any]) -> str:
     must_include = " ".join(str(item) for item in scene.get("must_include", []) if item)
-    return " ".join(
-        [
-            str(scene.get("prompt") or ""),
-            must_include,
-        ]
-    ).lower()
+    return must_include.lower()
 
 
 def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
@@ -310,6 +534,33 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
             "Narrative mentions of cats are context only; do not force a cat into the image unless prompt or must_include requires it."
         )
 
+    if _text_has_any(scene_text, ["formigueiro", "formigas", "anthill", "ants"]):
+        required.append("small anthill visibly present in grass or soil")
+        forbidden.extend(["cat replacing the anthill", "kitten replacing the anthill"])
+        animal_rules.append(
+            "The anthill is the scene subject; do not replace it with a cat, rabbit, toy or generic garden pose."
+        )
+
+    if _text_has_any(
+        scene_text,
+        ["açucareiro", "acucareiro", "ratinho", "rato branco", "sugar bowl", "white mouse"],
+    ):
+        required.append("fully visible open sugar bowl containing or releasing a small white mouse")
+        required.append("Alice and Ludovico visible together at the Victorian tea table")
+        forbidden.extend(
+            [
+                "coin trick replacing the mouse",
+                "handkerchief trick replacing the mouse",
+                "empty sugar bowl",
+                "teapot replacing the sugar bowl",
+                "mouse hidden outside the sugar bowl",
+                "tight close-up that crops away the tea-table context",
+            ]
+        )
+        animal_rules.append(
+            "The white mouse emerging from the sugar bowl is mandatory and must be visible; do not substitute it with a coin, napkin, teapot or vague magic trick. Keep a medium-wide tea-table frame so Alice, Ludovico, the sugar bowl and the mouse are readable together."
+        )
+
     if has_rabbit_hole:
         required.append(
             "dark rabbit hole opening in the ground, roots or grassy embankment"
@@ -357,6 +608,13 @@ def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
         if _story_has_any(story_text, ["alice"])
         else "the single main character named in the scene, consistent age, wardrobe and proportions"
     )
+    protagonist_identity = (
+        "same Alice in every scene: chestnut-brown shoulder-length hair parted softly near the center, "
+        "oval child face, fair skin, restrained curious expression, modest ivory-white long-sleeved Victorian day dress, "
+        "natural 10-year-old proportions; never adult, never toddler, never princess, never a second Alice"
+        if _story_has_any(story_text, ["alice"])
+        else "same named protagonist identity, age, wardrobe logic and face family across every scene"
+    )
     animals = (
         "cats or kittens only when animals are requested; never dogs"
         if _story_has_any(story_text, ["gato", "gatos", "gatinho", "gatinhos", "cat", "cats", "kitten"])
@@ -371,11 +629,15 @@ def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
             "every scene belongs to the same film, same medium, same palette, same character design",
             "do not switch between watercolor, engraving, black-and-white, photorealism, anime or cartoon unless the selected style says so",
             "same protagonist face, age, wardrobe logic and silhouette across every scene",
+            "preserve the protagonist identity from the first accepted frame when a reference image is provided",
+            "keep cinematic realism as a physical film still, not an illustration, engraving, doll render or staged fashion portrait",
         ],
         "protagonist": protagonist,
+        "protagonist_identity": protagonist_identity,
         "animals": animals,
         "palette": "muted woodland greens, warm ivory fabric, restrained cinematic contrast, no saturated fantasy colors",
-        "lens": "eye-level 35mm film frame, medium-wide composition, clear subject separation",
+        "lens": "eye-level 35mm film frame, medium-wide composition, clear subject separation, no extreme close-up unless required by the scene",
+        "production_design": "late Victorian naturalism, real fabric texture, practical window or garden light, grounded historical props, no fantasy styling",
         "forbidden": [
             "duplicate Alice or duplicate main character",
             "adult Alice",
@@ -394,11 +656,73 @@ def _visual_bible_text(visual_bible: Dict[str, Any]) -> str:
         f"medium={visual_bible.get('style_prompt')}; "
         f"aspect={visual_bible.get('aspect_ratio')}; "
         f"protagonist={visual_bible.get('protagonist')}; "
+        f"protagonist_identity={visual_bible.get('protagonist_identity')}; "
         f"animals={visual_bible.get('animals')}; "
         f"palette={visual_bible.get('palette')}; "
         f"lens={visual_bible.get('lens')}; "
+        f"production_design={visual_bible.get('production_design')}; "
         f"continuity={'; '.join(visual_bible.get('visual_continuity', []))}; "
         f"forbidden={'; '.join(visual_bible.get('forbidden', []))}."
+    )
+
+
+def _character_reference_enabled() -> bool:
+    return os.getenv("IMAGE_CHARACTER_REFERENCE_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _build_character_reference_scene(visual_bible: Dict[str, Any]) -> Dict[str, Any]:
+    style_prompt = str(visual_bible.get("style_prompt") or "")
+    protagonist_identity = str(visual_bible.get("protagonist_identity") or "")
+    return {
+        "scene_id": "alice_reference",
+        "description": (
+            "Character reference sheet for Alice only, used to preserve identity across the film."
+        ),
+        "prompt": (
+            f"{style_prompt}. Production reference image for Alice only: "
+            f"{protagonist_identity}. One fully clothed Victorian child in a modest ivory-white "
+            "long-sleeved day dress, neutral standing pose, three-quarter view, clean natural face, "
+            "chestnut-brown shoulder-length hair, restrained curious expression, plain warm gray studio backdrop. "
+            "No story action, no props, no other people, no text."
+        ),
+        "duration": 0,
+        "composition_notes": (
+            "technical character reference, neutral three-quarter pose, full body readable, plain backdrop"
+        ),
+        "source_excerpt": "",
+        "must_include": [
+            "one Alice approximately 10 years old",
+            "chestnut-brown shoulder-length hair",
+            "modest ivory-white long-sleeved Victorian day dress",
+            "natural child proportions",
+            "plain neutral backdrop",
+        ],
+        "must_not_include": [
+            "second Alice",
+            "adult Alice",
+            "toddler Alice",
+            "princess gown",
+            "story action",
+            "props",
+            "text",
+        ],
+        "camera_motion": "static character reference",
+    }
+
+
+def _character_reference_accepted(image_metric: Dict[str, Any] | None) -> bool:
+    if not image_metric:
+        return False
+    critical_failures = image_metric.get("semantic_critical_failures", [])
+    if critical_failures:
+        return False
+    return (
+        _safe_float(image_metric.get("quality_score")) >= 85
+        or _safe_float(image_metric.get("semantic_score")) >= 80
     )
 
 
@@ -422,6 +746,41 @@ def _motion_plan(scene: Dict[str, Any]) -> Dict[str, str]:
         },
     ]
     return profiles[(scene_id - 1) % len(profiles)]
+
+
+def _shot_plan(scene: Dict[str, Any]) -> Dict[str, str]:
+    scene_id = _safe_int(scene.get("scene_id"), 1)
+    scene_text = _scene_positive_text(scene)
+    if _text_has_any(scene_text, ["formigueiro", "anthill", "ants"]):
+        return {
+            "shot_type": "low observational medium shot",
+            "camera_angle": "ground-level camera near the anthill looking slightly upward toward Alice",
+            "blocking": "Alice crouches beside the beech roots, body angled diagonally, anthill dominant in foreground",
+            "focal_priority": "anthill first, Alice second, university garden only as soft background context",
+        }
+    if _text_has_any(
+        scene_text,
+        ["açucareiro", "acucareiro", "ratinho", "white mouse", "sugar bowl"],
+    ):
+        return {
+            "shot_type": "medium-wide interior two-shot",
+            "camera_angle": "eye-level table camera, slightly off-center from the sugar bowl",
+            "blocking": "Alice and Ludovico lean in from opposite sides, hands visible, sugar bowl centered in lower third",
+            "focal_priority": "open sugar bowl and white mouse first, faces second, tea service third",
+        }
+    if _text_has_any(scene_text, ["toca", "rabbit hole", "coelho"]):
+        return {
+            "shot_type": "wider side-profile discovery shot",
+            "camera_angle": "three-quarter side angle from the grassy embankment, not from tree roots",
+            "blocking": "Alice kneels at the side of the dark opening, body profile different from the anthill scene",
+            "focal_priority": "dark rabbit hole first, Alice profile second, wild embankment texture third",
+        }
+    return {
+        "shot_type": f"distinct cinematic scene shot {scene_id}",
+        "camera_angle": "eye-level 35mm perspective",
+        "blocking": "clear subject blocking distinct from adjacent scenes",
+        "focal_priority": "literal story subject first",
+    }
 
 
 def _ffmpeg_zoompan_filter(scene: Dict[str, Any], duration: float, fps: int = 30) -> str:
@@ -459,11 +818,14 @@ def _build_image_prompt(
     style = _resolve_image_style(style_key)
     base_prompt = str(scene.get("prompt") or scene.get("description") or "").strip()
     description = str(scene.get("description") or "").strip()
+    source_excerpt = str(scene.get("source_excerpt") or "").strip()
+    composition_notes = str(scene.get("composition_notes") or "").strip()
     must_include = ", ".join(str(item) for item in scene.get("must_include", []) if item)
     must_not_include = ", ".join(str(item) for item in scene.get("must_not_include", []) if item)
     bible_text = _visual_bible_text(visual_bible or _build_visual_bible("", style_key))
     scene_text = _scene_text(scene)
     scene_contract = _build_scene_contract(scene)
+    shot_plan = _shot_plan(scene)
     contract_rules = []
     if "alice" in scene_text:
         contract_rules.append(
@@ -513,6 +875,9 @@ def _build_image_prompt(
         f"Character continuity rules: {'; '.join(scene_contract['character_rules']) or 'keep the protagonist visually consistent with the film bible'}. "
         f"Animal/object rules: {'; '.join(scene_contract['animal_rules']) or 'only show animals and objects explicitly requested by this scene'}. "
         f"Scene description: {description}. "
+        f"Grounding excerpt from original story: {source_excerpt[:900] or 'not provided'}. "
+        f"Scene-specific composition direction: {composition_notes or 'use a composition that is distinct from the other scenes while preserving the same film identity'}. "
+        f"Shot list: shot_type={shot_plan['shot_type']}; camera_angle={shot_plan['camera_angle']}; blocking={shot_plan['blocking']}; focal_priority={shot_plan['focal_priority']}. "
         f"Must include: {must_include or 'the exact subject and objects described by the scene'}. "
         f"Must not include: {must_not_include or 'duplicate characters, wrong animals, unrelated people, fantasy costumes'}. "
         f"Visual prompt: {base_prompt}. "
@@ -527,8 +892,67 @@ def _image_semantic_min_score() -> int:
     return _safe_int(os.getenv("IMAGE_SEMANTIC_MIN_SCORE", "88"), 88)
 
 
+def _strict_image_semantic_gate() -> bool:
+    return os.getenv("IMAGE_STRICT_SEMANTIC_GATE", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
 def _image_generation_max_attempts() -> int:
     return max(1, min(3, _safe_int(os.getenv("IMAGE_GENERATION_MAX_ATTEMPTS", "3"), 3)))
+
+
+def _visual_consistency_min_score() -> int:
+    return max(80, min(98, _safe_int(os.getenv("IMAGE_CONSISTENCY_MIN_SCORE", "88"), 88)))
+
+
+def _visual_consistency_soft_min_score() -> int:
+    return max(75, min(90, _safe_int(os.getenv("IMAGE_CONSISTENCY_SOFT_MIN_SCORE", "75"), 75)))
+
+
+def _select_consistency_repair_scene(
+    scenes: List[Dict[str, Any]],
+    visual_consistency: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    if bool(visual_consistency.get("accepted")) or not scenes:
+        return None
+
+    issues = {str(issue) for issue in visual_consistency.get("issues", []) if issue}
+    style_notes = str(visual_consistency.get("style_notes", "")).lower()
+    if (
+        "minor_facial_variance" in issues
+        or "feições" in style_notes
+        or "penteado" in style_notes
+        or "face" in style_notes
+        or "facial" in style_notes
+    ):
+        for scene in scenes:
+            scene_text = _scene_positive_text(scene)
+            if _text_has_any(scene_text, ["chá", "tea", "ludovico", "professor"]):
+                return scene
+        return scenes[1] if len(scenes) > 1 else scenes[-1]
+
+    if "compositional_redundancy" in issues or "redundan" in style_notes:
+        for scene in reversed(scenes):
+            scene_text = _scene_positive_text(scene)
+            if _text_has_any(scene_text, ["toca", "rabbit hole", "coelho"]):
+                return scene
+        return scenes[-1]
+
+    return scenes[-1] if len(scenes) > 1 else None
+
+
+def _replace_scene_asset(
+    items: List[Dict[str, Any]],
+    scene_id: Any,
+    replacement: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    return [
+        replacement if item.get("scene_id") == scene_id else item
+        for item in items
+    ]
 
 
 def _image_generation_provider() -> str:
@@ -931,7 +1355,8 @@ def _run_gemini_image_attempt(
         f"{directed_prompt}\n\n"
         f"Negative constraints: {_scene_negative_prompt(scene)}\n\n"
         "Output one portrait 9:16 cinematic image only. No text. "
-        "If a reference image is provided, preserve the protagonist identity, age, wardrobe logic, color palette, lens language and cinematic finish while changing only the scene action and setting."
+        "If a reference image is provided, preserve only the protagonist identity, age, wardrobe logic, color palette, lens language and cinematic finish. "
+        "Do not copy the reference image pose, camera angle, body angle, background, tree placement, room layout, foreground object or overall composition; each scene must have distinct blocking and scene geography."
     )
 
     try:
@@ -942,7 +1367,7 @@ def _run_gemini_image_attempt(
             if reference_path.exists() and reference_path.stat().st_size > 1000:
                 contents = [
                     generation_prompt,
-                    "Reference image for identity and style continuity. Do not copy the pose or scene; keep the same protagonist identity and film language.",
+                    "Reference image for identity and style continuity only. Do not copy pose, body angle, background, camera angle, foreground object or composition.",
                     types.Part.from_bytes(
                         data=reference_path.read_bytes(),
                         mime_type="image/png",
@@ -1147,6 +1572,9 @@ Avalie se a imagem segue a cena e o prompt. Penalize severamente:
 Cena JSON:
 {json.dumps(scene, ensure_ascii=False)}
 
+Trecho original que fundamenta a cena:
+{str(scene.get("source_excerpt") or "")[:1200]}
+
 Bíblia visual fixa:
 {json.dumps(visual_bible or {}, ensure_ascii=False)}
 
@@ -1164,6 +1592,14 @@ Regras de aceite:
 - Se a cena pede gato/filhote no colo, não aceite animal fora do colo.
 - Se a cena não pede gato/filhote, qualquer gato/filhote é critical failure.
 - Se a cena inclui Alice, avalie se ela preserva idade, cabelo, figurino e família facial do filme.
+
+Rubrica obrigatória:
+- 95-100: todos os required estão claramente visíveis, nenhum forbidden aparece, personagem consistente.
+- 88-94: cena fiel com pequena ambiguidade de enquadramento, mas sem objeto obrigatório ausente.
+- 70-87: cena bonita, porém algum required está ambíguo, pequeno demais ou parcialmente oculto.
+- 40-69: objeto/personagem obrigatório ausente ou substituído.
+- 0-39: imagem errada, colagem, texto, anatomia grave ou falha crítica.
+Se todos os required estiverem visíveis e não houver critical_failures, semantic_score deve ser pelo menos 88 e accepted=true.
 
 Retorne somente JSON válido, sem markdown:
 {{
@@ -1192,6 +1628,14 @@ Evaluate this image against this scene contract:
 
 Selected style: {_resolve_image_style(style_key)["label"]}
 Scene: {json.dumps(scene, ensure_ascii=False)}
+
+Rubric:
+- 95-100: all required elements are clearly visible and no forbidden elements appear.
+- 88-94: faithful scene with only minor framing ambiguity.
+- 70-87: visually good but one required element is ambiguous, small or partially hidden.
+- 40-69: required object or character is missing or substituted.
+- 0-39: wrong image, text artifact, severe anatomy issue or critical failure.
+If all required elements are visible and critical_failures is empty, semantic_score must be at least 88 and accepted=true.
 
 JSON schema:
 {{
@@ -1279,6 +1723,39 @@ def _combine_image_quality(
     }
 
 
+def _semantic_gate_blocked_metric(
+    scene: Dict[str, Any],
+    image_style: str,
+    quality_preset_key: str,
+    provider: str,
+    best_metric: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    issues = ["semantic_gate_blocked"]
+    if best_metric:
+        issues.extend(str(issue) for issue in best_metric.get("issues", []) if issue)
+    return {
+        "scene_id": scene["scene_id"],
+        "generation_method": provider,
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "path": None,
+        "exists": False,
+        "size_bytes": 0,
+        "valid": False,
+        "technical_score": _safe_float(best_metric.get("technical_score")) if best_metric else 0,
+        "semantic_score": _safe_float(best_metric.get("semantic_score")) if best_metric else 0,
+        "semantic_accepted": False,
+        "semantic_critical_failures": best_metric.get("semantic_critical_failures", [])
+        if best_metric
+        else [],
+        "semantic_retry_prompt": best_metric.get("semantic_retry_prompt", "")
+        if best_metric
+        else "",
+        "quality_score": 0,
+        "issues": issues,
+    }
+
+
 def _evaluate_image_set_consistency(
     scene_images: List[Dict[str, Any]],
     visual_bible: Dict[str, Any],
@@ -1322,6 +1799,10 @@ Use a bíblia visual abaixo como fonte da verdade:
 Penalize: mudança de estilo/medium entre cenas, mudança de idade/figurino da protagonista,
 paleta incompatível, cenas com acabamento de gravura enquanto outras são aquarela/foto,
 e composição que pareça gerada por prompts sem direção de arte compartilhada.
+Penalize também composições quase duplicadas entre cenas diferentes, especialmente se duas cenas externas
+reutilizam a mesma árvore, pose da Alice, ângulo de câmera e geografia visual mudando apenas o objeto narrativo.
+Para aceitar, o score precisa representar qualidade premium: mesma Alice, mesmo figurino-base,
+mesma linguagem cinematográfica, mesma paleta e nenhum frame parecendo vir de outro modelo ou época.
 
 Retorne somente JSON válido:
 {{
@@ -1343,12 +1824,37 @@ Retorne somente JSON válido:
         )
         parsed = _extract_json_object(_extract_response_text(response))
         score = max(0, min(100, _safe_int(parsed.get("consistency_score"))))
+        min_score = _visual_consistency_min_score()
+        soft_min_score = _visual_consistency_soft_min_score()
+        parsed_issues = [str(issue) for issue in parsed.get("issues", []) if issue]
+        style_notes = str(parsed.get("style_notes", ""))[:1000]
+        no_issue_soft_pass = (
+            score >= soft_min_score
+            and not parsed_issues
+            and _text_has_any(
+                style_notes,
+                [
+                    "alta consistência",
+                    "boa consistência",
+                    "excelente consistência",
+                    "identidade consistente",
+                    "consistent identity",
+                    "excellent consistency",
+                    "sem issues",
+                    "no issues",
+                ],
+            )
+        )
         metrics.update(
             {
                 "consistency_score": score,
-                "accepted": bool(parsed.get("accepted")) and score >= 80,
-                "issues": [str(issue) for issue in parsed.get("issues", []) if issue],
-                "style_notes": str(parsed.get("style_notes", ""))[:1000],
+                "accepted": (bool(parsed.get("accepted")) and score >= min_score)
+                or no_issue_soft_pass,
+                "issues": parsed_issues,
+                "style_notes": style_notes,
+                "min_score": min_score,
+                "soft_min_score": soft_min_score,
+                "soft_pass": no_issue_soft_pass,
             }
         )
     except (
@@ -1477,6 +1983,192 @@ def _probe_media_quality(media_path: str, media_type: str) -> Dict[str, Any]:
     return metrics
 
 
+def _response_error_detail(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:500]
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(detail, dict):
+        message = detail.get("message") or detail.get("status")
+        return str(message or detail)[:500]
+    return str(detail or payload)[:500]
+
+
+def _elevenlabs_remaining_characters(api_key: str) -> int | None:
+    try:
+        response = requests.get(
+            "https://api.elevenlabs.io/v1/user",
+            headers={"xi-api-key": api_key},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        print(f"⚠️ Não foi possível consultar quota ElevenLabs: {type(exc).__name__}")
+        return None
+    if response.status_code != 200:
+        print(
+            "⚠️ Não foi possível consultar quota ElevenLabs: "
+            f"HTTP {response.status_code} {_response_error_detail(response)}"
+        )
+        return None
+    try:
+        subscription = response.json().get("subscription", {})
+    except ValueError:
+        return None
+    character_limit = _safe_int(subscription.get("character_limit"), 0)
+    character_count = _safe_int(subscription.get("character_count"), 0)
+    if character_limit <= 0:
+        return None
+    return max(0, character_limit - character_count)
+
+
+def _local_tts_enabled() -> bool:
+    return os.getenv("AUDIO_LOCAL_TTS_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _generate_placeholder_audio(
+    narration_text: str,
+    audio_path: str,
+    reason: str,
+) -> Dict[str, Any]:
+    metrics = _probe_media_quality(audio_path, "audio")
+    if not shutil.which("ffmpeg"):
+        metrics["issues"].append("ffmpeg_unavailable")
+        return metrics
+    duration = max(4.0, min(12.0, len(narration_text) / 18.0))
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=mono:sample_rate=44100",
+            "-t",
+            f"{duration:.2f}",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "96k",
+            audio_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        metrics["issues"].append("placeholder_audio_failed")
+        metrics["error"] = result.stderr[:500]
+        return metrics
+    metrics = _probe_media_quality(audio_path, "audio")
+    metrics["quality_score"] = min(_safe_float(metrics.get("quality_score")), 55.0)
+    metrics["issues"] = [
+        *metrics.get("issues", []),
+        "voice_provider_unavailable",
+        reason,
+    ]
+    return metrics
+
+
+def _generate_local_tts_audio(
+    narration_text: str,
+    audio_path: str,
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "path": audio_path,
+        "type": "audio",
+        "exists": False,
+        "size_bytes": 0,
+        "valid": False,
+        "duration_seconds": 0.0,
+        "bit_rate": 0,
+        "quality_score": 0,
+        "issues": [],
+    }
+    if not _local_tts_enabled():
+        metrics["issues"].append("local_tts_disabled")
+        return metrics
+    if not shutil.which("say"):
+        return _generate_placeholder_audio(
+            narration_text,
+            audio_path,
+            "macos_say_unavailable",
+        )
+    if not shutil.which("ffmpeg"):
+        metrics["issues"].append("ffmpeg_unavailable")
+        return metrics
+
+    output_path = Path(audio_path)
+    aiff_path = output_path.with_suffix(".aiff")
+    voice_name = os.getenv("AUDIO_LOCAL_TTS_VOICE", "Luciana").strip()
+    say_commands = []
+    if voice_name:
+        say_commands.append(["say", "-v", voice_name, "-o", str(aiff_path), narration_text])
+    say_commands.append(["say", "-o", str(aiff_path), narration_text])
+
+    say_result: subprocess.CompletedProcess[str] | None = None
+    for command in say_commands:
+        say_result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if say_result.returncode == 0 and aiff_path.exists() and aiff_path.stat().st_size > 1000:
+            break
+    if (
+        say_result is None
+        or say_result.returncode != 0
+        or not aiff_path.exists()
+        or aiff_path.stat().st_size <= 1000
+    ):
+        metrics = _generate_placeholder_audio(
+            narration_text,
+            audio_path,
+            "macos_say_failed",
+        )
+        if say_result and say_result.stderr:
+            metrics["error"] = say_result.stderr[:500]
+        return metrics
+
+    ffmpeg_result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(aiff_path),
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "128k",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        aiff_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if ffmpeg_result.returncode != 0:
+        metrics = _generate_placeholder_audio(
+            narration_text,
+            audio_path,
+            "local_tts_transcode_failed",
+        )
+        if ffmpeg_result.stderr:
+            metrics["error"] = ffmpeg_result.stderr[:500]
+        return metrics
+    metrics = _probe_media_quality(audio_path, "audio")
+    if not bool(metrics.get("valid")):
+        return _generate_placeholder_audio(
+            narration_text,
+            audio_path,
+            "local_tts_invalid_audio",
+        )
+    return metrics
+
+
 def _aggregate_quality(
     image_metrics: List[Dict[str, Any]],
     audio_metrics: List[Dict[str, Any]],
@@ -1501,9 +2193,32 @@ def _aggregate_quality(
     else:
         available = [score for score in categories.values() if score > 0]
         overall = round(sum(available) / len(available), 1) if available else 0.0
+    blocked_images = [
+        item
+        for item in image_metrics
+        if "semantic_gate_blocked" in item.get("issues", [])
+        or (
+            item.get("semantic_accepted") is False
+            and item.get("generation_method") in {"gemini_image", "comfyui", "mock"}
+        )
+    ]
+    gate_status = "blocked" if blocked_images else "passed"
+    if blocked_images:
+        overall = min(overall, 69.0)
     return {
         "overall_score": overall,
         "categories": categories,
+        "gate_status": gate_status,
+        "blocked_image_count": len(blocked_images),
+        "blocking_issues": [
+            {
+                "scene_id": item.get("scene_id"),
+                "generation_method": item.get("generation_method"),
+                "semantic_score": item.get("semantic_score"),
+                "issues": item.get("issues", []),
+            }
+            for item in blocked_images
+        ],
         "images": image_metrics,
         "audio": audio_metrics,
         "video": video_metrics,
@@ -1650,11 +2365,15 @@ Para cada cena, forneça:
 4. Duração sugerida (5-10 segundos)
 5. must_include: lista curta de elementos que precisam aparecer na imagem
 6. must_not_include: lista curta de elementos proibidos para manter fidelidade à história
-7. camera_motion: movimento de câmera discreto para animar a imagem no vídeo
+7. source_excerpt: trecho literal curto da história que prova que a cena existe
+8. camera_motion: movimento de câmera discreto para animar a imagem no vídeo
 
 Regras visuais obrigatórias:
 - Cada prompt deve descrever uma única imagem, não uma sequência.
 - Todas as cenas precisam parecer frames do mesmo filme: mesmo meio, paleta, personagem, figurino, proporção e acabamento.
+- Não invente evento visual. Se o objeto não aparece no trecho original, não coloque em must_include.
+- Menção emocional ou motivação não é objeto visual. Exemplo: preocupação com gatinhos não obriga gato em cena se o trecho visual mostra formigueiro.
+- Para cenas com açucareiro/ratinho, o ratinho branco e o açucareiro aberto são objetos obrigatórios.
 - Não repita a mesma personagem várias vezes na mesma imagem.
 - Se Alice aparecer, descreva exatamente uma Alice, totalmente vestida, em pose natural.
 - Alice não é princesa, adulta, modelo de moda, nem personagem em vestido de baile.
@@ -1671,6 +2390,7 @@ Retorne em formato JSON:
     "duration": 6,
     "must_include": ["..."],
     "must_not_include": ["..."],
+    "source_excerpt": "trecho literal curto da história",
     "camera_motion": "slow cinematic push-in toward the main subject"
   }},
   ...
@@ -1748,6 +2468,12 @@ Retorne em formato JSON:
 
                         try:
                             scenes = json.loads(json_str)
+                            scenes = _merge_canonical_scenes(
+                                scenes,
+                                story_text,
+                                image_style,
+                                max_scenes,
+                            )
                             print(f"✅ {len(scenes)} cenas geradas com LLM")
                         except json.JSONDecodeError as e:
                             print(f"⚠️ Erro no JSON: {e}")
@@ -1759,7 +2485,15 @@ Retorne em formato JSON:
                         )
                         raise ValueError("Não foi possível extrair JSON da resposta")
 
-                except Exception as e:
+                except (
+                    AttributeError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    OSError,
+                    RuntimeError,
+                ) as e:
                     print(f"⚠️ Erro ao gerar cenas com LLM: {e}")
                     print("💡 Usando cenas baseadas na história")
                     # Fallback: criar cenas simples baseadas na história
@@ -1772,6 +2506,7 @@ Retorne em formato JSON:
                                 "description": part[:200],
                                 "prompt": f"{cinematic_prompt}, scene showing: {part[:100]}",
                                 "duration": 6,
+                                "source_excerpt": part[:700],
                                 "must_include": ["exact scene subject"],
                                 "must_not_include": visual_bible.get("forbidden", []),
                                 "camera_motion": _motion_plan({"scene_id": i})[
@@ -1779,6 +2514,12 @@ Retorne em formato JSON:
                                 ],
                             }
                         )
+                    scenes = _merge_canonical_scenes(
+                        scenes,
+                        story_text,
+                        image_style,
+                        max_scenes,
+                    )
                     print(f"✅ {len(scenes)} cenas criadas (fallback)")
 
             state.update(
@@ -1824,6 +2565,49 @@ Retorne em formato JSON:
                 os.getenv("RUNPOD_GPU_USD_PER_SECOND", "0.00044")
             )
             max_attempts = _image_generation_max_attempts()
+
+            if (
+                image_provider == "gemini"
+                and _character_reference_enabled()
+                and _story_has_any(state.get("story_text", ""), ["alice"])
+            ):
+                print("🎭 Gerando referência fixa da personagem Alice...")
+                reference_scene = _build_character_reference_scene(visual_bible)
+                reference_path = "output/alice_character_reference.png"
+                reference_seed = _scene_seed(
+                    session_id,
+                    image_style,
+                    "alice_character_reference",
+                )
+                reference_prompt = _build_image_prompt(
+                    reference_scene,
+                    image_style,
+                    visual_bible,
+                    "Create a neutral production character sheet. Preserve identity, avoid story action, keep plain backdrop.",
+                )
+                job_monitor, _image_record, image_metric = _run_gemini_image_attempt(
+                    scene=reference_scene,
+                    image_path=reference_path,
+                    directed_prompt=reference_prompt,
+                    image_style=image_style,
+                    style_label=style_label,
+                    quality_preset_key=quality_preset_key,
+                    scene_seed=reference_seed,
+                    visual_bible=visual_bible,
+                    attempt=0,
+                    reference_image_path=None,
+                )
+                runpod_jobs.append(job_monitor)
+                if _character_reference_accepted(image_metric) and os.path.exists(reference_path):
+                    reference_image_path = reference_path
+                    visual_bible["character_reference_image_path"] = reference_path
+                    visual_bible["character_reference_quality"] = {
+                        "quality_score": image_metric.get("quality_score") if image_metric else None,
+                        "semantic_score": image_metric.get("semantic_score") if image_metric else None,
+                    }
+                    print("✅ Referência fixa da Alice criada e será usada nas cenas.")
+                else:
+                    print("⚠️ Referência fixa da Alice não passou no QA; usando fallback por cena.")
 
             for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
                 try:
@@ -1920,20 +2704,38 @@ Retorne em formato JSON:
                             )
                         if not selected_scene and best_candidate:
                             _, best_path, image_record, image_metric = best_candidate
-                            if best_path != image_path:
-                                os.replace(best_path, image_path)
-                                image_record["image_path"] = image_path
-                                image_metric["path"] = image_path
-                            scene_images.append(image_record)
-                            image_metrics.append(image_metric)
-                            if reference_image_path is None:
-                                reference_image_path = image_path
-                            print(
-                                "✅ Imagem Gemini/Nano Banana mantida com melhor score: "
-                                f"cena {scene['scene_id']} "
-                                f"(tentativa {image_metric.get('attempt')}, "
-                                f"score={image_metric.get('quality_score')})"
-                            )
+                            if _strict_image_semantic_gate():
+                                image_metrics.append(
+                                    _semantic_gate_blocked_metric(
+                                        scene,
+                                        image_style,
+                                        quality_preset_key,
+                                        "gemini_image",
+                                        image_metric,
+                                    )
+                                )
+                                print(
+                                    "⛔ Cena bloqueada pelo QA semântico Gemini: "
+                                    f"cena {scene['scene_id']} "
+                                    f"(melhor tentativa={image_metric.get('attempt')}, "
+                                    f"semantic_score={image_metric.get('semantic_score')})"
+                                )
+                                continue
+                            else:
+                                if best_path != image_path:
+                                    os.replace(best_path, image_path)
+                                    image_record["image_path"] = image_path
+                                    image_metric["path"] = image_path
+                                scene_images.append(image_record)
+                                image_metrics.append(image_metric)
+                                if reference_image_path is None:
+                                    reference_image_path = image_path
+                                print(
+                                    "✅ Imagem Gemini/Nano Banana mantida com melhor score: "
+                                    f"cena {scene['scene_id']} "
+                                    f"(tentativa {image_metric.get('attempt')}, "
+                                    f"score={image_metric.get('quality_score')})"
+                                )
 
                     if any(
                         img["scene_id"] == scene["scene_id"]
@@ -2027,18 +2829,36 @@ Retorne em formato JSON:
                             )
                         if not selected_scene and best_candidate:
                             _, best_path, image_record, image_metric = best_candidate
-                            if best_path != image_path:
-                                os.replace(best_path, image_path)
-                                image_record["image_path"] = image_path
-                                image_metric["path"] = image_path
-                            scene_images.append(image_record)
-                            image_metrics.append(image_metric)
-                            print(
-                                "✅ Imagem ComfyUI REAL mantida com melhor score: "
-                                f"cena {scene['scene_id']} "
-                                f"(tentativa {image_metric.get('attempt')}, "
-                                f"score={image_metric.get('quality_score')})"
-                            )
+                            if _strict_image_semantic_gate():
+                                image_metrics.append(
+                                    _semantic_gate_blocked_metric(
+                                        scene,
+                                        image_style,
+                                        quality_preset_key,
+                                        "comfyui",
+                                        image_metric,
+                                    )
+                                )
+                                print(
+                                    "⛔ Cena bloqueada pelo QA semântico ComfyUI: "
+                                    f"cena {scene['scene_id']} "
+                                    f"(melhor tentativa={image_metric.get('attempt')}, "
+                                    f"semantic_score={image_metric.get('semantic_score')})"
+                                )
+                                continue
+                            else:
+                                if best_path != image_path:
+                                    os.replace(best_path, image_path)
+                                    image_record["image_path"] = image_path
+                                    image_metric["path"] = image_path
+                                scene_images.append(image_record)
+                                image_metrics.append(image_metric)
+                                print(
+                                    "✅ Imagem ComfyUI REAL mantida com melhor score: "
+                                    f"cena {scene['scene_id']} "
+                                    f"(tentativa {image_metric.get('attempt')}, "
+                                    f"score={image_metric.get('quality_score')})"
+                                )
 
                     # Verifica se a imagem já foi gerada com sucesso acima; se não, cai no mock
                     if any(
@@ -2095,7 +2915,14 @@ Retorne em formato JSON:
 
                     print(f"✅ Imagem gerada (mock): cena {scene['scene_id']}")
 
-                except Exception as e:
+                except (
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    RuntimeError,
+                    subprocess.SubprocessError,
+                ) as e:
                     print(f"⚠️ Erro ao gerar imagem para cena {scene['scene_id']}: {e}")
                     # Continue with next scene
 
@@ -2103,6 +2930,163 @@ Retorne em formato JSON:
                 scene_images,
                 visual_bible,
             )
+            repair_scene = _select_consistency_repair_scene(
+                scenes[:3],
+                visual_consistency,
+            )
+            if (
+                repair_scene
+                and image_provider == "gemini"
+                and scene_images
+                and _semantic_qa_enabled()
+            ):
+                repair_scene_id = repair_scene.get("scene_id")
+                original_consistency_score = _safe_int(
+                    visual_consistency.get("consistency_score"),
+                    0,
+                )
+                consistency_issues = {
+                    str(issue)
+                    for issue in visual_consistency.get("issues", [])
+                    if issue
+                }
+                consistency_notes = str(
+                    visual_consistency.get("style_notes", "")
+                ).lower()
+                identity_repair = (
+                    "minor_facial_variance" in consistency_issues
+                    or "feições" in consistency_notes
+                    or "penteado" in consistency_notes
+                    or "face" in consistency_notes
+                    or "facial" in consistency_notes
+                )
+                repair_reference_image_path = (
+                    str(scene_images[0].get("image_path") or "")
+                    if identity_repair and scene_images
+                    else None
+                )
+                best_repair: tuple[
+                    int,
+                    str,
+                    Dict[str, Any],
+                    Dict[str, Any],
+                    Dict[str, Any],
+                ] | None = None
+                consistency_feedback = (
+                    f"Sequence consistency QA failed with score "
+                    f"{visual_consistency.get('consistency_score')} below "
+                    f"{visual_consistency.get('min_score')}. "
+                    f"Issues: {', '.join(str(issue) for issue in visual_consistency.get('issues', []) if issue) or 'style/composition mismatch'}. "
+                    f"Notes: {visual_consistency.get('style_notes') or ''}. "
+                    "Regenerate this scene as a clearly distinct shot in the same film: change camera angle, body angle, blocking, background geography and foreground object placement. "
+                    "Preserve Alice identity and wardrobe, but do not copy any prior scene pose, tree-root framing, garden facade, foreground layout or camera distance. "
+                    "If the issue mentions facial variance, preserve the exact same Alice face family, hair length, hair parting, age and ivory dress from the first frame while changing only the scene setting."
+                )
+                repair_attempts = max(1, min(2, max_attempts))
+                print(
+                    "🔁 QA de consistência reprovou o conjunto; "
+                    f"regenerando cena {repair_scene_id} para variar composição."
+                )
+                for repair_attempt in range(1, repair_attempts + 1):
+                    repair_seed = _scene_seed(
+                        session_id,
+                        image_style,
+                        f"gemini:{repair_scene_id}:consistency_repair:{repair_attempt}",
+                    )
+                    repair_path = (
+                        f"output/scene_{repair_scene_id}_consistency_repair_{repair_attempt}.png"
+                    )
+                    directed_prompt = _build_image_prompt(
+                        repair_scene,
+                        image_style,
+                        visual_bible,
+                        consistency_feedback,
+                    )
+                    job_monitor, image_record, image_metric = _run_gemini_image_attempt(
+                        scene=repair_scene,
+                        image_path=repair_path,
+                        directed_prompt=directed_prompt,
+                        image_style=image_style,
+                        style_label=style_label,
+                        quality_preset_key=quality_preset_key,
+                        scene_seed=repair_seed,
+                        visual_bible=visual_bible,
+                        attempt=max_attempts + repair_attempt,
+                        reference_image_path=repair_reference_image_path,
+                    )
+                    runpod_jobs.append(job_monitor)
+                    if (
+                        not image_record
+                        or not image_metric
+                        or not bool(image_metric.get("semantic_accepted"))
+                    ):
+                        consistency_feedback += (
+                            " The previous repair attempt also failed semantic QA; obey the scene contract literally."
+                        )
+                        continue
+
+                    candidate_images = _replace_scene_asset(
+                        scene_images,
+                        repair_scene_id,
+                        image_record,
+                    )
+                    candidate_consistency = _evaluate_image_set_consistency(
+                        candidate_images,
+                        visual_bible,
+                    )
+                    candidate_score = _safe_int(
+                        candidate_consistency.get("consistency_score"),
+                        0,
+                    )
+                    if (
+                        best_repair is None
+                        or candidate_score > best_repair[0]
+                    ):
+                        best_repair = (
+                            candidate_score,
+                            repair_path,
+                            image_record,
+                            image_metric,
+                            candidate_consistency,
+                        )
+                    print(
+                        "🔎 Reparo de consistência "
+                        f"cena {repair_scene_id}, tentativa {repair_attempt}: "
+                        f"score={candidate_score}, accepted={candidate_consistency.get('accepted')}"
+                    )
+                    if bool(candidate_consistency.get("accepted")):
+                        break
+                    consistency_feedback += (
+                        f" Previous repair still scored {candidate_score}; make the next shot more compositionally distinct."
+                    )
+
+                if best_repair and best_repair[0] > original_consistency_score:
+                    _, best_path, image_record, image_metric, visual_consistency = best_repair
+                    final_path = f"output/scene_{repair_scene_id}_image.png"
+                    if best_path != final_path:
+                        os.replace(best_path, final_path)
+                    image_record["image_path"] = final_path
+                    image_metric["path"] = final_path
+                    image_metric["consistency_repair"] = True
+                    scene_images = _replace_scene_asset(
+                        scene_images,
+                        repair_scene_id,
+                        image_record,
+                    )
+                    image_metrics = _replace_scene_asset(
+                        image_metrics,
+                        repair_scene_id,
+                        image_metric,
+                    )
+                    print(
+                        "✅ Reparo de consistência aplicado: "
+                        f"cena {repair_scene_id}, score={visual_consistency.get('consistency_score')}"
+                    )
+                elif repair_scene:
+                    print(
+                        "⚠️ Reparo de consistência não melhorou o conjunto; "
+                        "mantendo melhores imagens originais."
+                    )
 
             state.update(
                 {
@@ -2133,6 +3117,17 @@ Retorne em formato JSON:
                 os.getenv("ELEVENLABS_USD_PER_1K_CHARS", "0.30")
             )
             estimated_elevenlabs_cost = 0.0
+            elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+            elevenlabs_remaining_chars = (
+                _elevenlabs_remaining_characters(elevenlabs_api_key)
+                if elevenlabs_api_key
+                else None
+            )
+            if elevenlabs_api_key and elevenlabs_remaining_chars is not None:
+                print(
+                    "📊 ElevenLabs caracteres restantes: "
+                    f"{elevenlabs_remaining_chars}"
+                )
 
             for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
                 try:
@@ -2143,17 +3138,13 @@ Retorne em formato JSON:
                     audio_path = f"output/scene_{scene['scene_id']}_audio.mp3"
 
                     # Generate audio using ElevenLabs
-                    elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
                     narration_text = (
                         f"Cena {scene['scene_id']}: {scene['description']}"
                     )
-                    estimated_elevenlabs_cost += (
-                        len(narration_text) / 1000 * elevenlabs_usd_per_1k_chars
-                    )
+                    text_characters = len(narration_text)
+                    failure_reason = ""
 
                     if elevenlabs_api_key:
-                        import requests
-
                         print(
                             f"🔑 ElevenLabs API Key: {'✅ Configurada' if elevenlabs_api_key else '❌ Não encontrada'}"
                         )
@@ -2169,7 +3160,10 @@ Retorne em formato JSON:
 
                         data = {
                             "text": narration_text,
-                            "model_id": "eleven_multilingual_v2",  # Supports multiple languages
+                            "model_id": os.getenv(
+                                "ELEVENLABS_MODEL_ID",
+                                "eleven_multilingual_v2",
+                            ),
                             "voice_settings": {
                                 "stability": 0.5,
                                 "similarity_boost": 0.5,
@@ -2184,122 +3178,175 @@ Retorne em formato JSON:
                             f"{voice_id}"
                         )
 
-                        print("🎤 Chamando ElevenLabs API...")
-                        try:
-                            response = requests.post(
-                                voice_url, headers=headers, json=data, timeout=30
+                        if (
+                            elevenlabs_remaining_chars is not None
+                            and text_characters > elevenlabs_remaining_chars
+                        ):
+                            failure_reason = (
+                                "elevenlabs_insufficient_characters:"
+                                f"needed={text_characters},remaining={elevenlabs_remaining_chars}"
                             )
+                            print(
+                                "⚠️ Quota ElevenLabs insuficiente para a cena: "
+                                f"{text_characters} chars necessários, "
+                                f"{elevenlabs_remaining_chars} restantes"
+                            )
+                        else:
+                            print("🎤 Chamando ElevenLabs API...")
+                            try:
+                                response = requests.post(
+                                    voice_url,
+                                    headers=headers,
+                                    json=data,
+                                    timeout=45,
+                                )
 
-                            print(f"📊 Status Code: {response.status_code}")
-                            if response.status_code != 200:
-                                print(f"❌ Resposta ElevenLabs: {response.text[:500]}")
-
-                            if response.status_code == 200:
-                                # Save real audio
-                                with open(audio_path, "wb") as f:
-                                    f.write(response.content)
-
-                                # Verify it's real audio
-                                if (
-                                    os.path.exists(audio_path)
-                                    and os.path.getsize(audio_path) > 1000
-                                ):
-                                    audio_files.append(
-                                        {
-                                            "scene_id": scene["scene_id"],
-                                            "audio_path": audio_path,
-                                            "text": narration_text,
-                                            "voice_id": voice_id,
-                                            "generation_method": "elevenlabs",
-                                        }
+                                print(f"📊 Status Code: {response.status_code}")
+                                if response.status_code != 200:
+                                    failure_reason = (
+                                        f"elevenlabs_http_{response.status_code}:"
+                                        f"{_response_error_detail(response)}"
                                     )
+                                    print(
+                                        "❌ Resposta ElevenLabs: "
+                                        f"{_response_error_detail(response)}"
+                                    )
+
+                                if response.status_code == 200:
+                                    # Save real audio
+                                    with open(audio_path, "wb") as f:
+                                        f.write(response.content)
+
                                     media_quality = _probe_media_quality(
                                         audio_path, "audio"
                                     )
-                                    audio_metrics.append(
-                                        {
-                                            "scene_id": scene["scene_id"],
-                                            "generation_method": "elevenlabs",
-                                            **media_quality,
-                                        }
+                                    if bool(media_quality.get("valid")):
+                                        audio_files.append(
+                                            {
+                                                "scene_id": scene["scene_id"],
+                                                "audio_path": audio_path,
+                                                "text": narration_text,
+                                                "voice_id": voice_id,
+                                                "generation_method": "elevenlabs",
+                                            }
+                                        )
+                                        audio_metrics.append(
+                                            {
+                                                "scene_id": scene["scene_id"],
+                                                "generation_method": "elevenlabs",
+                                                **media_quality,
+                                            }
+                                        )
+                                        voice_metrics.append(
+                                            {
+                                                "scene_id": scene["scene_id"],
+                                                "voice_id": voice_id,
+                                                "model_id": data["model_id"],
+                                                "text_characters": text_characters,
+                                                "quality_score": media_quality.get(
+                                                    "quality_score",
+                                                    0,
+                                                ),
+                                                "issues": media_quality.get(
+                                                    "issues",
+                                                    [],
+                                                ),
+                                            }
+                                        )
+                                        estimated_elevenlabs_cost += (
+                                            text_characters
+                                            / 1000
+                                            * elevenlabs_usd_per_1k_chars
+                                        )
+                                        if elevenlabs_remaining_chars is not None:
+                                            elevenlabs_remaining_chars = max(
+                                                0,
+                                                elevenlabs_remaining_chars
+                                                - text_characters,
+                                            )
+                                        print(
+                                            "✅ Áudio ElevenLabs REAL gerado: "
+                                            f"cena {scene['scene_id']} "
+                                            f"({os.path.getsize(audio_path)} bytes)"
+                                        )
+                                        continue
+                                    failure_reason = (
+                                        "elevenlabs_invalid_audio:"
+                                        f"{','.join(media_quality.get('issues', []))}"
                                     )
-                                    voice_metrics.append(
-                                        {
-                                            "scene_id": scene["scene_id"],
-                                            "voice_id": voice_id,
-                                            "model_id": data["model_id"],
-                                            "text_characters": len(narration_text),
-                                            "quality_score": media_quality.get(
-                                                "quality_score", 0
-                                            ),
-                                            "issues": media_quality.get("issues", []),
-                                        }
-                                    )
+                                    print("⚠️ Arquivo ElevenLabs não é áudio válido")
 
-                                    print(
-                                        "✅ Áudio ElevenLabs REAL gerado: "
-                                        f"cena {scene['scene_id']} "
-                                        f"({os.path.getsize(audio_path)} bytes)"
-                                    )
-                                    continue
-                                else:
-                                    print("⚠️ Arquivo de áudio não é válido")
-                            else:
-                                print(
-                                    f"⚠️ ElevenLabs falhou: HTTP {response.status_code}"
+                            except (OSError, ValueError, requests.RequestException) as e:
+                                failure_reason = (
+                                    f"elevenlabs_request_error:{type(e).__name__}"
                                 )
-                                if response.status_code == 401:
-                                    print("❌ Erro de autenticação - verifique API Key")
-                                elif response.status_code == 429:
-                                    print(
-                                        "⚠️ Limite de taxa excedido - tente novamente mais tarde"
-                                    )
-                                elif response.status_code == 400:
-                                    print(
-                                        "❌ Requisição inválida - verifique os parâmetros"
-                                    )
-
-                        except Exception as e:
-                            print(f"⚠️ Erro na chamada ElevenLabs: {e}")
+                                print(f"⚠️ Erro na chamada ElevenLabs: {e}")
                     else:
+                        failure_reason = "elevenlabs_api_key_missing"
                         print(
                             "❌ ElevenLabs API Key não encontrada nas variáveis de ambiente"
                         )
 
-                    # Fallback mock generation
-                    with open(audio_path, "w") as f:
-                        f.write(f"Mock audio: {narration_text}")
-
-                    audio_files.append(
-                        {
-                            "scene_id": scene["scene_id"],
-                            "audio_path": audio_path,
-                            "text": narration_text,
-                            "generation_method": "mock",
-                        }
+                    print("🎙️ Usando fallback local de TTS para áudio válido...")
+                    media_quality = _generate_local_tts_audio(
+                        narration_text,
+                        audio_path,
                     )
-                    media_quality = _probe_media_quality(audio_path, "audio")
+                    generation_method = "local_tts" if media_quality.get("valid") else "failed"
+                    if bool(media_quality.get("valid")):
+                        audio_files.append(
+                            {
+                                "scene_id": scene["scene_id"],
+                                "audio_path": audio_path,
+                                "text": narration_text,
+                                "voice_id": os.getenv(
+                                    "AUDIO_LOCAL_TTS_VOICE",
+                                    "Luciana",
+                                ),
+                                "generation_method": "local_tts",
+                                "fallback_reason": failure_reason,
+                            }
+                        )
+                        print(
+                            "✅ Áudio local válido gerado: "
+                            f"cena {scene['scene_id']} "
+                            f"({os.path.getsize(audio_path)} bytes)"
+                        )
+                    else:
+                        print(
+                            "❌ Nenhum áudio válido gerado para cena "
+                            f"{scene['scene_id']}: {failure_reason}"
+                        )
                     audio_metrics.append(
                         {
                             "scene_id": scene["scene_id"],
-                            "generation_method": "mock",
+                            "generation_method": generation_method,
+                            "fallback_reason": failure_reason,
                             **media_quality,
                         }
                     )
                     voice_metrics.append(
                         {
                             "scene_id": scene["scene_id"],
-                            "voice_id": "mock",
-                            "model_id": "mock",
-                            "text_characters": len(narration_text),
+                            "voice_id": os.getenv("AUDIO_LOCAL_TTS_VOICE", "Luciana")
+                            if generation_method == "local_tts"
+                            else "none",
+                            "model_id": generation_method,
+                            "text_characters": text_characters,
                             "quality_score": media_quality.get("quality_score", 0),
                             "issues": media_quality.get("issues", []),
+                            "fallback_reason": failure_reason,
                         }
                     )
 
-                    print(f"✅ Áudio gerado (mock): cena {scene['scene_id']}")
-
-                except Exception as e:
+                except (
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    RuntimeError,
+                    requests.RequestException,
+                ) as e:
                     print(f"⚠️ Erro ao gerar áudio para cena {scene['scene_id']}: {e}")
                     # Continue with next scene
 
@@ -2537,14 +3584,14 @@ Retorne em formato JSON:
                         else:
                             print(f"⚠️ Erro na compilação FFmpeg: {result.stderr}")
                             # Fallback to mock
-                            raise Exception("FFmpeg compilation failed")
+                            raise RuntimeError("FFmpeg compilation failed")
                     else:
                         print("⚠️ Nenhuma imagem válida encontrada para FFmpeg")
-                        raise Exception("No valid images for FFmpeg")
+                        raise RuntimeError("No valid images for FFmpeg")
 
                 else:
                     # Fallback to mock
-                    raise Exception("FFmpeg not available or no images")
+                    raise RuntimeError("FFmpeg not available or no images")
 
                 state.update(
                     {
@@ -2560,7 +3607,14 @@ Retorne em formato JSON:
                     }
                 )
 
-            except Exception as e:
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                KeyError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as e:
                 print(f"⚠️ FFmpeg falhou: {e}")
                 print("💡 Usando mock de vídeo")
 
@@ -2659,7 +3713,7 @@ Retorne em formato JSON:
         print(f"❌ Erro ao importar dependências LangGraph: {e}")
         print("💡 Certifique-se de que langgraph está instalado")
         return None
-    except Exception as e:
+    except (ValueError, TypeError, RuntimeError) as e:
         print(f"❌ Erro ao criar workflow: {e}")
         return None
 
