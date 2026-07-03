@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import requests
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, redirect, request, send_file
+from dagster._core.errors import DagsterError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPEN3D_ROOT = Path(__file__).resolve().parent
@@ -34,6 +36,25 @@ ALLOWED_IMAGE_STYLES = {
     "anime_cinematic",
 }
 ALLOWED_IMAGE_QUALITY_PRESETS = {"balanced", "high"}
+ALLOWED_CURATION_STATUSES = {
+    "approved",
+    "rejected",
+    "pending_review",
+    "retry_requested",
+    "superseded",
+}
+CURATION_REASONS = {
+    "personagem incorreto",
+    "estilo inconsistente",
+    "cena não fiel ao texto",
+    "artefatos/texto",
+    "rosto/anatomia ruim",
+    "movimento ruim",
+    "áudio/voz ruim",
+    "ritmo/transição ruim",
+}
+RETRY_SCOPES = {"image", "video", "audio", "image_video", "full_scene"}
+YOUTUBE_PRIVACY_STATUSES = {"private", "unlisted", "public"}
 
 load_dotenv(OPEN3D_ROOT / ".env", override=True)
 if os.getenv("GEMINI_API_KEY"):
@@ -136,13 +157,55 @@ INDEX_HTML = r"""<!doctype html>
     .asset { background: #0d0f12; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; min-height: 110px; }
     .asset img, .asset video { display: block; width: 100%; background: #050607; }
     .asset a { display: block; color: var(--accent); padding: 10px; text-decoration: none; overflow-wrap: anywhere; }
+    .asset-meta { padding: 0 10px 10px; color: var(--muted); font-size: 12px; }
+    .asset-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 0 10px 10px; }
+    .asset-actions button { height: 32px; padding: 0 8px; font-size: 12px; }
+    .asset-note { width: calc(100% - 20px); min-height: 56px; margin: 0 10px 10px; font-size: 12px; }
+    .badge { display: inline-flex; align-items: center; height: 22px; border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; font-size: 11px; color: var(--muted); }
+    .badge.approved { color: var(--ok); border-color: rgba(110, 211, 154, .35); }
+    .badge.rejected { color: var(--bad); border-color: rgba(212, 103, 94, .35); }
+    .badge.pending_review, .badge.retry_requested { color: var(--warn); border-color: rgba(224, 168, 92, .35); }
+    .curation { margin: 14px 0; border: 1px solid var(--line); border-radius: 8px; background: #0d0f12; overflow: hidden; }
+    .curation-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-bottom: 1px solid var(--line); }
+    .curation-title { font: 600 18px/1.2 ui-serif, Georgia, serif; }
+    .curation-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .progress { height: 6px; background: #050607; border-radius: 999px; overflow: hidden; margin-top: 10px; }
+    .progress > span { display: block; height: 100%; background: var(--accent); width: 0; }
+    .blockers { color: var(--warn); font-size: 12px; padding: 0 14px 12px; }
+    .curation-scenes { display: grid; grid-template-columns: 1fr; gap: 10px; padding: 14px; }
+    .review-card { border: 1px solid var(--line); border-radius: 7px; background: #090a0c; overflow: hidden; }
+    .review-grid { display: grid; grid-template-columns: 170px 170px 1fr; gap: 12px; padding: 12px; align-items: start; }
+    .review-card img, .review-card video { width: 100%; background: #050607; border-radius: 6px; display: block; }
+    .review-meta { color: var(--muted); font-size: 12px; }
+    .review-meta strong { color: var(--text); font-size: 14px; display: block; margin-bottom: 6px; }
+    .review-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+    .review-controls select, .review-controls textarea { min-height: 38px; margin: 0; width: 100%; }
+    .review-controls textarea { grid-column: 1 / -1; min-height: 64px; }
+    .attempt-strip { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+    .attempt-pill { border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; color: var(--muted); font-size: 11px; }
+    .attempt-pill.active { color: var(--accent); border-color: rgba(217, 180, 111, .5); }
+    .compare-tools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+    .attempt-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+    .attempt-card { border: 1px solid var(--line); border-radius: 7px; background: #050607; overflow: hidden; }
+    .attempt-card-head { display: flex; justify-content: space-between; gap: 8px; padding: 10px; border-bottom: 1px solid var(--line); }
+    .attempt-card-title { font-weight: 700; }
+    .attempt-media { display: grid; gap: 8px; padding: 10px; }
+    .attempt-media img, .attempt-media video { width: 100%; border-radius: 6px; background: #090a0c; }
+    .attempt-card audio { width: 100%; }
+    .attempt-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 0 10px 10px; color: var(--muted); font-size: 12px; }
+    .attempt-facts div { overflow-wrap: anywhere; }
+    .attempt-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 10px 10px; }
+    .attempt-actions button { height: 32px; padding: 0 9px; font-size: 12px; }
+    .final-gate { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 14px; border-top: 1px solid var(--line); background: #0b0c0e; }
+    .final-gate video { width: 220px; max-width: 100%; border-radius: 6px; background: #050607; }
+    .final-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     .pill { display: inline-flex; align-items: center; height: 26px; padding: 0 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); }
     table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 12px; }
     th, td { border-bottom: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }
     th { color: var(--muted); font-weight: 600; }
     td { color: var(--text); overflow-wrap: anywhere; }
     .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
-    @media (max-width: 900px) { main { padding: 18px; } .grid, .status, .assets { grid-template-columns: 1fr; } header { display: block; } }
+    @media (max-width: 900px) { main { padding: 18px; } .grid, .status, .assets, .review-grid, .final-gate, .attempt-compare, .compare-tools { grid-template-columns: 1fr; } header { display: block; } }
   </style>
 </head>
 <body>
@@ -188,6 +251,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><strong id="quality">0</strong><span>qualidade</span></div>
         <div class="metric"><strong id="cost">$0</strong><span>custo est.</span></div>
       </div>
+      <div id="curation" class="curation"></div>
       <div id="log" class="log"></div>
       <div id="monitoring"></div>
       <div id="assets" class="assets"></div>
@@ -197,6 +261,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let currentRun = null;
 let pollTimer = null;
+let comparisonSelections = {};
 
 const $ = (id) => document.getElementById(id);
 
@@ -204,6 +269,16 @@ function logLine(text) {
   const el = $('log');
   el.textContent += `${new Date().toLocaleTimeString()}  ${text}\n`;
   el.scrollTop = el.scrollHeight;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;'
+  }[char]));
 }
 
 async function api(path, options) {
@@ -223,7 +298,227 @@ async function refreshHealth() {
   }
 }
 
+const CURATION_REASONS = [
+  'personagem incorreto',
+  'estilo inconsistente',
+  'cena não fiel ao texto',
+  'artefatos/texto',
+  'rosto/anatomia ruim',
+  'movimento ruim',
+  'áudio/voz ruim',
+  'ritmo/transição ruim'
+];
+
+const RETRY_SCOPES = [
+  ['image_video', 'Imagem + vídeo'],
+  ['image', 'Imagem'],
+  ['video', 'Vídeo'],
+  ['audio', 'Áudio'],
+  ['full_scene', 'Cena completa']
+];
+
+function reasonOptions(selected = '') {
+  return `<option value="">Motivo</option>${CURATION_REASONS.map(reason => `<option value="${escapeHtml(reason)}" ${reason === selected ? 'selected' : ''}>${escapeHtml(reason)}</option>`).join('')}`;
+}
+
+function scopeOptions(selected = 'image_video') {
+  return RETRY_SCOPES.map(([value, label]) => `<option value="${value}" ${value === selected ? 'selected' : ''}>${label}</option>`).join('');
+}
+
+function findByScene(items, sceneId) {
+  return (items || []).find(item => String(item.scene_id) === String(sceneId)) || {};
+}
+
+function mediaUrl(run, path) {
+  return `/api/runs/${run.id}/file?path=${encodeURIComponent(path)}`;
+}
+
+function activeAttempt(review) {
+  const attempts = review.attempts || [];
+  return attempts.find(attempt => attempt.id === review.active_attempt_id) || attempts[attempts.length - 1] || {};
+}
+
+function defaultCompareSelection(review) {
+  const attempts = review.attempts || [];
+  const active = review.active_attempt_id || attempts[attempts.length - 1]?.id || 'attempt_1';
+  const previous = attempts.slice().reverse().find(attempt => attempt.id !== active)?.id || active;
+  return {left: active, right: previous};
+}
+
+function attemptOptions(attempts, selected) {
+  return (attempts || []).map(attempt => `<option value="${escapeHtml(attempt.id)}" ${attempt.id === selected ? 'selected' : ''}>${escapeHtml(attempt.id)} · ${escapeHtml(attempt.status || 'draft')}</option>`).join('');
+}
+
+function attemptMedia(run, attempt) {
+  const image = attempt.image_path ? `<img src="${mediaUrl(run, attempt.image_path)}" alt="${escapeHtml(attempt.id)} imagem">` : '<div class="asset-meta">sem imagem nesta tentativa</div>';
+  const video = attempt.video_path ? `<video controls src="${mediaUrl(run, attempt.video_path)}"></video>` : '<div class="asset-meta">sem vídeo nesta tentativa</div>';
+  const audio = attempt.audio_path ? `<audio controls src="${mediaUrl(run, attempt.audio_path)}"></audio>` : '<div class="asset-meta">sem áudio nesta tentativa</div>';
+  return `${image}${video}${audio}`;
+}
+
+function renderAttemptCard(run, sceneId, review, attemptId) {
+  const attempt = (review.attempts || []).find(item => item.id === attemptId) || {};
+  if (!attempt.id) return `<div class="attempt-card"><div class="asset-meta">tentativa indisponível</div></div>`;
+  const isActive = attempt.id === review.active_attempt_id;
+  const canUse = attempt.status !== 'failed';
+  return `
+    <div class="attempt-card">
+      <div class="attempt-card-head">
+        <div>
+          <div class="attempt-card-title">${escapeHtml(attempt.id)}</div>
+          <div class="curation-sub">${escapeHtml(attempt.created_at || '')}</div>
+        </div>
+        <span class="badge ${escapeHtml(attempt.status || 'pending_review')}">${escapeHtml(isActive ? `${attempt.status || 'active'} · ativa` : attempt.status || 'draft')}</span>
+      </div>
+      <div class="attempt-media">${attemptMedia(run, attempt)}</div>
+      <div class="attempt-facts">
+        <div>imagem: ${escapeHtml(attempt.image_quality_score ?? '-')} · semântico ${escapeHtml(attempt.image_semantic_score ?? '-')}</div>
+        <div>vídeo: ${escapeHtml(attempt.video_quality_score ?? '-')}</div>
+        <div>áudio: ${escapeHtml(attempt.audio_quality_score ?? '-')}</div>
+        <div>escopo: ${escapeHtml(attempt.retry_scope || 'original')}</div>
+        <div>providers: ${escapeHtml([attempt.image_provider, attempt.video_provider, attempt.audio_provider].filter(Boolean).join(' · ') || '-')}</div>
+        <div>motivo: ${escapeHtml(attempt.reason || '-')}</div>
+        ${attempt.error ? `<div style="grid-column:1 / -1" class="bad">erro: ${escapeHtml(attempt.error)}</div>` : ''}
+        ${attempt.note ? `<div style="grid-column:1 / -1">nota: ${escapeHtml(attempt.note)}</div>` : ''}
+      </div>
+      <div class="attempt-actions">
+        <button onclick="activateAttempt('${sceneId}', '${attempt.id}')" ${canUse && !isActive ? '' : 'disabled'}>Tornar ativa</button>
+        <button class="primary" onclick="approveAttempt('${sceneId}', '${attempt.id}')" ${canUse ? '' : 'disabled'}>Aprovar esta tentativa</button>
+      </div>
+    </div>`;
+}
+
+function updateAttemptComparison(sceneId) {
+  if (!currentRun || !window.lastRenderedRun) return;
+  const left = document.getElementById(`compare-left-${sceneId}`)?.value;
+  const right = document.getElementById(`compare-right-${sceneId}`)?.value;
+  comparisonSelections[sceneId] = {left, right};
+  const run = window.lastRenderedRun;
+  const review = run.summary?.curation?.scenes?.[String(sceneId)] || {};
+  const target = document.getElementById(`attempt-compare-${sceneId}`);
+  if (target) {
+    target.innerHTML = `${renderAttemptCard(run, sceneId, review, left)}${renderAttemptCard(run, sceneId, review, right)}`;
+  }
+}
+
+function gateTone(status) {
+  if (status === 'final_approved') return 'approved';
+  if (status === 'scene_review_blocked') return 'rejected';
+  return 'pending_review';
+}
+
+function renderCuration(run) {
+  const el = $('curation');
+  const summary = run.summary || {};
+  if (!summary.scene_images?.length) {
+    el.innerHTML = `
+      <div class="curation-head">
+        <div>
+          <div class="curation-title">Sala de Curadoria</div>
+          <div class="curation-sub">Aguardando geração de cenas para abrir o gate visual.</div>
+        </div>
+        <span class="badge pending_review">aguardando</span>
+      </div>`;
+    return;
+  }
+
+  const curation = summary.curation || {};
+  const scenes = curation.scenes || {};
+  const approved = curation.approved_count || 0;
+  const total = curation.total_scenes || summary.scene_images.length || 0;
+  const progress = total ? Math.round((approved / total) * 100) : 0;
+  const blockers = curation.blockers || [];
+  const finalReview = curation.final_review || {};
+  const publication = summary.publication || {};
+  const q = summary.quality_metrics || {};
+
+  const sceneCards = (summary.scene_images || []).map(img => {
+    const sceneId = String(img.scene_id);
+    const review = scenes[sceneId] || {status: 'pending_review', note: '', reason: '', active_attempt_id: 'attempt_1'};
+    const imageMetric = findByScene(q.images, sceneId);
+    const audioMetric = findByScene(q.audio, sceneId);
+    const clip = findByScene(summary.scene_videos, sceneId);
+    const audio = findByScene(summary.audio_files, sceneId);
+    const noteId = `curation-note-${sceneId}`;
+    const reasonId = `curation-reason-${sceneId}`;
+    const scopeId = `curation-scope-${sceneId}`;
+    const attemptId = review.active_attempt_id || 'attempt_1';
+    const attempts = review.attempts?.length ? review.attempts : [{id: attemptId, status: 'active', image_path: img.image_path, video_path: clip.video_path, audio_path: audio.audio_path}];
+    review.attempts = attempts;
+    const defaults = comparisonSelections[sceneId] || defaultCompareSelection(review);
+    const leftAttempt = attempts.find(attempt => attempt.id === defaults.left)?.id || attemptId;
+    const rightAttempt = attempts.find(attempt => attempt.id === defaults.right)?.id || attempts.find(attempt => attempt.id !== leftAttempt)?.id || leftAttempt;
+    comparisonSelections[sceneId] = {left: leftAttempt, right: rightAttempt};
+    const attemptStrip = attempts.map(attempt => `<span class="attempt-pill ${attempt.id === attemptId ? 'active' : ''}">${escapeHtml(attempt.id)} · ${escapeHtml(attempt.status || 'draft')}</span>`).join('');
+    const autoVerdict = imageMetric.semantic_accepted === false || (imageMetric.issues || []).length ? 'revisar' : 'recomendada para aprovação';
+    return `
+      <div class="review-card">
+        <div class="review-grid">
+          <div>
+            <img src="/api/runs/${run.id}/file?path=${encodeURIComponent(img.image_path)}" alt="Cena ${escapeHtml(sceneId)}">
+          </div>
+          <div>
+            ${clip.video_path ? `<video controls src="/api/runs/${run.id}/file?path=${encodeURIComponent(clip.video_path)}"></video>` : `<div class="asset-meta">clipe ainda indisponível</div>`}
+            ${audio.audio_path ? `<audio controls src="/api/runs/${run.id}/file?path=${encodeURIComponent(audio.audio_path)}" style="width:100%; margin-top:8px"></audio>` : ''}
+          </div>
+          <div class="review-meta">
+            <strong>Cena ${escapeHtml(sceneId)}</strong>
+            <span class="badge ${escapeHtml(review.status || 'pending_review')}">${escapeHtml(review.status || 'pending_review')}</span>
+            <div style="margin-top:8px">pré-gate: ${escapeHtml(autoVerdict)}</div>
+            <div>imagem: ${escapeHtml(imageMetric.quality_score || 0)} · semântico ${escapeHtml(imageMetric.semantic_score ?? '-')}</div>
+            <div>vídeo: ${escapeHtml(clip.quality_score || '-')}</div>
+            <div>áudio: ${escapeHtml(audioMetric.quality_score || '-')}</div>
+            <div>tentativa ativa: ${escapeHtml(attemptId)}</div>
+            <div class="attempt-strip">${attemptStrip}</div>
+            <div class="review-controls">
+              <select id="${reasonId}">${reasonOptions(review.reason || '')}</select>
+              <select id="${scopeId}">${scopeOptions(review.retry_scope || 'image_video')}</select>
+              <textarea id="${noteId}" placeholder="Nota obrigatória para reprovar ou pedir retry">${escapeHtml(review.note || '')}</textarea>
+              <button onclick="approveAttempt('${sceneId}', '${attemptId}')">Aprovar tentativa ativa</button>
+              <button onclick="setCuration('${sceneId}', 'rejected')">Reprovar</button>
+              <button onclick="requestSceneRetry('${sceneId}')">Retry escopo</button>
+            </div>
+            <div class="compare-tools">
+              <select id="compare-left-${sceneId}" onchange="updateAttemptComparison('${sceneId}')">${attemptOptions(attempts, leftAttempt)}</select>
+              <select id="compare-right-${sceneId}" onchange="updateAttemptComparison('${sceneId}')">${attemptOptions(attempts, rightAttempt)}</select>
+            </div>
+            <div id="attempt-compare-${sceneId}" class="attempt-compare">
+              ${renderAttemptCard(run, sceneId, review, leftAttempt)}
+              ${renderAttemptCard(run, sceneId, review, rightAttempt)}
+            </div>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div class="curation-head">
+      <div>
+        <div class="curation-title">Sala de Curadoria</div>
+        <div class="curation-sub">${approved}/${total} cenas aprovadas · corte final: ${escapeHtml(finalReview.status || 'draft')}</div>
+        <div class="progress"><span style="width:${progress}%"></span></div>
+      </div>
+      <span class="badge ${gateTone(curation.status)}">${escapeHtml(curation.status || 'pending_review')}</span>
+    </div>
+    ${blockers.length ? `<div class="blockers">${blockers.map(escapeHtml).join(' · ')}</div>` : ''}
+    <div class="curation-scenes">${sceneCards}</div>
+    <div class="final-gate">
+      <div>
+        <div class="curation-title">Corte final</div>
+        <div class="curation-sub">Publicação só libera com todas as cenas aprovadas, vídeo visualizado e corte final aprovado.</div>
+        <div class="curation-sub">YouTube: ${escapeHtml(publication.status || 'not_started')}${publication.url ? ` · <a href="${escapeHtml(publication.url)}" target="_blank">${escapeHtml(publication.url)}</a>` : ''}${publication.error ? ` · ${escapeHtml(publication.error)}` : ''}</div>
+      </div>
+      ${summary.video_path ? `<video controls onplay="markFinalVideoViewed()" src="/api/runs/${run.id}/file?path=${encodeURIComponent('output/final_video.mp4')}"></video>` : `<span class="badge pending_review">sem vídeo</span>`}
+      <div class="final-actions">
+        <button onclick="authenticateYoutube().catch(err => logLine(err.message))">Autenticar YouTube</button>
+        <button onclick="approveFinalCut()" ${curation.can_final_approve ? '' : 'disabled'}>Aprovar corte final</button>
+        <button class="primary" onclick="publishGate()" ${curation.can_publish ? '' : 'disabled'}>Publicar</button>
+      </div>
+    </div>`;
+}
+
 function renderRun(run) {
+  window.lastRenderedRun = run;
   $('state').textContent = run.status;
   $('state').className = run.status === 'failed' ? 'bad' : run.status === 'completed' ? 'ok' : '';
   $('scenes').textContent = run.summary?.scenes_count ?? 0;
@@ -234,6 +529,7 @@ function renderRun(run) {
   $('retryBtn').disabled = !currentRun || run.status === 'running';
   $('runBtn').disabled = run.status === 'running';
   $('log').textContent = (run.log || []).join('\n');
+  renderCuration(run);
 
   const monitoring = $('monitoring');
   const jobs = run.summary?.runpod_jobs || [];
@@ -242,8 +538,8 @@ function renderRun(run) {
   const voices = q.voices || [];
   monitoring.innerHTML = `
     <table>
-      <thead><tr><th>RunPod job</th><th>Status</th><th>Tempo</th><th>Custo</th><th>Erro</th></tr></thead>
-      <tbody>${jobs.map(job => `<tr><td>${job.job_id || '-'}</td><td>${job.status || '-'}</td><td>${job.elapsed_seconds || 0}s</td><td>$${(job.estimated_cost_usd || 0).toFixed(4)}</td><td>${job.error || '-'}</td></tr>`).join('')}</tbody>
+      <thead><tr><th>Provider job</th><th>Provider</th><th>Status</th><th>Tempo</th><th>Custo</th><th>Erro</th></tr></thead>
+      <tbody>${jobs.map(job => `<tr><td>${escapeHtml(job.job_id || '-')}</td><td>${escapeHtml(job.provider || '-')} · ${escapeHtml(job.model || '-')}</td><td>${escapeHtml(job.status || '-')}</td><td>${job.elapsed_seconds || 0}s</td><td>$${(job.estimated_cost_usd || 0).toFixed(4)}</td><td>${escapeHtml(job.error || '-')}</td></tr>`).join('')}</tbody>
     </table>
     <table>
       <thead><tr><th>Mídia</th><th>Score</th><th>Técnico</th><th>Semântico</th><th>Detalhe</th><th>Issues</th></tr></thead>
@@ -260,11 +556,25 @@ function renderRun(run) {
   const assets = $('assets');
   assets.innerHTML = '';
   const summary = run.summary || {};
+  const curation = summary.curation?.scenes || {};
   for (const img of summary.scene_images || []) {
     if (img.image_path) {
       const div = document.createElement('div');
       div.className = 'asset';
-      div.innerHTML = `<img src="/api/runs/${run.id}/file?path=${encodeURIComponent(img.image_path)}" alt="Cena ${img.scene_id}"><a href="/api/runs/${run.id}/file?path=${encodeURIComponent(img.image_path)}" target="_blank">Cena ${img.scene_id} · ${img.camera_motion || 'motion'}</a>`;
+      const sceneId = String(img.scene_id);
+      const review = curation[sceneId] || {status: 'pending_review', note: ''};
+      div.innerHTML = `
+        <img src="/api/runs/${run.id}/file?path=${encodeURIComponent(img.image_path)}" alt="Cena ${escapeHtml(sceneId)}">
+        <a href="/api/runs/${run.id}/file?path=${encodeURIComponent(img.image_path)}" target="_blank">Cena ${escapeHtml(sceneId)} · ${escapeHtml(img.camera_motion || 'motion')}</a>
+        <div class="asset-meta"><span class="badge ${escapeHtml(review.status)}">${escapeHtml(review.status)}</span></div>`;
+      assets.appendChild(div);
+    }
+  }
+  for (const clip of summary.scene_videos || []) {
+    if (clip.video_path) {
+      const div = document.createElement('div');
+      div.className = 'asset';
+      div.innerHTML = `<video controls src="/api/runs/${run.id}/file?path=${encodeURIComponent(clip.video_path)}"></video><a href="/api/runs/${run.id}/file?path=${encodeURIComponent(clip.video_path)}" target="_blank">Clipe cena ${escapeHtml(clip.scene_id)} · ${escapeHtml(clip.provider || 'video')}</a><div class="asset-meta">score ${escapeHtml(clip.quality_score || 0)} · ${escapeHtml(clip.duration || 0)}s</div>`;
       assets.appendChild(div);
     }
   }
@@ -276,12 +586,117 @@ function renderRun(run) {
   }
 }
 
+async function setCuration(sceneId, status) {
+  if (!currentRun) return;
+  const note = document.getElementById(`curation-note-${sceneId}`)?.value || '';
+  const reason = document.getElementById(`curation-reason-${sceneId}`)?.value || '';
+  if ((status === 'rejected' || status === 'retry_requested') && !note.trim() && !reason) {
+    logLine(`informe um motivo ou nota para cena ${sceneId}`);
+    return;
+  }
+  const active = window.lastRenderedRun?.summary?.curation?.scenes?.[String(sceneId)]?.active_attempt_id || 'attempt_1';
+  const run = await api(`/api/runs/${currentRun}/curation`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({scene_id: sceneId, status, note, reason, attempt_id: active})
+  });
+  renderRun(run);
+  logLine(`curadoria cena ${sceneId}: ${status}`);
+}
+
+async function activateAttempt(sceneId, attemptId) {
+  if (!currentRun) return;
+  const run = await api(`/api/runs/${currentRun}/attempt-active`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({scene_id: sceneId, attempt_id: attemptId})
+  });
+  renderRun(run);
+  logLine(`tentativa ativa alterada: cena ${sceneId} · ${attemptId}`);
+}
+
+async function approveAttempt(sceneId, attemptId) {
+  if (!currentRun) return;
+  const run = await api(`/api/runs/${currentRun}/attempt-approval`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({scene_id: sceneId, attempt_id: attemptId})
+  });
+  renderRun(run);
+  logLine(`tentativa aprovada: cena ${sceneId} · ${attemptId}`);
+}
+
+async function requestSceneRetry(sceneId) {
+  if (!currentRun) return;
+  const note = document.getElementById(`curation-note-${sceneId}`)?.value || '';
+  const reason = document.getElementById(`curation-reason-${sceneId}`)?.value || '';
+  const scope = document.getElementById(`curation-scope-${sceneId}`)?.value || 'image_video';
+  if (!note.trim() && !reason) {
+    logLine(`informe um motivo ou nota para retry da cena ${sceneId}`);
+    return;
+  }
+  await setCuration(sceneId, 'retry_requested');
+  const data = await api(`/api/runs/${currentRun}/retry-scene`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({scene_id: sceneId, note, reason, scope})
+  });
+  currentRun = data.id;
+  logLine(`retry ${scope} iniciado para cena ${sceneId}: ${currentRun}`);
+  await poll();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 2000);
+}
+
+async function markFinalVideoViewed() {
+  if (!currentRun) return;
+  const run = await api(`/api/runs/${currentRun}/final-video-viewed`, {method: 'POST'});
+  renderRun(run);
+  logLine('vídeo final marcado como visualizado');
+}
+
+async function approveFinalCut() {
+  if (!currentRun) return;
+  const run = await api(`/api/runs/${currentRun}/final-approval`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({note: 'Aprovado na Sala de Curadoria'})
+  });
+  renderRun(run);
+  logLine('corte final aprovado');
+}
+
+async function publishGate() {
+  if (!currentRun) return;
+  const result = await api(`/api/runs/${currentRun}/publish-gate`, {method: 'POST'});
+  if (result.blocked) {
+    logLine(`publicação bloqueada: ${(result.blockers || []).join(', ')}`);
+  } else if (result.status === 'published') {
+    logLine(`YouTube já publicado: ${result.url || result.video_id}`);
+  } else if (result.status === 'queued' || result.status === 'uploading') {
+    if (result.run) renderRun(result.run);
+    logLine('upload YouTube iniciado');
+    clearInterval(pollTimer);
+    pollTimer = setInterval(poll, 3000);
+  } else {
+    logLine(`publicação: ${result.status || 'ok'}`);
+  }
+}
+
+async function authenticateYoutube() {
+  logLine('iniciando autenticação YouTube');
+  const result = await api('/api/youtube/auth', {method: 'POST'});
+  logLine(`YouTube: ${result.status}`);
+  await refreshHealth();
+}
+
 async function poll() {
   if (!currentRun) return;
   try {
     const run = await api(`/api/runs/${currentRun}`);
     renderRun(run);
-    if (run.status === 'completed' || run.status === 'failed') {
+    const publicationStatus = run.summary?.publication?.status || '';
+    if ((run.status === 'completed' || run.status === 'failed') && !['queued', 'uploading'].includes(publicationStatus)) {
       clearInterval(pollTimer);
       pollTimer = null;
     }
@@ -315,6 +730,17 @@ async function startRun(retry = false) {
   pollTimer = setInterval(poll, 2000);
 }
 
+async function loadLatestRun() {
+  try {
+    const run = await api('/api/runs/latest');
+    currentRun = run.id;
+    renderRun(run);
+    logLine(`último run carregado: ${currentRun}`);
+  } catch (err) {
+    logLine('nenhum run anterior carregado');
+  }
+}
+
 $('sampleBtn').onclick = async () => {
   const data = await api('/api/sample-story');
   $('story').value = data.story_text;
@@ -331,6 +757,7 @@ $('file').onchange = async (event) => {
 };
 
 refreshHealth();
+loadLatestRun();
 </script>
 </body>
 </html>
@@ -377,12 +804,15 @@ def _build_summary(run_dir: Path, final_state: dict[str, Any]) -> dict[str, Any]
         "video_path": str(video_path),
         "video_exists": video_path.exists(),
         "video_size": video_path.stat().st_size if video_path.exists() else 0,
+        "scenes": final_state.get("scenes", []),
         "scene_images": final_state.get("scene_images", []),
+        "scene_videos": final_state.get("scene_videos", []),
         "audio_files": final_state.get("audio_files", []),
         "runpod_jobs": final_state.get("runpod_jobs", []),
         "visual_bible": final_state.get("visual_bible", {}),
         "quality_metrics": final_state.get("quality_metrics", {}),
         "cost_estimate": final_state.get("cost_estimate", {}),
+        "curation": {"status": "pending_review", "scenes": {}},
     }
     if video_path.exists():
         probe = subprocess.run(
@@ -403,6 +833,1434 @@ def _build_summary(run_dir: Path, final_state: dict[str, Any]) -> dict[str, Any]
         if probe.returncode == 0:
             summary["ffprobe"] = json.loads(probe.stdout)
     return summary
+
+
+def _apply_curation_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    curation = summary.setdefault("curation", {})
+    scenes = curation.setdefault("scenes", {})
+    if not isinstance(scenes, dict):
+        scenes = {}
+        curation["scenes"] = scenes
+
+    scene_images = summary.get("scene_images", [])
+    scene_videos = summary.get("scene_videos", [])
+    audio_files = summary.get("audio_files", [])
+    quality_metrics = summary.get("quality_metrics", {})
+    image_metrics = quality_metrics.get("images", [])
+    audio_metrics = quality_metrics.get("audio", [])
+    scene_ids = [
+        str(item.get("scene_id"))
+        for item in scene_images
+        if item.get("scene_id") is not None
+    ]
+    for scene_id in scene_ids:
+        image = next(
+            (item for item in scene_images if str(item.get("scene_id")) == scene_id),
+            {},
+        )
+        video = next(
+            (item for item in scene_videos if str(item.get("scene_id")) == scene_id),
+            {},
+        )
+        audio = next(
+            (item for item in audio_files if str(item.get("scene_id")) == scene_id),
+            {},
+        )
+        image_metric = next(
+            (item for item in image_metrics if str(item.get("scene_id")) == scene_id),
+            {},
+        )
+        audio_metric = next(
+            (item for item in audio_metrics if str(item.get("scene_id")) == scene_id),
+            {},
+        )
+        attempt_id = "attempt_1"
+        scenes.setdefault(
+            scene_id,
+            {
+                "status": "pending_review",
+                "note": "",
+                "reason": "",
+                "active_attempt_id": attempt_id,
+                "approved_attempt_id": None,
+                "attempts": [],
+                "updated_at": None,
+            },
+        )
+        scene_review = scenes[scene_id]
+        attempts = scene_review.setdefault("attempts", [])
+        if not attempts:
+            attempts.append(
+                {
+                    "id": attempt_id,
+                    "status": "active",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "image_path": image.get("image_path"),
+                    "video_path": video.get("video_path"),
+                    "audio_path": audio.get("audio_path"),
+                    "image_provider": image.get("generation_method")
+                    or image.get("provider"),
+                    "video_provider": video.get("provider"),
+                    "audio_provider": audio.get("generation_method"),
+                    "image_quality_score": image_metric.get("quality_score", 0),
+                    "image_semantic_score": image_metric.get("semantic_score"),
+                    "image_semantic_accepted": image_metric.get("semantic_accepted"),
+                    "audio_quality_score": audio_metric.get("quality_score", 0),
+                    "prompt": image.get("prompt") or image.get("base_prompt"),
+                }
+            )
+        scene_review.setdefault("active_attempt_id", attempt_id)
+        if scene_review.get("status") == "approved":
+            scene_review.setdefault(
+                "approved_attempt_id", scene_review["active_attempt_id"]
+            )
+
+    approved = sum(
+        1
+        for scene_id in scene_ids
+        if scenes.get(scene_id, {}).get("status") == "approved"
+    )
+    rejected = sum(
+        1
+        for scene_id in scene_ids
+        if scenes.get(scene_id, {}).get("status") == "rejected"
+    )
+    retry_requested = sum(
+        1
+        for scene_id in scene_ids
+        if scenes.get(scene_id, {}).get("status") == "retry_requested"
+    )
+    pending = sum(
+        1
+        for scene_id in scene_ids
+        if scenes.get(scene_id, {}).get("status") == "pending_review"
+    )
+    blockers = []
+    if pending:
+        blockers.append(f"{pending} cena(s) pendente(s)")
+    if rejected:
+        blockers.append(f"{rejected} cena(s) reprovada(s)")
+    if retry_requested:
+        blockers.append(f"{retry_requested} retry(s) solicitado(s)")
+
+    final_review = curation.setdefault("final_review", {})
+    final_review.setdefault("status", "draft")
+    final_review.setdefault("video_viewed", False)
+    final_review.setdefault("approved_at", None)
+    final_review.setdefault("note", "")
+    video_ready = bool(summary.get("video_exists"))
+    scene_gate_passed = bool(scene_ids) and approved == len(scene_ids)
+    can_final_approve = (
+        scene_gate_passed and video_ready and bool(final_review.get("video_viewed"))
+    )
+
+    if final_review.get("status") == "final_approved" and not scene_gate_passed:
+        final_review["status"] = "scene_review_blocked"
+        final_review["approved_at"] = None
+
+    if final_review.get("status") == "final_approved":
+        status = "final_approved"
+    elif blockers:
+        status = "scene_review_blocked"
+    elif scene_ids and approved == len(scene_ids):
+        status = "ready_for_final_review"
+    else:
+        status = "pending_review"
+
+    if not video_ready:
+        blockers.append("vídeo final ausente")
+    if scene_gate_passed and video_ready and not final_review.get("video_viewed"):
+        blockers.append("vídeo final ainda não visualizado")
+    if (
+        scene_gate_passed
+        and video_ready
+        and final_review.get("video_viewed")
+        and final_review.get("status") != "final_approved"
+    ):
+        blockers.append("corte final ainda não aprovado")
+
+    curation.update(
+        {
+            "status": status,
+            "approved_count": approved,
+            "rejected_count": rejected,
+            "pending_count": pending,
+            "retry_requested_count": retry_requested,
+            "total_scenes": len(scene_ids),
+            "blockers": blockers,
+            "can_final_approve": can_final_approve,
+            "can_publish": status == "final_approved",
+        }
+    )
+    return summary
+
+
+def _persist_summary(run: dict[str, Any]) -> None:
+    summary = run.get("summary", {})
+    if not summary:
+        return
+    summary_path = Path(run["run_dir"]) / "pipeline_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = summary_path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.replace(summary_path)
+
+
+def _run_path(run: dict[str, Any], media_path: str | None) -> Path | None:
+    if not media_path:
+        return None
+    path = Path(media_path)
+    if not path.is_absolute():
+        path = Path(run["run_dir"]) / path
+    return path
+
+
+def _summary_scene(summary: dict[str, Any], scene_id: str) -> dict[str, Any]:
+    for scene in summary.get("scenes", []):
+        if str(scene.get("scene_id")) == scene_id:
+            return dict(scene)
+    for image in summary.get("scene_images", []):
+        if str(image.get("scene_id")) == scene_id:
+            return {
+                "scene_id": image.get("scene_id"),
+                "prompt": image.get("prompt") or image.get("base_prompt") or "",
+                "description": image.get("prompt") or image.get("base_prompt") or "",
+                "duration": image.get("duration", 6),
+                "camera_motion": image.get("camera_motion", ""),
+            }
+    return {"scene_id": scene_id, "prompt": "", "description": "", "duration": 6}
+
+
+def _active_attempt(summary: dict[str, Any], scene_id: str) -> dict[str, Any]:
+    scene_review = summary.get("curation", {}).get("scenes", {}).get(scene_id, {})
+    active_attempt_id = scene_review.get("active_attempt_id")
+    attempts = scene_review.get("attempts", [])
+    for attempt in attempts:
+        if attempt.get("id") == active_attempt_id:
+            return dict(attempt)
+    return dict(attempts[-1]) if attempts else {}
+
+
+def _next_attempt_id(summary: dict[str, Any], scene_id: str) -> str:
+    attempts = (
+        summary.get("curation", {})
+        .get("scenes", {})
+        .get(scene_id, {})
+        .get("attempts", [])
+    )
+    return f"attempt_{len(attempts) + 1}"
+
+
+def _find_attempt(
+    summary: dict[str, Any], scene_id: str, attempt_id: str
+) -> dict[str, Any]:
+    attempts = (
+        summary.get("curation", {})
+        .get("scenes", {})
+        .get(scene_id, {})
+        .get("attempts", [])
+    )
+    for attempt in attempts:
+        if attempt.get("id") == attempt_id:
+            return attempt
+    return {}
+
+
+def _replace_scene_record(
+    records: list[dict[str, Any]],
+    scene_id: str,
+    patch: dict[str, Any],
+) -> list[dict[str, Any]]:
+    replaced = False
+    updated: list[dict[str, Any]] = []
+    for record in records:
+        if str(record.get("scene_id")) == scene_id:
+            updated.append(
+                {**record, **patch, "scene_id": record.get("scene_id", scene_id)}
+            )
+            replaced = True
+        else:
+            updated.append(record)
+    if not replaced:
+        updated.append({"scene_id": scene_id, **patch})
+    return updated
+
+
+def _reset_final_gate(summary: dict[str, Any], status: str) -> None:
+    final_review = summary.setdefault("curation", {}).setdefault("final_review", {})
+    final_review.update(
+        {
+            "status": "draft",
+            "video_viewed": False,
+            "approved_at": None,
+            "note": "",
+        }
+    )
+    summary.setdefault("publication", {}).update({"status": status})
+
+
+def _apply_attempt_to_summary(
+    run: dict[str, Any],
+    scene_id: str,
+    attempt_id: str,
+    approve: bool,
+) -> dict[str, Any]:
+    summary = run.get("summary", {})
+    scene_review = (
+        summary.setdefault("curation", {})
+        .setdefault("scenes", {})
+        .setdefault(scene_id, {"status": "pending_review", "attempts": []})
+    )
+    attempts = scene_review.setdefault("attempts", [])
+    selected = _find_attempt(summary, scene_id, attempt_id)
+    if not selected:
+        raise ValueError("attempt not found")
+    if selected.get("status") == "failed":
+        raise ValueError("failed attempt cannot be activated")
+
+    for attempt in attempts:
+        if attempt.get("id") == attempt_id:
+            attempt["status"] = "approved" if approve else "active"
+        elif attempt.get("status") != "failed":
+            attempt["status"] = "superseded"
+
+    if selected.get("image_path"):
+        summary["scene_images"] = _replace_scene_record(
+            summary.get("scene_images", []),
+            scene_id,
+            {
+                "image_path": selected.get("image_path"),
+                "generation_method": selected.get("image_provider") or "curation",
+                "prompt": selected.get("prompt"),
+            },
+        )
+    if selected.get("video_path"):
+        summary["scene_videos"] = _replace_scene_record(
+            summary.get("scene_videos", []),
+            scene_id,
+            {
+                "video_path": selected.get("video_path"),
+                "provider": selected.get("video_provider") or "curation",
+                "quality_score": selected.get("video_quality_score", 0),
+            },
+        )
+    if selected.get("audio_path"):
+        summary["audio_files"] = _replace_scene_record(
+            summary.get("audio_files", []),
+            scene_id,
+            {
+                "audio_path": selected.get("audio_path"),
+                "text": selected.get("audio_text"),
+                "voice_id": selected.get("voice_id"),
+                "generation_method": selected.get("audio_provider") or "curation",
+            },
+        )
+
+    scene_review.update(
+        {
+            "status": "approved" if approve else "pending_review",
+            "active_attempt_id": attempt_id,
+            "approved_attempt_id": attempt_id if approve else None,
+            "retry_status": None,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+    )
+    _reset_final_gate(summary, "stale_after_attempt_change")
+    run["summary"] = summary
+    _recompile_final_video_from_attempts(run)
+    run["summary"] = _apply_curation_summary(summary)
+    run["updated_at"] = datetime.utcnow().isoformat()
+    _persist_summary(run)
+    return run
+
+
+def _retry_instruction(reason: str, note: str, scope: str) -> str:
+    correction = f"{reason}. {note}".strip(". ")
+    extras = {
+        "artefatos/texto": "Remove all visible text, captions, watermarks, logos, malformed borders and typography.",
+        "personagem incorreto": "Preserve the correct protagonist identity and required characters exactly; remove wrong or duplicate characters.",
+        "estilo inconsistente": "Match the global visual bible, color palette, lens language, wardrobe, era and finish of the approved scenes.",
+        "cena não fiel ao texto": "Obey the story excerpt and required objects literally; do not invent unrelated action or props.",
+        "rosto/anatomia ruim": "Fix face, eyes, hands, proportions and anatomy while preserving the character identity.",
+        "movimento ruim": "Keep the image faithful; the video retry must use subtle coherent cinematic motion only.",
+    }
+    return (
+        "Director curation correction. "
+        f"Retry scope: {scope}. "
+        f"Requested correction: {correction or 'Improve fidelity and remove visual defects'}. "
+        f"{extras.get(reason, '')} "
+        "Preserve continuity with approved scenes. Correct only the issue pointed out by the director."
+    ).strip()
+
+
+def _ffmpeg_concat_file(filelist_path: Path, paths: list[Path]) -> None:
+    filelist_path.write_text(
+        "".join(f"file '{path.resolve()}'\n" for path in paths),
+        encoding="utf-8",
+    )
+
+
+def _recompile_final_video_from_attempts(run: dict[str, Any]) -> dict[str, Any]:
+    from open3d_implementation.core.langgraph_adapter import _probe_media_quality
+
+    run_dir = Path(run["run_dir"])
+    output_dir = run_dir / "output"
+    summary = run.get("summary", {})
+    scene_ids = [
+        str(item.get("scene_id"))
+        for item in summary.get("scene_images", [])
+        if item.get("scene_id") is not None
+    ]
+    clip_paths: list[Path] = []
+    for scene_id in scene_ids:
+        attempt = _active_attempt(summary, scene_id)
+        clip_path = _run_path(run, attempt.get("video_path"))
+        if clip_path and clip_path.exists() and clip_path.stat().st_size > 1000:
+            clip_paths.append(clip_path)
+            continue
+        fallback_clip = _run_path(
+            run,
+            next(
+                (
+                    item.get("video_path")
+                    for item in summary.get("scene_videos", [])
+                    if str(item.get("scene_id")) == scene_id
+                ),
+                "",
+            ),
+        )
+        if (
+            fallback_clip
+            and fallback_clip.exists()
+            and fallback_clip.stat().st_size > 1000
+        ):
+            clip_paths.append(fallback_clip)
+            continue
+        for candidate in (
+            output_dir / f"scene_{scene_id}_runway.mp4",
+            output_dir / f"scene_{scene_id}_motion.mp4",
+        ):
+            if candidate.exists() and candidate.stat().st_size > 1000:
+                clip_paths.append(candidate)
+                summary.setdefault("scene_videos", []).append(
+                    {
+                        "scene_id": scene_id,
+                        "video_path": str(candidate),
+                        "provider": (
+                            "runway"
+                            if candidate.name.endswith("_runway.mp4")
+                            else "ffmpeg_camera_motion"
+                        ),
+                    }
+                )
+                break
+
+    if not clip_paths:
+        raise RuntimeError("no_scene_clips_available")
+
+    output_dir.mkdir(exist_ok=True)
+    video_list = output_dir / "curation_video_filelist.txt"
+    temp_video = output_dir / "curation_temp_video.mp4"
+    final_video = output_dir / "final_video.mp4"
+    _ffmpeg_concat_file(video_list, clip_paths)
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(video_list),
+            "-c:v",
+            "copy",
+            "-pix_fmt",
+            "yuv420p",
+            str(temp_video),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg_video_concat_failed:{result.stderr[:300]}")
+
+    audio_paths = []
+    for scene_id in scene_ids:
+        attempt = _active_attempt(summary, scene_id)
+        audio_path = _run_path(run, attempt.get("audio_path"))
+        if audio_path and audio_path.exists() and audio_path.stat().st_size > 1000:
+            audio_paths.append(audio_path)
+            continue
+        fallback_audio = _run_path(
+            run,
+            next(
+                (
+                    item.get("audio_path")
+                    for item in summary.get("audio_files", [])
+                    if str(item.get("scene_id")) == scene_id
+                ),
+                "",
+            ),
+        )
+        if (
+            fallback_audio
+            and fallback_audio.exists()
+            and fallback_audio.stat().st_size > 1000
+        ):
+            audio_paths.append(fallback_audio)
+    audio_paths = [
+        path
+        for path in audio_paths
+        if path and path.exists() and path.stat().st_size > 1000
+    ]
+    if audio_paths:
+        audio_list = output_dir / "curation_audio_filelist.txt"
+        combined_audio = output_dir / "curation_combined_audio.m4a"
+        _ffmpeg_concat_file(audio_list, audio_paths)
+        audio_result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(audio_list),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                str(combined_audio),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if audio_result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg_audio_concat_failed:{audio_result.stderr[:300]}"
+            )
+        mux_result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(temp_video),
+                "-i",
+                str(combined_audio),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(final_video),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if mux_result.returncode != 0:
+            raise RuntimeError(f"ffmpeg_mux_failed:{mux_result.stderr[:300]}")
+    else:
+        temp_video.replace(final_video)
+
+    for temp_path in (
+        video_list,
+        temp_video,
+        output_dir / "curation_audio_filelist.txt",
+        output_dir / "curation_combined_audio.m4a",
+    ):
+        if temp_path.exists():
+            temp_path.unlink()
+
+    video_metric = _probe_media_quality(str(final_video), "video")
+    summary["video_path"] = str(final_video)
+    summary["video_exists"] = final_video.exists()
+    summary["video_size"] = final_video.stat().st_size if final_video.exists() else 0
+    quality_metrics = summary.setdefault("quality_metrics", {})
+    quality_metrics["video"] = video_metric
+    return video_metric
+
+
+def _run_selective_visual_retry(
+    run_id: str,
+    scene_id: str,
+    note: str,
+    reason: str,
+    scope: str,
+) -> None:
+    from open3d_implementation.core.langgraph_adapter import (
+        _build_image_prompt,
+        _generate_runway_clip,
+        _probe_image_quality,
+        _run_gemini_image_attempt,
+        _scene_audio_duration,
+        _scene_seed,
+    )
+
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return
+        summary = run.get("summary", {})
+        previous_summary = json.loads(json.dumps(summary))
+        scene_review = (
+            summary.setdefault("curation", {})
+            .setdefault("scenes", {})
+            .setdefault(
+                scene_id,
+                {"status": "pending_review", "attempts": []},
+            )
+        )
+        previous_active_attempt_id = scene_review.get("active_attempt_id")
+        attempt_id = _next_attempt_id(summary, scene_id)
+        scene_review["status"] = "retry_requested"
+        scene_review["retry_status"] = "running"
+        scene_review["retry_scope"] = scope
+        scene_review["note"] = note
+        scene_review["reason"] = reason
+        scene_review["updated_at"] = datetime.utcnow().isoformat()
+        run["summary"] = _apply_curation_summary(summary)
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+
+    _append_log(
+        run_id, f"retry seletivo real iniciado: cena {scene_id}, escopo {scope}"
+    )
+
+    try:
+        run_dir = Path(run["run_dir"])
+        curation_dir = run_dir / "output" / "curation"
+        curation_dir.mkdir(parents=True, exist_ok=True)
+        summary = run.get("summary", {})
+        scene = _summary_scene(summary, scene_id)
+        image_style = str(
+            run.get("image_style") or summary.get("image_style") or "cinematic_realism"
+        )
+        quality_preset_key = str(
+            run.get("image_quality_preset")
+            or summary.get("image_quality_preset")
+            or "high"
+        )
+        visual_bible = summary.get("visual_bible", {})
+        instruction = _retry_instruction(reason, note, scope)
+        active_attempt = _active_attempt(summary, scene_id)
+        base_image_path = _run_path(run, active_attempt.get("image_path"))
+        image_path = base_image_path
+        image_record = None
+        image_metric = None
+        image_job = None
+
+        if scope in {"image", "image_video", "full_scene"}:
+            image_path = curation_dir / f"scene_{scene_id}_{attempt_id}_image.png"
+            directed_prompt = _build_image_prompt(
+                scene,
+                image_style,
+                visual_bible,
+                instruction,
+            )
+            seed = _scene_seed(run_id, image_style, f"{scene_id}:{attempt_id}:curation")
+            image_job, image_record, image_metric = _run_gemini_image_attempt(
+                scene=scene,
+                image_path=str(image_path),
+                directed_prompt=directed_prompt,
+                image_style=image_style,
+                style_label=image_style.replace("_", " "),
+                quality_preset_key=quality_preset_key,
+                scene_seed=seed,
+                visual_bible=visual_bible,
+                attempt=int(attempt_id.split("_")[-1]),
+                reference_image_path=str(base_image_path) if base_image_path else None,
+            )
+            if not image_record or not image_metric:
+                raise RuntimeError(
+                    f"selective_image_retry_failed:{image_job.get('error') if image_job else 'unknown'}"
+                )
+        elif not image_path or not image_path.exists():
+            raise RuntimeError("active_image_missing_for_video_retry")
+
+        duration = max(
+            3.0,
+            _scene_audio_duration(summary.get("audio_files", []), scene_id),
+            float(scene.get("duration") or 5),
+        )
+        video_path = curation_dir / f"scene_{scene_id}_{attempt_id}_runway.mp4"
+        runway_source = {
+            **scene,
+            "scene_id": scene_id,
+            "image_path": str(image_path),
+            "prompt": (image_record or active_attempt).get("prompt")
+            or scene.get("prompt")
+            or "",
+            "base_prompt": (image_record or active_attempt).get("base_prompt")
+            or scene.get("prompt")
+            or "",
+            "camera_motion": scene.get("camera_motion", ""),
+        }
+        video_job, video_ok = _generate_runway_clip(
+            runway_source,
+            str(video_path),
+            duration,
+        )
+        if not video_ok:
+            raise RuntimeError(f"selective_video_retry_failed:{video_job.get('error')}")
+
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            summary = run.get("summary", {})
+            scene_review = (
+                summary.setdefault("curation", {})
+                .setdefault("scenes", {})
+                .setdefault(scene_id, {})
+            )
+            attempts = scene_review.setdefault("attempts", [])
+            if previous_active_attempt_id:
+                for attempt in attempts:
+                    if attempt.get("id") == previous_active_attempt_id:
+                        attempt["status"] = "superseded"
+            attempts.append(
+                {
+                    "id": attempt_id,
+                    "status": "active",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "image_path": str(image_path),
+                    "video_path": str(video_path),
+                    "audio_path": active_attempt.get("audio_path"),
+                    "image_provider": "gemini",
+                    "video_provider": "runway",
+                    "retry_scope": scope,
+                    "reason": reason,
+                    "note": note,
+                    "image_quality_score": (image_metric or {}).get("quality_score", 0),
+                    "image_semantic_score": (image_metric or {}).get("semantic_score"),
+                    "image_semantic_accepted": (image_metric or {}).get(
+                        "semantic_accepted"
+                    ),
+                    "video_quality_score": video_job.get("quality_score", 0),
+                    "image_job": image_job,
+                    "video_job": video_job,
+                }
+            )
+            scene_review.update(
+                {
+                    "status": "pending_review",
+                    "retry_status": "succeeded",
+                    "active_attempt_id": attempt_id,
+                    "approved_attempt_id": None,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
+            if image_record:
+                summary["scene_images"] = [
+                    (
+                        {
+                            **item,
+                            "image_path": str(image_path),
+                            "generation_method": "gemini_image",
+                        }
+                        if str(item.get("scene_id")) == scene_id
+                        else item
+                    )
+                    for item in summary.get("scene_images", [])
+                ]
+            summary["scene_videos"] = [
+                item
+                for item in summary.get("scene_videos", [])
+                if str(item.get("scene_id")) != scene_id
+            ]
+            summary.setdefault("scene_videos", []).append(
+                {
+                    "scene_id": scene_id,
+                    "video_path": str(video_path),
+                    "provider": "runway",
+                    "job_id": video_job.get("job_id"),
+                    "duration": duration,
+                    "quality_score": video_job.get("quality_score", 0),
+                }
+            )
+            jobs = summary.setdefault("runpod_jobs", [])
+            if image_job:
+                jobs.append(image_job)
+            jobs.append(video_job)
+            final_review = summary.setdefault("curation", {}).setdefault(
+                "final_review", {}
+            )
+            final_review.update(
+                {
+                    "status": "draft",
+                    "video_viewed": False,
+                    "approved_at": None,
+                    "note": "",
+                }
+            )
+            publication = summary.setdefault("publication", {})
+            publication.update({"status": "stale_after_retry"})
+            run["summary"] = summary
+
+        video_metric = _recompile_final_video_from_attempts(run)
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            summary = _apply_curation_summary(run.get("summary", {}))
+            run["summary"] = summary
+            run["updated_at"] = datetime.utcnow().isoformat()
+            _persist_summary(run)
+        _append_log(
+            run_id,
+            f"retry seletivo concluído: cena {scene_id}, tentativa {attempt_id}, vídeo score {video_metric.get('quality_score')}",
+        )
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        RuntimeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            run["summary"] = previous_summary
+            scene_review = (
+                run["summary"]
+                .setdefault("curation", {})
+                .setdefault("scenes", {})
+                .setdefault(scene_id, {})
+            )
+            attempts = scene_review.setdefault("attempts", [])
+            attempts.append(
+                {
+                    "id": attempt_id,
+                    "status": "failed",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "retry_scope": scope,
+                    "reason": reason,
+                    "note": note,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            scene_review["retry_status"] = "failed"
+            scene_review["status"] = "retry_requested"
+            run["summary"] = _apply_curation_summary(run["summary"])
+            run["updated_at"] = datetime.utcnow().isoformat()
+            _persist_summary(run)
+        _append_log(
+            run_id,
+            f"retry seletivo falhou: cena {scene_id}: {type(exc).__name__}: {exc}",
+        )
+
+
+def _scene_narration_text(summary: dict[str, Any], scene_id: str) -> str:
+    active = _active_attempt(summary, scene_id)
+    if active.get("audio_text"):
+        return str(active["audio_text"])
+    for audio in summary.get("audio_files", []):
+        if str(audio.get("scene_id")) == scene_id and audio.get("text"):
+            return str(audio["text"])
+    scene = _summary_scene(summary, scene_id)
+    description = scene.get("description") or scene.get("prompt") or ""
+    return f"Cena {scene_id}: {description}".strip()
+
+
+def _run_selective_audio_retry(
+    run_id: str,
+    scene_id: str,
+    note: str,
+    reason: str,
+    scope: str,
+) -> None:
+    from open3d_implementation.core.langgraph_adapter import (
+        _elevenlabs_remaining_characters,
+        _probe_media_quality,
+        _response_error_detail,
+    )
+
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return
+        summary = run.get("summary", {})
+        previous_summary = json.loads(json.dumps(summary))
+        scene_review = (
+            summary.setdefault("curation", {})
+            .setdefault("scenes", {})
+            .setdefault(scene_id, {"status": "pending_review", "attempts": []})
+        )
+        previous_active = _active_attempt(summary, scene_id)
+        attempt_id = _next_attempt_id(summary, scene_id)
+        scene_review.update(
+            {
+                "status": "retry_requested",
+                "retry_status": "running",
+                "retry_scope": scope,
+                "note": note,
+                "reason": reason,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        )
+        run["summary"] = _apply_curation_summary(summary)
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+
+    _append_log(run_id, f"retry ElevenLabs iniciado: cena {scene_id}")
+
+    try:
+        api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("elevenlabs_api_key_missing")
+        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us").strip()
+        if not voice_id:
+            raise RuntimeError("elevenlabs_voice_id_missing")
+
+        run_dir = Path(run["run_dir"])
+        curation_dir = run_dir / "output" / "curation"
+        curation_dir.mkdir(parents=True, exist_ok=True)
+        summary = run.get("summary", {})
+        narration_text = _scene_narration_text(summary, scene_id)
+        if not narration_text:
+            raise RuntimeError("scene_narration_text_missing")
+        remaining = _elevenlabs_remaining_characters(api_key)
+        if remaining is not None and len(narration_text) > remaining:
+            raise RuntimeError(
+                f"elevenlabs_insufficient_characters:needed={len(narration_text)},remaining={remaining}"
+            )
+
+        audio_path = curation_dir / f"scene_{scene_id}_{attempt_id}_audio.mp3"
+        model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+        response = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": api_key,
+            },
+            json={
+                "text": narration_text,
+                "model_id": model_id,
+                "voice_settings": {
+                    "stability": 0.58,
+                    "similarity_boost": 0.72,
+                    "style": 0.25,
+                    "use_speaker_boost": True,
+                },
+            },
+            timeout=60,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"elevenlabs_http_{response.status_code}:{_response_error_detail(response)}"
+            )
+        audio_path.write_bytes(response.content)
+        media_quality = _probe_media_quality(str(audio_path), "audio")
+        if not bool(media_quality.get("valid")):
+            raise RuntimeError(
+                "elevenlabs_invalid_audio:"
+                + ",".join(str(issue) for issue in media_quality.get("issues", []))
+            )
+
+        usd_per_1k_chars = float(os.getenv("ELEVENLABS_USD_PER_1K_CHARS", "0.30"))
+        estimated_cost = len(narration_text) / 1000 * usd_per_1k_chars
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            summary = run.get("summary", {})
+            scene_review = (
+                summary.setdefault("curation", {})
+                .setdefault("scenes", {})
+                .setdefault(scene_id, {})
+            )
+            attempts = scene_review.setdefault("attempts", [])
+            active_id = scene_review.get("active_attempt_id")
+            for attempt in attempts:
+                if attempt.get("id") == active_id:
+                    attempt["status"] = "superseded"
+            attempts.append(
+                {
+                    "id": attempt_id,
+                    "status": "active",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "image_path": previous_active.get("image_path"),
+                    "video_path": previous_active.get("video_path"),
+                    "audio_path": str(audio_path),
+                    "audio_text": narration_text,
+                    "image_provider": previous_active.get("image_provider"),
+                    "video_provider": previous_active.get("video_provider"),
+                    "audio_provider": "elevenlabs",
+                    "voice_id": voice_id,
+                    "model_id": model_id,
+                    "retry_scope": scope,
+                    "reason": reason,
+                    "note": note,
+                    "image_quality_score": previous_active.get(
+                        "image_quality_score",
+                        0,
+                    ),
+                    "image_semantic_score": previous_active.get("image_semantic_score"),
+                    "image_semantic_accepted": previous_active.get(
+                        "image_semantic_accepted"
+                    ),
+                    "video_quality_score": previous_active.get(
+                        "video_quality_score",
+                        0,
+                    ),
+                    "audio_quality_score": media_quality.get("quality_score", 0),
+                    "audio_job": {
+                        "provider": "elevenlabs",
+                        "model": model_id,
+                        "voice_id": voice_id,
+                        "status": "succeeded",
+                        "estimated_cost_usd": round(estimated_cost, 6),
+                        "text_characters": len(narration_text),
+                    },
+                }
+            )
+            scene_review.update(
+                {
+                    "status": "pending_review",
+                    "retry_status": "succeeded",
+                    "active_attempt_id": attempt_id,
+                    "approved_attempt_id": None,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            )
+            summary["audio_files"] = _replace_scene_record(
+                summary.get("audio_files", []),
+                scene_id,
+                {
+                    "audio_path": str(audio_path),
+                    "text": narration_text,
+                    "voice_id": voice_id,
+                    "generation_method": "elevenlabs",
+                },
+            )
+            quality_metrics = summary.setdefault("quality_metrics", {})
+            quality_metrics["audio"] = _replace_scene_record(
+                quality_metrics.get("audio", []),
+                scene_id,
+                {"generation_method": "elevenlabs", **media_quality},
+            )
+            quality_metrics["voices"] = _replace_scene_record(
+                quality_metrics.get("voices", []),
+                scene_id,
+                {
+                    "voice_id": voice_id,
+                    "model_id": model_id,
+                    "text_characters": len(narration_text),
+                    "quality_score": media_quality.get("quality_score", 0),
+                    "issues": media_quality.get("issues", []),
+                    "retry_note": note,
+                },
+            )
+            cost_estimate = summary.setdefault("cost_estimate", {})
+            cost_estimate["elevenlabs_usd"] = round(
+                float(cost_estimate.get("elevenlabs_usd") or 0) + estimated_cost,
+                6,
+            )
+            cost_estimate["total_usd"] = round(
+                float(cost_estimate.get("total_usd") or 0) + estimated_cost,
+                6,
+            )
+            _reset_final_gate(summary, "stale_after_audio_retry")
+            run["summary"] = summary
+
+        video_metric = _recompile_final_video_from_attempts(run)
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            run["summary"] = _apply_curation_summary(run.get("summary", {}))
+            run["updated_at"] = datetime.utcnow().isoformat()
+            _persist_summary(run)
+        _append_log(
+            run_id,
+            f"retry ElevenLabs concluído: cena {scene_id}, tentativa {attempt_id}, áudio score {media_quality.get('quality_score')}, vídeo score {video_metric.get('quality_score')}",
+        )
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        requests.RequestException,
+        subprocess.SubprocessError,
+    ) as exc:
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            run["summary"] = previous_summary
+            scene_review = (
+                run["summary"]
+                .setdefault("curation", {})
+                .setdefault("scenes", {})
+                .setdefault(scene_id, {})
+            )
+            attempts = scene_review.setdefault("attempts", [])
+            attempts.append(
+                {
+                    "id": attempt_id,
+                    "status": "failed",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "retry_scope": scope,
+                    "reason": reason,
+                    "note": note,
+                    "audio_provider": "elevenlabs",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            scene_review["retry_status"] = "failed"
+            scene_review["status"] = "retry_requested"
+            run["summary"] = _apply_curation_summary(run["summary"])
+            run["updated_at"] = datetime.utcnow().isoformat()
+            _persist_summary(run)
+        _append_log(
+            run_id,
+            f"retry ElevenLabs falhou: cena {scene_id}: {type(exc).__name__}: {exc}",
+        )
+
+
+def _first_existing_path(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _youtube_token_path() -> Path:
+    configured = os.getenv("YOUTUBE_TOKEN_FILE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (REPO_ROOT.parent / "token.json").resolve()
+
+
+def _youtube_client_secrets_path() -> Path | None:
+    configured = os.getenv("YOUTUBE_CLIENT_SECRETS_FILE", "").strip()
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        return path if path.exists() else None
+    return _first_existing_path(
+        [
+            OPEN3D_ROOT / "GOOGLE_APPLICATION_CREDENTIALS_OAUTH.json",
+            REPO_ROOT / "script" / "client_secrets.json",
+            REPO_ROOT.parent / "client_secrets.json",
+            REPO_ROOT.parent.parent / "client_secrets.json",
+        ]
+    )
+
+
+def _youtube_auth_status() -> dict[str, Any]:
+    token_path = _youtube_token_path()
+    client_secrets_path = _youtube_client_secrets_path()
+    status = {
+        "token_exists": token_path.exists(),
+        "client_secrets_exists": bool(
+            client_secrets_path and client_secrets_path.exists()
+        ),
+        "token_valid": False,
+        "token_expired": False,
+        "has_refresh_token": False,
+    }
+    if token_path.exists():
+        try:
+            from google.oauth2.credentials import Credentials
+
+            credentials = Credentials.from_authorized_user_file(
+                str(token_path),
+                ["https://www.googleapis.com/auth/youtube.upload"],
+            )
+            status.update(
+                {
+                    "token_valid": bool(credentials.valid),
+                    "token_expired": bool(credentials.expired),
+                    "has_refresh_token": bool(credentials.refresh_token),
+                }
+            )
+        except (OSError, ValueError):
+            status["token_invalid"] = True
+    return status
+
+
+def _build_youtube_service() -> Any:
+    try:
+        from google.auth.exceptions import RefreshError
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise RuntimeError("youtube_google_client_missing") from exc
+
+    scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+    token_path = _youtube_token_path()
+    client_secrets_path = _youtube_client_secrets_path()
+    credentials = None
+
+    if token_path.exists():
+        try:
+            credentials = Credentials.from_authorized_user_file(str(token_path), scopes)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("youtube_token_invalid") from exc
+
+    if credentials and credentials.expired and credentials.refresh_token:
+        try:
+            credentials.refresh(GoogleAuthRequest())
+        except RefreshError as exc:
+            if os.getenv("YOUTUBE_ALLOW_OAUTH_FLOW", "false").lower() != "true":
+                raise RuntimeError("youtube_token_refresh_failed") from exc
+            credentials = None
+        else:
+            token_path.write_text(credentials.to_json(), encoding="utf-8")
+
+    if not credentials or not credentials.valid:
+        if not client_secrets_path:
+            raise RuntimeError("youtube_client_secrets_missing")
+        if os.getenv("YOUTUBE_ALLOW_OAUTH_FLOW", "false").lower() != "true":
+            raise RuntimeError("youtube_oauth_required")
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(client_secrets_path),
+                scopes,
+            )
+            credentials = flow.run_local_server(port=0)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("youtube_oauth_flow_failed") from exc
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(credentials.to_json(), encoding="utf-8")
+
+    try:
+        return build("youtube", "v3", credentials=credentials)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("youtube_service_build_failed") from exc
+
+
+def _youtube_metadata(run: dict[str, Any]) -> dict[str, Any]:
+    run_dir = Path(run["run_dir"])
+    story_path = run_dir / "historia.txt"
+    story_text = story_path.read_text(encoding="utf-8") if story_path.exists() else ""
+    first_line = next(
+        (line.strip() for line in story_text.splitlines() if line.strip()),
+        "AI Film",
+    )
+    title = os.getenv("YOUTUBE_UPLOAD_TITLE", first_line[:95]).strip() or "AI Film"
+    description = os.getenv("YOUTUBE_UPLOAD_DESCRIPTION", "").strip()
+    if not description:
+        description = (
+            f"{first_line}\n\n"
+            "Vídeo criado com o pipeline AI Film: cenas, imagens, vozes e animação geradas com IA."
+        )
+    tags_raw = os.getenv(
+        "YOUTUBE_UPLOAD_TAGS",
+        "AI Film,animação,filme com IA,história animada",
+    )
+    tags = [tag.strip() for tag in tags_raw.split(",") if tag.strip()]
+    privacy = os.getenv("YOUTUBE_UPLOAD_PRIVACY", "private").strip().lower()
+    if privacy not in YOUTUBE_PRIVACY_STATUSES:
+        privacy = "private"
+    return {
+        "title": title[:100],
+        "description": description[:5000],
+        "tags": tags[:30],
+        "categoryId": os.getenv("YOUTUBE_UPLOAD_CATEGORY_ID", "1"),
+        "privacyStatus": privacy,
+        "selfDeclaredMadeForKids": os.getenv(
+            "YOUTUBE_SELF_DECLARED_MADE_FOR_KIDS",
+            "false",
+        ).lower()
+        == "true",
+    }
+
+
+def _upload_video_to_youtube(
+    video_path: Path, metadata: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        import httplib2
+        from googleapiclient.errors import HttpError
+        from googleapiclient.http import MediaFileUpload
+    except ImportError as exc:
+        raise RuntimeError("youtube_google_client_missing") from exc
+
+    service = _build_youtube_service()
+    body = {
+        "snippet": {
+            "title": metadata["title"],
+            "description": metadata["description"],
+            "tags": metadata["tags"],
+            "categoryId": metadata["categoryId"],
+        },
+        "status": {
+            "privacyStatus": metadata["privacyStatus"],
+            "selfDeclaredMadeForKids": metadata["selfDeclaredMadeForKids"],
+        },
+    }
+    media = MediaFileUpload(
+        str(video_path),
+        mimetype="video/mp4",
+        chunksize=8 * 1024 * 1024,
+        resumable=True,
+    )
+    request_upload = service.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
+    response = None
+    retries = 0
+    while response is None:
+        try:
+            _, response = request_upload.next_chunk()
+        except HttpError as exc:
+            if exc.resp.status not in {500, 502, 503, 504} or retries >= 5:
+                raise RuntimeError(f"youtube_upload_http_{exc.resp.status}") from exc
+            retries += 1
+            threading.Event().wait(2**retries)
+        except (httplib2.HttpLib2Error, OSError) as exc:
+            if retries >= 5:
+                raise RuntimeError("youtube_upload_network_failed") from exc
+            retries += 1
+            threading.Event().wait(2**retries)
+    video_id = str(response.get("id", ""))
+    if not video_id:
+        raise RuntimeError("youtube_upload_missing_video_id")
+    return {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "privacyStatus": metadata["privacyStatus"],
+    }
+
+
+def _run_youtube_upload(run_id: str) -> None:
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return
+        summary = run.get("summary", {})
+        video_path = Path(summary.get("video_path") or "")
+        if not video_path.is_absolute():
+            video_path = Path(run["run_dir"]) / video_path
+        metadata = _youtube_metadata(run)
+        summary.setdefault("publication", {}).update(
+            {
+                "status": "uploading",
+                "started_at": datetime.utcnow().isoformat(),
+                "metadata": metadata,
+            }
+        )
+        run["summary"] = summary
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+    _append_log(run_id, "upload real para YouTube iniciado")
+
+    try:
+        if not video_path.exists() or not video_path.is_file():
+            raise FileNotFoundError(str(video_path))
+        result = _upload_video_to_youtube(video_path, metadata)
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            summary = run.get("summary", {})
+            summary.setdefault("curation", {})["status"] = "published"
+            summary.setdefault("publication", {}).update(
+                {
+                    "status": "published",
+                    "completed_at": datetime.utcnow().isoformat(),
+                    **result,
+                }
+            )
+            run["summary"] = summary
+            run["updated_at"] = datetime.utcnow().isoformat()
+            _persist_summary(run)
+        _append_log(run_id, f"YouTube publicado: {result['url']}")
+    except (
+        FileNotFoundError,
+        RuntimeError,
+        OSError,
+        ValueError,
+    ) as exc:
+        with RUN_LOCK:
+            run = RUNS.get(run_id)
+            if run is None:
+                return
+            summary = run.get("summary", {})
+            summary.setdefault("publication", {}).update(
+                {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "failed_at": datetime.utcnow().isoformat(),
+                }
+            )
+            run["summary"] = summary
+            run["updated_at"] = datetime.utcnow().isoformat()
+            _persist_summary(run)
+        _append_log(run_id, f"falha no upload YouTube: {type(exc).__name__}: {exc}")
+
+
+def _start_pipeline_run(
+    story_text: str,
+    image_style: str,
+    image_quality_preset: str,
+    retry_of: str | None = None,
+    target_scene_id: str | None = None,
+) -> dict[str, Any]:
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
+    run_dir = RUNS_ROOT / run_id
+    with RUN_LOCK:
+        RUNS[run_id] = {
+            "id": run_id,
+            "status": "running",
+            "run_dir": str(run_dir),
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "retry_of": retry_of,
+            "target_scene_id": target_scene_id,
+            "image_style": image_style,
+            "image_quality_preset": image_quality_preset,
+            "log": ["run recebido pela UI"],
+            "summary": {},
+        }
+
+    thread = threading.Thread(
+        target=_run_pipeline,
+        args=(run_id, story_text, image_style, image_quality_preset),
+        daemon=True,
+    )
+    thread.start()
+    return RUNS[run_id]
+
+
+def _hydrate_run_from_summary(summary_path: Path) -> dict[str, Any]:
+    run_dir = summary_path.parent
+    run_id = run_dir.name
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary = _apply_curation_summary(summary)
+    story_path = run_dir / "historia.txt"
+    run = {
+        "id": run_id,
+        "status": summary.get("status") or "completed",
+        "run_dir": str(run_dir),
+        "created_at": datetime.fromtimestamp(run_dir.stat().st_mtime).isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+        "retry_of": None,
+        "target_scene_id": None,
+        "image_style": summary.get("image_style", "cinematic_realism"),
+        "image_quality_preset": summary.get("image_quality_preset", "high"),
+        "log": ["run carregado de pipeline_summary.json"],
+        "summary": summary,
+    }
+    if story_path.exists():
+        run["story_characters"] = len(story_path.read_text(encoding="utf-8"))
+    with RUN_LOCK:
+        RUNS[run_id] = run
+    return run
 
 
 def _run_pipeline(
@@ -470,6 +2328,7 @@ def _run_pipeline(
         final_state = result.output_for_node("enhanced_langgraph_workflow_asset")
         validation = result.output_for_node("enhanced_validation_asset")
         summary = _build_summary(run_dir=run_dir, final_state=final_state)
+        summary = _apply_curation_summary(summary)
         summary["image_style"] = image_style
         summary["image_quality_preset"] = image_quality_preset
         summary["dagster"] = {
@@ -484,9 +2343,20 @@ def _run_pipeline(
         )
         _append_log(run_id, f"Dagster run concluído: {result.run_id}")
         _set_run(run_id, status="completed", summary=summary)
-    except Exception as exc:
+    except (
+        DagsterError,
+        ImportError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+    ) as exc:
         _append_log(run_id, f"falha: {type(exc).__name__}: {exc}")
-        _set_run(run_id, status="failed", error=str(exc), traceback=traceback.format_exc())
+        _set_run(
+            run_id, status="failed", error=str(exc), traceback=traceback.format_exc()
+        )
     finally:
         if previous_dagster_home is None:
             os.environ.pop("DAGSTER_HOME", None)
@@ -508,18 +2378,27 @@ def health() -> Response:
             "runs_root": str(RUNS_ROOT),
             "models": {
                 "gemini_text": os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash"),
-                "gemini_image_quality": os.getenv("GEMINI_IMAGE_QUALITY_MODEL", "gemini-3-pro-image"),
+                "gemini_image_quality": os.getenv(
+                    "GEMINI_IMAGE_QUALITY_MODEL", "gemini-3-pro-image"
+                ),
                 "openai_fast": os.getenv("OPENAI_FAST_MODEL", "gpt-5.4-nano"),
             },
             "image_provider": os.getenv("IMAGE_GENERATION_PROVIDER", "gemini"),
+            "video_provider": os.getenv("VIDEO_GENERATION_PROVIDER", "runway"),
             "orchestrator": "dagster",
             "image_styles": sorted(ALLOWED_IMAGE_STYLES),
             "image_quality_presets": sorted(ALLOWED_IMAGE_QUALITY_PRESETS),
+            "youtube": _youtube_auth_status(),
             "keys": {
-                "gemini": bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
+                "gemini": bool(
+                    os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+                ),
                 "openai": bool(os.getenv("OPENAI_API_KEY")),
-                "runpod": bool(os.getenv("RUNPOD_API_KEY") and os.getenv("RUNPOD_ENDPOINT_ID")),
+                "runpod": bool(
+                    os.getenv("RUNPOD_API_KEY") and os.getenv("RUNPOD_ENDPOINT_ID")
+                ),
                 "elevenlabs": bool(os.getenv("ELEVENLABS_API_KEY")),
+                "runway": bool(os.getenv("RUNWAY_API_KEY")),
             },
         }
     )
@@ -528,7 +2407,25 @@ def health() -> Response:
 @app.get("/api/sample-story")
 def sample_story() -> Response:
     story = STORY_PATH.read_text(encoding="utf-8")
-    return jsonify({"path": str(STORY_PATH), "characters": len(story), "story_text": story})
+    return jsonify(
+        {"path": str(STORY_PATH), "characters": len(story), "story_text": story}
+    )
+
+
+@app.post("/api/youtube/auth")
+def youtube_auth() -> Response:
+    previous = os.environ.get("YOUTUBE_ALLOW_OAUTH_FLOW")
+    os.environ["YOUTUBE_ALLOW_OAUTH_FLOW"] = "true"
+    try:
+        _build_youtube_service()
+    except RuntimeError as exc:
+        return jsonify({"status": "failed", "error": str(exc)}), 409
+    finally:
+        if previous is None:
+            os.environ.pop("YOUTUBE_ALLOW_OAUTH_FLOW", None)
+        else:
+            os.environ["YOUTUBE_ALLOW_OAUTH_FLOW"] = previous
+    return jsonify({"status": "authenticated", "youtube": _youtube_auth_status()})
 
 
 @app.post("/api/runs")
@@ -544,29 +2441,328 @@ def create_run() -> Response:
     if image_quality_preset not in ALLOWED_IMAGE_QUALITY_PRESETS:
         return jsonify({"error": "invalid image_quality_preset"}), 400
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
-    run_dir = RUNS_ROOT / run_id
-    with RUN_LOCK:
-        RUNS[run_id] = {
-            "id": run_id,
-            "status": "running",
-            "run_dir": str(run_dir),
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-            "retry_of": payload.get("retry_of"),
-            "image_style": image_style,
-            "image_quality_preset": image_quality_preset,
-            "log": ["run recebido pela UI"],
-            "summary": {},
-        }
+    run = _start_pipeline_run(
+        story_text=story_text,
+        image_style=image_style,
+        image_quality_preset=image_quality_preset,
+        retry_of=payload.get("retry_of"),
+    )
+    return jsonify({"id": run["id"], "status": "running", "run_dir": run["run_dir"]})
 
+
+@app.post("/api/runs/<run_id>/curation")
+def set_run_curation(run_id: str) -> Response:
+    payload = request.get_json(silent=True) or {}
+    scene_id = str(payload.get("scene_id", "")).strip()
+    status = str(payload.get("status", "")).strip()
+    note = str(payload.get("note", "")).strip()[:2000]
+    reason = str(payload.get("reason", "")).strip()
+    attempt_id = str(payload.get("attempt_id", "")).strip() or "attempt_1"
+    if not scene_id:
+        return jsonify({"error": "scene_id is required"}), 400
+    if status not in ALLOWED_CURATION_STATUSES:
+        return jsonify({"error": "invalid curation status"}), 400
+    if status in {"rejected", "retry_requested"} and not (note or reason):
+        return jsonify({"error": "reason or note is required"}), 400
+    if reason and reason not in CURATION_REASONS:
+        return jsonify({"error": "invalid curation reason"}), 400
+
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        summary = run.get("summary")
+        if not summary:
+            return jsonify({"error": "run summary is not ready"}), 409
+        curation = summary.setdefault("curation", {})
+        scenes = curation.setdefault("scenes", {})
+        existing = scenes.get(scene_id, {})
+        attempts = existing.get("attempts", [])
+        if status == "approved":
+            approved_attempt_id = attempt_id
+            for attempt in attempts:
+                if attempt.get("id") != approved_attempt_id:
+                    attempt["status"] = "superseded"
+                else:
+                    attempt["status"] = "approved"
+        else:
+            approved_attempt_id = existing.get("approved_attempt_id")
+        scenes[scene_id] = {
+            **existing,
+            "status": status,
+            "note": note,
+            "reason": reason,
+            "active_attempt_id": attempt_id,
+            "approved_attempt_id": approved_attempt_id,
+            "attempts": attempts,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        run["summary"] = _apply_curation_summary(summary)
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+        return jsonify(run)
+
+
+@app.post("/api/runs/<run_id>/attempt-active")
+def activate_attempt(run_id: str) -> Response:
+    payload = request.get_json(silent=True) or {}
+    scene_id = str(payload.get("scene_id", "")).strip()
+    attempt_id = str(payload.get("attempt_id", "")).strip()
+    if not scene_id:
+        return jsonify({"error": "scene_id is required"}), 400
+    if not attempt_id:
+        return jsonify({"error": "attempt_id is required"}), 400
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        if not run.get("summary"):
+            return jsonify({"error": "run summary is not ready"}), 409
+        try:
+            updated = _apply_attempt_to_summary(run, scene_id, attempt_id, False)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+        return jsonify(updated)
+
+
+@app.post("/api/runs/<run_id>/attempt-approval")
+def approve_attempt(run_id: str) -> Response:
+    payload = request.get_json(silent=True) or {}
+    scene_id = str(payload.get("scene_id", "")).strip()
+    attempt_id = str(payload.get("attempt_id", "")).strip()
+    if not scene_id:
+        return jsonify({"error": "scene_id is required"}), 400
+    if not attempt_id:
+        return jsonify({"error": "attempt_id is required"}), 400
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        if not run.get("summary"):
+            return jsonify({"error": "run summary is not ready"}), 409
+        try:
+            updated = _apply_attempt_to_summary(run, scene_id, attempt_id, True)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+        return jsonify(updated)
+
+
+@app.post("/api/runs/<run_id>/final-video-viewed")
+def mark_final_video_viewed(run_id: str) -> Response:
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        summary = run.get("summary")
+        if not summary:
+            return jsonify({"error": "run summary is not ready"}), 409
+        final_review = summary.setdefault("curation", {}).setdefault("final_review", {})
+        final_review["video_viewed"] = True
+        final_review["viewed_at"] = datetime.utcnow().isoformat()
+        run["summary"] = _apply_curation_summary(summary)
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+        return jsonify(run)
+
+
+@app.post("/api/runs/<run_id>/final-approval")
+def approve_final_cut(run_id: str) -> Response:
+    payload = request.get_json(silent=True) or {}
+    note = str(payload.get("note", "")).strip()[:2000]
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        summary = run.get("summary")
+        if not summary:
+            return jsonify({"error": "run summary is not ready"}), 409
+        summary = _apply_curation_summary(summary)
+        curation = summary.setdefault("curation", {})
+        if not curation.get("can_final_approve"):
+            return (
+                jsonify(
+                    {
+                        "error": "final approval blocked",
+                        "blockers": curation.get("blockers", []),
+                    }
+                ),
+                409,
+            )
+        final_review = curation.setdefault("final_review", {})
+        final_review.update(
+            {
+                "status": "final_approved",
+                "approved_at": datetime.utcnow().isoformat(),
+                "note": note,
+            }
+        )
+        run["summary"] = _apply_curation_summary(summary)
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+        return jsonify(run)
+
+
+@app.post("/api/runs/<run_id>/publish-gate")
+def publish_gate(run_id: str) -> Response:
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        summary = run.get("summary")
+        if not summary:
+            return jsonify({"error": "run summary is not ready"}), 409
+        summary = _apply_curation_summary(summary)
+        curation = summary.get("curation", {})
+        publication = summary.setdefault("publication", {})
+        run["summary"] = summary
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+        if not curation.get("can_publish"):
+            return jsonify(
+                {
+                    "blocked": True,
+                    "status": curation.get("status"),
+                    "blockers": curation.get("blockers", []),
+                }
+            )
+        if publication.get("status") == "uploading":
+            return jsonify(
+                {
+                    "blocked": False,
+                    "status": "uploading",
+                    "message": "youtube upload already running",
+                }
+            )
+        if publication.get("status") == "published":
+            return jsonify(
+                {
+                    "blocked": False,
+                    "status": "published",
+                    "url": publication.get("url"),
+                    "video_id": publication.get("video_id"),
+                }
+            )
+        publication.update(
+            {
+                "status": "queued",
+                "queued_at": datetime.utcnow().isoformat(),
+            }
+        )
+        run["summary"] = summary
+        _persist_summary(run)
     thread = threading.Thread(
-        target=_run_pipeline,
-        args=(run_id, story_text, image_style, image_quality_preset),
+        target=_run_youtube_upload,
+        args=(run_id,),
         daemon=True,
     )
     thread.start()
-    return jsonify({"id": run_id, "status": "running", "run_dir": str(run_dir)})
+    _append_log(run_id, "upload YouTube enfileirado")
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is not None:
+            return jsonify(
+                {
+                    "blocked": False,
+                    "status": "queued",
+                    "message": "youtube upload queued",
+                    "run": run,
+                }
+            )
+        return (
+            jsonify(
+                {
+                    "blocked": True,
+                    "status": "run_missing_after_queue",
+                    "blockers": ["run not found after queue"],
+                }
+            ),
+            404,
+        )
+
+
+@app.post("/api/runs/<run_id>/retry-scene")
+def retry_scene(run_id: str) -> Response:
+    payload = request.get_json(silent=True) or {}
+    scene_id = str(payload.get("scene_id", "")).strip()
+    note = str(payload.get("note", "")).strip()[:2000]
+    reason = str(payload.get("reason", "")).strip()
+    scope = str(payload.get("scope", "image_video")).strip()
+    if not scene_id:
+        return jsonify({"error": "scene_id is required"}), 400
+    if scope not in RETRY_SCOPES:
+        return jsonify({"error": "invalid retry scope"}), 400
+    if not (note or reason):
+        return jsonify({"error": "reason or note is required"}), 400
+    if reason and reason not in CURATION_REASONS:
+        return jsonify({"error": "invalid curation reason"}), 400
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        summary = run.get("summary") or {}
+        if not summary:
+            return jsonify({"error": "run summary is not ready"}), 409
+        curation = summary.setdefault("curation", {})
+        scenes = curation.setdefault("scenes", {})
+        existing = scenes.get(scene_id, {})
+        scenes[scene_id] = {
+            **existing,
+            "status": "retry_requested",
+            "retry_status": "queued",
+            "note": note,
+            "reason": reason,
+            "retry_scope": scope,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        run["summary"] = _apply_curation_summary(summary)
+        run["updated_at"] = datetime.utcnow().isoformat()
+        _persist_summary(run)
+
+    retry_target = (
+        _run_selective_audio_retry if scope == "audio" else _run_selective_visual_retry
+    )
+    thread = threading.Thread(
+        target=retry_target,
+        args=(run_id, scene_id, note, reason, scope),
+        daemon=True,
+    )
+    thread.start()
+    _append_log(run_id, f"retry seletivo enfileirado para cena {scene_id}: {scope}")
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            return jsonify({"error": "run not found"}), 404
+        return jsonify(
+            {
+                "id": run["id"],
+                "status": run["status"],
+                "run_dir": run["run_dir"],
+                "summary": run.get("summary", {}),
+            }
+        )
+
+
+@app.get("/api/runs/latest")
+def get_latest_run() -> Response:
+    with RUN_LOCK:
+        if RUNS:
+            latest = max(RUNS.values(), key=lambda item: item.get("updated_at", ""))
+            return jsonify(latest)
+    summary_files = sorted(
+        RUNS_ROOT.glob("*/pipeline_summary.json"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    if not summary_files:
+        return jsonify({"error": "run not found"}), 404
+    try:
+        return jsonify(_hydrate_run_from_summary(summary_files[0]))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.get("/api/runs/<run_id>")
