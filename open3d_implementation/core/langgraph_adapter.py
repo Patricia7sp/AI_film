@@ -8,10 +8,12 @@ import base64
 import importlib
 import json
 import hashlib
+import math
 import os
 import re
 import shutil
 import subprocess
+import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -224,6 +226,14 @@ def _story_has_any(story_text: str, terms: List[str]) -> bool:
 def _text_has_any(text: str, terms: List[str]) -> bool:
     lowered = text.lower()
     return any(term in lowered for term in terms)
+
+
+def _text_has_phrase(text: str, term: str) -> bool:
+    return bool(re.search(rf"(?<!\w){re.escape(term.lower())}(?!\w)", text.lower()))
+
+
+def _text_has_any_phrase(text: str, terms: List[str]) -> bool:
+    return any(_text_has_phrase(text, term) for term in terms)
 
 
 def _story_excerpt_around(
@@ -485,10 +495,87 @@ def _scene_visual_object_text(scene: Dict[str, Any]) -> str:
     return must_include.lower()
 
 
+def _hero_object_requirements(scene: Dict[str, Any]) -> List[Dict[str, str]]:
+    must_include = " ".join(str(item) for item in scene.get("must_include", []) if item)
+    # Use only the author's scene intent and explicit required objects. Generated
+    # prompts contain negative examples such as "no coin trick", which must not
+    # become false-positive hero-object requirements.
+    scene_text = " ".join(
+        [
+            str(scene.get("description") or ""),
+            must_include,
+        ]
+    ).lower()
+    hero_objects: List[Dict[str, str]] = []
+
+    if _text_has_any_phrase(scene_text, ["formigueiro", "formigas", "anthill", "ants"]):
+        hero_objects.append(
+            {
+                "name": "small anthill",
+                "placement": "dominant foreground detail in grass or soil",
+                "minimum_legibility": "individual mound texture and Alice looking at it must be readable without zooming",
+                "camera": "low ground-level object-first composition",
+            }
+        )
+
+    if _text_has_any_phrase(
+        scene_text,
+        [
+            "açucareiro",
+            "acucareiro",
+            "ratinho",
+            "rato branco",
+            "sugar bowl",
+            "white mouse",
+        ],
+    ):
+        hero_objects.append(
+            {
+                "name": "white mouse emerging from open sugar bowl",
+                "placement": "central lower-third hero object on the tea table",
+                "minimum_legibility": "mouse head/body and open sugar bowl rim must be clearly recognizable at thumbnail size",
+                "camera": "object-first medium close insert with Alice and Ludovico still visible as context",
+            }
+        )
+
+    small_object_terms = [
+        ("key", "key", "central visible story prop, not hidden in a hand"),
+        ("chave", "key", "central visible story prop, not hidden in a hand"),
+        ("letter", "letter", "readable physical letter shape, no fake text"),
+        ("carta", "letter", "readable physical letter shape, no fake text"),
+        ("watch", "watch", "foreground readable watch or pocket watch"),
+        ("relógio", "watch", "foreground readable watch or pocket watch"),
+        ("relogio", "watch", "foreground readable watch or pocket watch"),
+        ("bottle", "bottle", "foreground readable small bottle"),
+        ("frasco", "bottle", "foreground readable small bottle"),
+        ("vial", "vial", "foreground readable small vial"),
+        ("coin", "coin", "foreground readable coin"),
+        ("moeda", "coin", "foreground readable coin"),
+        ("card", "card", "foreground readable card shape, no fake text"),
+        ("cartão", "card", "foreground readable card shape, no fake text"),
+        ("cartao", "card", "foreground readable card shape, no fake text"),
+    ]
+    seen_names = {item["name"] for item in hero_objects}
+    for term, name, placement in small_object_terms:
+        if _text_has_phrase(scene_text, term) and name not in seen_names:
+            hero_objects.append(
+                {
+                    "name": name,
+                    "placement": placement,
+                    "minimum_legibility": "the object must be large enough to identify in the full 9:16 frame without zooming",
+                    "camera": "object-first insert or medium-close composition",
+                }
+            )
+            seen_names.add(name)
+
+    return hero_objects
+
+
 def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
     scene_text = _scene_positive_text(scene)
     visual_object_text = _scene_visual_object_text(scene)
     full_scene_text = _scene_text(scene)
+    hero_objects = _hero_object_requirements(scene)
     required: List[str] = []
     forbidden: List[str] = [
         "visible text, typography, subtitles, captions, watermark, signature",
@@ -595,6 +682,15 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
             "The white mouse emerging from the sugar bowl is mandatory and must be visible; do not substitute it with a coin, napkin, teapot or vague magic trick. Keep a medium-wide tea-table frame so Alice, Ludovico, the sugar bowl and the mouse are readable together."
         )
 
+    if hero_objects:
+        for hero_object in hero_objects:
+            required.append(
+                f"hero object legibility: {hero_object['name']} must be {hero_object['placement']}; {hero_object['minimum_legibility']}"
+            )
+        animal_rules.append(
+            "Small required story objects are hero objects: if present but too small, hidden, blurred, cropped, or visually ambiguous, the image fails semantic QA."
+        )
+
     if has_rabbit_hole:
         required.append(
             "dark rabbit hole opening in the ground, roots or grassy embankment"
@@ -626,6 +722,7 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
         "forbidden": sorted(set(forbidden)),
         "character_rules": character_rules,
         "animal_rules": animal_rules,
+        "hero_objects": hero_objects,
         "raw_scene_terms": full_scene_text[:1200],
     }
 
@@ -802,10 +899,10 @@ def _shot_plan(scene: Dict[str, Any]) -> Dict[str, str]:
         ["açucareiro", "acucareiro", "ratinho", "white mouse", "sugar bowl"],
     ):
         return {
-            "shot_type": "medium-wide interior two-shot",
-            "camera_angle": "eye-level table camera, slightly off-center from the sugar bowl",
-            "blocking": "Alice and Ludovico lean in from opposite sides, hands visible, sugar bowl centered in lower third",
-            "focal_priority": "open sugar bowl and white mouse first, faces second, tea service third",
+            "shot_type": "object-first medium-close insert inside a readable two-shot",
+            "camera_angle": "eye-level table camera close enough that the sugar bowl and mouse are readable at thumbnail size",
+            "blocking": "open sugar bowl and white mouse dominate the central lower third; Alice and Ludovico lean in from opposite sides as contextual faces and hands",
+            "focal_priority": "white mouse and open sugar bowl first, Alice and Ludovico second, tea service third",
         }
     if _text_has_any(scene_text, ["toca", "rabbit hole", "coelho"]):
         return {
@@ -871,6 +968,22 @@ def _build_image_prompt(
     scene_text = _scene_text(scene)
     scene_contract = _build_scene_contract(scene)
     shot_plan = _shot_plan(scene)
+    hero_objects = scene_contract.get("hero_objects", [])
+    hero_object_clause = ""
+    if hero_objects:
+        hero_object_lines = [
+            (
+                f"{item['name']} => placement: {item['placement']}; "
+                f"minimum legibility: {item['minimum_legibility']}; camera: {item['camera']}"
+            )
+            for item in hero_objects
+        ]
+        hero_object_clause = (
+            "Hero object mandate: small required story objects must be staged as readable hero objects, "
+            "not incidental background details. If the object would not be identifiable in a thumbnail, "
+            "move the camera closer, enlarge the object in frame, simplify surrounding props, and keep it "
+            f"in sharp focus. Required hero objects: {' | '.join(hero_object_lines)}. "
+        )
     contract_rules = []
     if "alice" in scene_text:
         contract_rules.append(
@@ -920,6 +1033,7 @@ def _build_image_prompt(
         f"Scene contract: {' '.join(contract_rules) if contract_rules else 'Obey must_include and must_not_include literally.'} "
         f"Structured required elements: {'; '.join(scene_contract['required'])}. "
         f"Structured forbidden elements: {'; '.join(scene_contract['forbidden'])}. "
+        f"{hero_object_clause}"
         f"Character continuity rules: {'; '.join(scene_contract['character_rules']) or 'keep the protagonist visually consistent with the film bible'}. "
         f"Animal/object rules: {'; '.join(scene_contract['animal_rules']) or 'only show animals and objects explicitly requested by this scene'}. "
         f"Scene description: {description}. "
@@ -1761,6 +1875,14 @@ def _evaluate_image_semantics(
         return metrics
 
     scene_contract = _build_scene_contract(scene)
+    hero_objects = scene_contract.get("hero_objects", [])
+    hero_object_qa = (
+        "\nObjetos pequenos críticos desta cena:\n"
+        + json.dumps(hero_objects, ensure_ascii=False, indent=2)
+        + "\nSe qualquer hero object estiver ausente, pequeno demais, cortado, escondido, desfocado, confundível com outro objeto, ou só reconhecível com zoom, marque accepted=false e critical_failures deve incluir hero_object_illegible ou hero_object_missing.\n"
+        if hero_objects
+        else ""
+    )
     try:
         from google import genai
         from google.genai import errors, types
@@ -1792,6 +1914,7 @@ Bíblia visual fixa:
 
 Contrato estruturado da cena:
 {json.dumps(scene_contract, ensure_ascii=False, indent=2)}
+{hero_object_qa}
 
 Estilo escolhido: {_resolve_image_style(style_key)["label"]}
 Prompt enviado ao gerador:
@@ -1804,19 +1927,23 @@ Regras de aceite:
 - Se a cena pede gato/filhote no colo, não aceite animal fora do colo.
 - Se a cena não pede gato/filhote, qualquer gato/filhote é critical failure.
 - Se a cena inclui Alice, avalie se ela preserva idade, cabelo, figurino e família facial do filme.
+- Se a cena tem hero_objects, eles precisam ser legíveis no frame completo sem zoom; presença ambígua ou pequena demais é critical failure.
 
 Rubrica obrigatória:
 - 95-100: todos os required estão claramente visíveis, nenhum forbidden aparece, personagem consistente.
 - 88-94: cena fiel com pequena ambiguidade de enquadramento, mas sem objeto obrigatório ausente.
-- 70-87: cena bonita, porém algum required está ambíguo, pequeno demais ou parcialmente oculto.
+- 70-87: cena bonita, porém algum required não-crítico está ambíguo, pequeno demais ou parcialmente oculto.
 - 40-69: objeto/personagem obrigatório ausente ou substituído.
 - 0-39: imagem errada, colagem, texto, anatomia grave ou falha crítica.
+Para hero_objects: se o objeto estiver pequeno demais, oculto, desfocado ou ambíguo, a pontuação máxima é 69 e accepted=false.
 Se todos os required estiverem visíveis e não houver critical_failures, semantic_score deve ser pelo menos 88 e accepted=true.
 
 Retorne somente JSON válido, sem markdown:
 {{
   "semantic_score": 0-100,
   "accepted": true/false,
+  "hero_object_legibility": true/false,
+  "hero_object_notes": "descrição curta do que está legível ou falhou",
   "issues": ["issue_code"],
   "critical_failures": ["failure_code"],
   "retry_prompt": "correção objetiva em inglês para regenerar a imagem"
@@ -1837,6 +1964,7 @@ Retorne somente JSON válido, sem markdown:
 Return only valid JSON.
 Evaluate this image against this scene contract:
 {json.dumps(scene_contract, ensure_ascii=False)}
+{hero_object_qa}
 
 Selected style: {_resolve_image_style(style_key)["label"]}
 Scene: {json.dumps(scene, ensure_ascii=False)}
@@ -1844,15 +1972,18 @@ Scene: {json.dumps(scene, ensure_ascii=False)}
 Rubric:
 - 95-100: all required elements are clearly visible and no forbidden elements appear.
 - 88-94: faithful scene with only minor framing ambiguity.
-- 70-87: visually good but one required element is ambiguous, small or partially hidden.
+- 70-87: visually good but one non-critical required element is ambiguous, small or partially hidden.
 - 40-69: required object or character is missing or substituted.
 - 0-39: wrong image, text artifact, severe anatomy issue or critical failure.
+For hero_objects, if the object is too small, hidden, blurred or ambiguous in the full frame, max score is 69 and accepted=false.
 If all required elements are visible and critical_failures is empty, semantic_score must be at least 88 and accepted=true.
 
 JSON schema:
 {{
   "semantic_score": 0-100,
   "accepted": true/false,
+  "hero_object_legibility": true/false,
+  "hero_object_notes": "short note",
   "issues": ["issue_code"],
   "critical_failures": ["failure_code"],
   "retry_prompt": "short English regeneration instruction"
@@ -1877,8 +2008,20 @@ JSON schema:
         critical_failures = parsed.get("critical_failures", [])
         issue_codes = [str(issue) for issue in issues if issue]
         critical_codes = [str(issue) for issue in critical_failures if issue]
+        hero_object_legibility = parsed.get("hero_object_legibility")
+        hero_object_notes = str(parsed.get("hero_object_notes", ""))[:500]
+        if hero_objects and hero_object_legibility is False:
+            if "hero_object_illegible" not in critical_codes:
+                critical_codes.append("hero_object_illegible")
+            if "hero_object_legibility_failed" not in issue_codes:
+                issue_codes.append("hero_object_legibility_failed")
         if critical_codes:
             score = min(score, 79)
+        if hero_objects and any(
+            code in critical_codes
+            for code in ("hero_object_illegible", "hero_object_missing")
+        ):
+            score = min(score, 69)
         metrics.update(
             {
                 "semantic_score": score,
@@ -1887,6 +2030,13 @@ JSON schema:
                 and score >= _image_semantic_min_score(),
                 "issues": [*issue_codes, *critical_codes],
                 "critical_failures": critical_codes,
+                "hero_objects": hero_objects,
+                "hero_object_legibility": (
+                    bool(hero_object_legibility)
+                    if hero_object_legibility is not None
+                    else None
+                ),
+                "hero_object_notes": hero_object_notes,
                 "retry_prompt": str(parsed.get("retry_prompt", ""))[:1000],
             }
         )
@@ -1932,6 +2082,9 @@ def _combine_image_quality(
         "semantic_critical_failures": semantic_metrics.get("critical_failures", []),
         "semantic_retry_prompt": semantic_metrics.get("retry_prompt", ""),
         "semantic_qa_model": semantic_metrics.get("model"),
+        "hero_objects": semantic_metrics.get("hero_objects", []),
+        "hero_object_legibility": semantic_metrics.get("hero_object_legibility"),
+        "hero_object_notes": semantic_metrics.get("hero_object_notes", ""),
         "quality_score": round(min(100, combined_score), 1),
         "issues": issues,
     }
@@ -2203,6 +2356,97 @@ def _probe_media_quality(media_path: str, media_type: str) -> Dict[str, Any]:
     return metrics
 
 
+def _audio_loudness_target_lufs() -> float:
+    return _safe_float(os.getenv("AUDIO_LOUDNESS_TARGET_LUFS", "-14.0"))
+
+
+def _measure_audio_loudness(audio_path: str) -> Dict[str, Any]:
+    if not shutil.which("ffmpeg"):
+        return {"issues": ["ffmpeg_unavailable_for_loudness"]}
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            audio_path,
+            "-af",
+            (
+                "loudnorm=I="
+                f"{_audio_loudness_target_lufs():.1f}:TP=-1.5:LRA=11:"
+                "print_format=json"
+            ),
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {"issues": ["loudness_probe_failed"]}
+    match = re.search(r"\{\s*\"input_i\".*?\}", result.stderr, flags=re.S)
+    if not match:
+        return {"issues": ["loudness_probe_missing_json"]}
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {"issues": ["loudness_probe_invalid_json"]}
+    return {
+        "input_i_lufs": _safe_float(payload.get("input_i")),
+        "input_tp_db": _safe_float(payload.get("input_tp")),
+        "input_lra_lu": _safe_float(payload.get("input_lra")),
+        "target_i_lufs": _audio_loudness_target_lufs(),
+        "normalization": "loudnorm",
+        "issues": [],
+    }
+
+
+def _audio_waveform_samples(audio_path: str, bins: int = 48) -> List[float]:
+    if bins <= 0 or not shutil.which("ffmpeg"):
+        return []
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            audio_path,
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-f",
+            "s16le",
+            "-",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return []
+    sample_count = len(result.stdout) // 2
+    if sample_count <= 0:
+        return []
+    samples = struct.unpack(f"<{sample_count}h", result.stdout[: sample_count * 2])
+    chunk_size = max(1, math.ceil(sample_count / bins))
+    values: List[float] = []
+    for start in range(0, sample_count, chunk_size):
+        chunk = samples[start : start + chunk_size]
+        if not chunk:
+            continue
+        rms = math.sqrt(
+            sum(float(sample) * float(sample) for sample in chunk) / len(chunk)
+        )
+        values.append(rms)
+    peak = max(values) if values else 0
+    if peak <= 0:
+        return [0.0 for _ in range(min(bins, len(values) or bins))]
+    return [round(min(1.0, value / peak), 3) for value in values[:bins]]
+
+
 def _response_error_detail(response: requests.Response) -> str:
     try:
         payload = response.json()
@@ -2240,6 +2484,340 @@ def _elevenlabs_remaining_characters(api_key: str) -> int | None:
     if character_limit <= 0:
         return None
     return max(0, character_limit - character_count)
+
+
+def _premium_audio_narration(scene: Dict[str, Any]) -> str:
+    scene_text = _scene_text(scene)
+    description = str(scene.get("description") or scene.get("prompt") or "").strip()
+
+    if _text_has_any_phrase(scene_text, ["açucareiro", "ratinho", "white mouse"]):
+        return (
+            "À mesa de chá, Ludovico ergue a tampa do açucareiro. "
+            "Alice prende a respiração quando um ratinho branco surge, pequeno e vivo, "
+            "no brilho da prata."
+        )
+    if _text_has_any_phrase(scene_text, ["formigueiro", "anthill", "ants"]):
+        return (
+            "No jardim silencioso, Alice se aproxima das raízes antigas. "
+            "Ali, quase escondido na grama, um pequeno formigueiro transforma o mundo "
+            "em descoberta."
+        )
+    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        return (
+            "Entre a grama e as raízes, Alice encontra uma abertura escura no barranco. "
+            "A toca parece pequena demais para guardar um segredo tão grande."
+        )
+
+    cleaned = re.sub(r"^\s*cena\s+\d+\s*[:.-]\s*", "", description, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "Alice observa o mundo ao redor como se cada detalhe pudesse abrir uma porta."
+    if len(cleaned) <= 230:
+        return cleaned
+    cutoff = cleaned[:230].rsplit(" ", 1)[0].strip(" ,;:")
+    return f"{cutoff}."
+
+
+def _premium_audio_direction(scene: Dict[str, Any]) -> Dict[str, Any]:
+    scene_text = _scene_text(scene)
+    if _text_has_any_phrase(scene_text, ["açucareiro", "ratinho", "white mouse"]):
+        return {
+            "tone": "wonder, suspense leve, calor íntimo de sala de chá",
+            "pace": "pausado, com pausa antes da revelação do ratinho",
+            "delivery": "narrador cinematográfico em português brasileiro, expressivo sem teatralizar",
+        }
+    if _text_has_any_phrase(scene_text, ["formigueiro", "anthill", "ants"]):
+        return {
+            "tone": "curiosidade delicada, observação infantil, assombro quieto",
+            "pace": "lento e contemplativo",
+            "delivery": "narrador cinematográfico em português brasileiro, voz próxima e precisa",
+        }
+    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        return {
+            "tone": "mistério, convite para aventura, tensão suave",
+            "pace": "crescendo discreto",
+            "delivery": "narrador cinematográfico em português brasileiro, íntimo e envolvente",
+        }
+    return {
+        "tone": "cinematográfico, técnico, premium",
+        "pace": "natural, com pausas curtas entre imagens importantes",
+        "delivery": "narrador cinematográfico em português brasileiro, claro e elegante",
+    }
+
+
+def _elevenlabs_voice_settings() -> Dict[str, Any]:
+    return {
+        "stability": _safe_float(os.getenv("ELEVENLABS_STABILITY", "0.62")),
+        "similarity_boost": _safe_float(
+            os.getenv("ELEVENLABS_SIMILARITY_BOOST", "0.82")
+        ),
+        "style": _safe_float(os.getenv("ELEVENLABS_STYLE", "0.35")),
+        "use_speaker_boost": os.getenv(
+            "ELEVENLABS_USE_SPEAKER_BOOST",
+            "true",
+        )
+        .strip()
+        .lower()
+        not in {"0", "false", "no"},
+    }
+
+
+def _scene_voice_role(scene: Dict[str, Any]) -> str:
+    explicit_role = str(
+        scene.get("voice_role")
+        or scene.get("speaker")
+        or scene.get("character_voice")
+        or ""
+    ).strip()
+    if explicit_role:
+        return explicit_role
+    return "narrator"
+
+
+def _voice_env_key(role: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", role).strip("_").upper()
+    return f"ELEVENLABS_VOICE_ID_{normalized or 'NARRATOR'}"
+
+
+def _elevenlabs_voice_id_for_scene(scene: Dict[str, Any]) -> tuple[str, str]:
+    role = _scene_voice_role(scene)
+    voice_id = os.getenv(_voice_env_key(role), "").strip()
+    if not voice_id and role.lower() != "narrator":
+        voice_id = os.getenv("ELEVENLABS_VOICE_ID_NARRATOR", "").strip()
+    if not voice_id:
+        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us").strip()
+    return voice_id, role
+
+
+def _ambient_audio_enabled() -> bool:
+    return os.getenv("AUDIO_AMBIENT_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _ambient_audio_profile(scene: Dict[str, Any]) -> Dict[str, Any]:
+    scene_text = _scene_text(scene)
+    if _text_has_any_phrase(scene_text, ["açucareiro", "mesa de chá", "tea"]):
+        return {
+            "label": "tea_room_air",
+            "frequency": 392,
+            "noise_color": "pink",
+            "bed_volume": 0.055,
+        }
+    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        return {
+            "label": "mysterious_grass_rustle",
+            "frequency": 196,
+            "noise_color": "brown",
+            "bed_volume": 0.06,
+        }
+    return {
+        "label": "garden_air",
+        "frequency": 288,
+        "noise_color": "pink",
+        "bed_volume": 0.05,
+    }
+
+
+def _render_ambient_bed(
+    scene: Dict[str, Any],
+    output_path: str,
+    duration_seconds: float,
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "path": output_path,
+        "enabled": _ambient_audio_enabled(),
+        "valid": False,
+        "profile": _ambient_audio_profile(scene),
+        "issues": [],
+    }
+    if not metrics["enabled"]:
+        metrics["issues"].append("ambient_audio_disabled")
+        return metrics
+    if not shutil.which("ffmpeg"):
+        metrics["issues"].append("ffmpeg_unavailable_for_ambient")
+        return metrics
+    duration = max(0.5, _safe_float(duration_seconds))
+    profile = metrics["profile"]
+    fade_out_start = max(0.0, duration - 0.8)
+    filter_complex = (
+        "[0:a]highpass=f=140,lowpass=f=2600,"
+        f"volume={_safe_float(profile.get('bed_volume'))}[noise];"
+        "[1:a]volume=0.012[tone];"
+        "[noise][tone]amix=inputs=2:normalize=0,"
+        "afade=t=in:st=0:d=0.45,"
+        f"afade=t=out:st={fade_out_start:.2f}:d=0.8[out]"
+    )
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            (
+                "anoisesrc="
+                f"color={profile.get('noise_color')}:"
+                "amplitude=0.018:sample_rate=44100"
+            ),
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency={_safe_int(profile.get('frequency'), 288)}:sample_rate=44100",
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[out]",
+            "-t",
+            f"{duration:.3f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        metrics["issues"].append("ambient_audio_render_failed")
+        metrics["error"] = result.stderr[:500]
+        return metrics
+    probed = _probe_media_quality(output_path, "audio")
+    metrics.update(probed)
+    metrics["profile"] = profile
+    return metrics
+
+
+def _enhance_premium_audio(
+    input_path: str,
+    output_path: str,
+    scene: Dict[str, Any],
+) -> Dict[str, Any]:
+    base_quality = _probe_media_quality(input_path, "audio")
+    if not bool(base_quality.get("valid")) or not shutil.which("ffmpeg"):
+        return {
+            **base_quality,
+            "enhanced": False,
+            "loudness": _measure_audio_loudness(input_path),
+            "waveform": _audio_waveform_samples(input_path),
+        }
+
+    duration = _safe_float(base_quality.get("duration_seconds"))
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ambient_path = output.with_name(f"{output.stem}_ambient.m4a")
+    ambient = _render_ambient_bed(scene, str(ambient_path), duration)
+    target = _audio_loudness_target_lufs()
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+    ]
+    filter_complex = (
+        "[0:a]loudnorm=" f"I={target:.1f}:TP=-1.5:LRA=11," "aresample=44100[out]"
+    )
+    if bool(ambient.get("valid")):
+        command.extend(["-i", str(ambient_path)])
+        filter_complex = (
+            "[0:a]volume=1.0[voice];"
+            "[1:a]volume=0.18[bed];"
+            "[voice][bed]amix=inputs=2:duration=first:normalize=0,"
+            f"loudnorm=I={target:.1f}:TP=-1.5:LRA=11,"
+            "aresample=44100[out]"
+        )
+    command.extend(
+        [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[out]",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "128k",
+            str(output),
+        ]
+    )
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        ambient_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if result.returncode != 0:
+        fallback = _probe_media_quality(input_path, "audio")
+        fallback.update(
+            {
+                "enhanced": False,
+                "ambient": ambient,
+                "loudness": _measure_audio_loudness(input_path),
+                "waveform": _audio_waveform_samples(input_path),
+                "issues": [
+                    *fallback.get("issues", []),
+                    "premium_audio_enhancement_failed",
+                ],
+                "error": result.stderr[:500],
+            }
+        )
+        return fallback
+    enhanced = _probe_media_quality(str(output), "audio")
+    enhanced.update(
+        {
+            "enhanced": True,
+            "ambient": ambient,
+            "loudness": _measure_audio_loudness(str(output)),
+            "waveform": _audio_waveform_samples(str(output)),
+        }
+    )
+    return enhanced
+
+
+def _audio_quality_gate(
+    media_quality: Dict[str, Any],
+    narration_text: str,
+    generation_method: str,
+) -> Dict[str, Any]:
+    gated = {**media_quality}
+    issues = [str(issue) for issue in gated.get("issues", []) if issue]
+    duration = _safe_float(gated.get("duration_seconds"))
+    bit_rate = _safe_int(gated.get("bit_rate"), 0)
+    audio_path = str(gated.get("path") or "").strip()
+
+    if audio_path and not gated.get("loudness"):
+        gated["loudness"] = _measure_audio_loudness(audio_path)
+    if audio_path and not gated.get("waveform"):
+        gated["waveform"] = _audio_waveform_samples(audio_path)
+
+    if re.match(r"^\s*cena\s+\d+\s*[:.-]", narration_text, flags=re.I):
+        issues.append("debug_scene_label_in_narration")
+        gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 82.0)
+    if generation_method != "elevenlabs":
+        issues.append("non_premium_voice_provider")
+        gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 72.0)
+    if duration < 2.5:
+        issues.append("audio_too_short_for_premium_narration")
+        gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 78.0)
+    if bit_rate and bit_rate < 96000:
+        issues.append("premium_audio_bitrate_below_96k")
+        gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 84.0)
+    loudness = gated.get("loudness") or {}
+    input_i = _safe_float(loudness.get("input_i_lufs"))
+    target_i = _safe_float(loudness.get("target_i_lufs"), _audio_loudness_target_lufs())
+    if generation_method == "elevenlabs" and input_i and abs(input_i - target_i) > 3.0:
+        issues.append("loudness_outside_video_standard")
+        gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 88.0)
+
+    gated["issues"] = sorted(set(issues))
+    gated["premium_audio"] = (
+        generation_method == "elevenlabs"
+        and not gated["issues"]
+        and _safe_float(gated.get("quality_score")) >= 88.0
+    )
+    return gated
 
 
 def _local_tts_enabled() -> bool:
@@ -3366,8 +3944,9 @@ Retorne em formato JSON:
                     os.makedirs("output", exist_ok=True)
                     audio_path = f"output/scene_{scene['scene_id']}_audio.mp3"
 
-                    # Generate audio using ElevenLabs
-                    narration_text = f"Cena {scene['scene_id']}: {scene['description']}"
+                    # Generate premium narration using ElevenLabs
+                    narration_text = _premium_audio_narration(scene)
+                    audio_direction = _premium_audio_direction(scene)
                     text_characters = len(narration_text)
                     failure_reason = ""
 
@@ -3391,15 +3970,10 @@ Retorne em formato JSON:
                                 "ELEVENLABS_MODEL_ID",
                                 "eleven_multilingual_v2",
                             ),
-                            "voice_settings": {
-                                "stability": 0.5,
-                                "similarity_boost": 0.5,
-                            },
+                            "voice_settings": _elevenlabs_voice_settings(),
                         }
 
-                        voice_id = os.getenv(
-                            "ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us"
-                        )
+                        voice_id, voice_role = _elevenlabs_voice_id_for_scene(scene)
                         voice_url = (
                             "https://api.elevenlabs.io/v1/text-to-speech/" f"{voice_id}"
                         )
@@ -3440,11 +4014,43 @@ Retorne em formato JSON:
 
                                 if response.status_code == 200:
                                     # Save real audio
-                                    with open(audio_path, "wb") as f:
+                                    raw_audio_path = str(
+                                        Path(audio_path).with_name(
+                                            f"{Path(audio_path).stem}_raw.mp3"
+                                        )
+                                    )
+                                    with open(raw_audio_path, "wb") as f:
                                         f.write(response.content)
 
-                                    media_quality = _probe_media_quality(
-                                        audio_path, "audio"
+                                    media_quality = _enhance_premium_audio(
+                                        raw_audio_path,
+                                        audio_path,
+                                        scene,
+                                    )
+                                    if not bool(media_quality.get("valid")):
+                                        shutil.copyfile(raw_audio_path, audio_path)
+                                        media_quality = _probe_media_quality(
+                                            audio_path, "audio"
+                                        )
+                                        media_quality.update(
+                                            {
+                                                "enhanced": False,
+                                                "loudness": _measure_audio_loudness(
+                                                    audio_path
+                                                ),
+                                                "waveform": _audio_waveform_samples(
+                                                    audio_path
+                                                ),
+                                            }
+                                        )
+                                    try:
+                                        Path(raw_audio_path).unlink(missing_ok=True)
+                                    except OSError:
+                                        pass
+                                    media_quality = _audio_quality_gate(
+                                        media_quality,
+                                        narration_text,
+                                        "elevenlabs",
                                     )
                                     if bool(media_quality.get("valid")):
                                         audio_files.append(
@@ -3452,7 +4058,9 @@ Retorne em formato JSON:
                                                 "scene_id": scene["scene_id"],
                                                 "audio_path": audio_path,
                                                 "text": narration_text,
+                                                "voice_direction": audio_direction,
                                                 "voice_id": voice_id,
+                                                "voice_role": voice_role,
                                                 "generation_method": "elevenlabs",
                                             }
                                         )
@@ -3460,6 +4068,9 @@ Retorne em formato JSON:
                                             {
                                                 "scene_id": scene["scene_id"],
                                                 "generation_method": "elevenlabs",
+                                                "voice_direction": audio_direction,
+                                                "voice_id": voice_id,
+                                                "voice_role": voice_role,
                                                 **media_quality,
                                             }
                                         )
@@ -3467,8 +4078,14 @@ Retorne em formato JSON:
                                             {
                                                 "scene_id": scene["scene_id"],
                                                 "voice_id": voice_id,
+                                                "voice_role": voice_role,
                                                 "model_id": data["model_id"],
                                                 "text_characters": text_characters,
+                                                "voice_direction": audio_direction,
+                                                "premium_audio": media_quality.get(
+                                                    "premium_audio",
+                                                    False,
+                                                ),
                                                 "quality_score": media_quality.get(
                                                     "quality_score",
                                                     0,
@@ -3525,12 +4142,18 @@ Retorne em formato JSON:
                     generation_method = (
                         "local_tts" if media_quality.get("valid") else "failed"
                     )
+                    media_quality = _audio_quality_gate(
+                        media_quality,
+                        narration_text,
+                        generation_method,
+                    )
                     if bool(media_quality.get("valid")):
                         audio_files.append(
                             {
                                 "scene_id": scene["scene_id"],
                                 "audio_path": audio_path,
                                 "text": narration_text,
+                                "voice_direction": audio_direction,
                                 "voice_id": os.getenv(
                                     "AUDIO_LOCAL_TTS_VOICE",
                                     "Luciana",
@@ -3554,6 +4177,7 @@ Retorne em formato JSON:
                             "scene_id": scene["scene_id"],
                             "generation_method": generation_method,
                             "fallback_reason": failure_reason,
+                            "voice_direction": audio_direction,
                             **media_quality,
                         }
                     )
@@ -3567,6 +4191,11 @@ Retorne em formato JSON:
                             ),
                             "model_id": generation_method,
                             "text_characters": text_characters,
+                            "voice_direction": audio_direction,
+                            "premium_audio": media_quality.get(
+                                "premium_audio",
+                                False,
+                            ),
                             "quality_score": media_quality.get("quality_score", 0),
                             "issues": media_quality.get("issues", []),
                             "fallback_reason": failure_reason,
@@ -3801,6 +4430,8 @@ Retorne em formato JSON:
                                     "0",
                                     "-i",
                                     audio_list_path,
+                                    "-af",
+                                    f"loudnorm=I={_audio_loudness_target_lufs():.1f}:TP=-1.5:LRA=11",
                                     "-c:a",
                                     "aac",
                                     "-b:a",

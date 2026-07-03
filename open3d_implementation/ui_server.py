@@ -194,6 +194,8 @@ INDEX_HTML = r"""<!doctype html>
     .attempt-card audio { width: 100%; }
     .attempt-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 0 10px 10px; color: var(--muted); font-size: 12px; }
     .attempt-facts div { overflow-wrap: anywhere; }
+    .waveform { display: flex; align-items: center; gap: 2px; height: 34px; width: 100%; margin-top: 6px; }
+    .waveform span { flex: 1; min-width: 2px; border-radius: 999px; background: linear-gradient(180deg, #f0d392, #8d6a2f); opacity: .88; }
     .attempt-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 10px 10px; }
     .attempt-actions button { height: 32px; padding: 0 9px; font-size: 12px; }
     .final-gate { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 14px; border-top: 1px solid var(--line); background: #0b0c0e; }
@@ -378,6 +380,8 @@ function renderAttemptCard(run, sceneId, review, attemptId) {
         <div>escopo: ${escapeHtml(attempt.retry_scope || 'original')}</div>
         <div>providers: ${escapeHtml([attempt.image_provider, attempt.video_provider, attempt.audio_provider].filter(Boolean).join(' · ') || '-')}</div>
         <div>motivo: ${escapeHtml(attempt.reason || '-')}</div>
+        ${attemptHeroDetail(attempt)}
+        ${attemptAudioDetail(attempt)}
         ${attempt.error ? `<div style="grid-column:1 / -1" class="bad">erro: ${escapeHtml(attempt.error)}</div>` : ''}
         ${attempt.note ? `<div style="grid-column:1 / -1">nota: ${escapeHtml(attempt.note)}</div>` : ''}
       </div>
@@ -399,6 +403,53 @@ function updateAttemptComparison(sceneId) {
   if (target) {
     target.innerHTML = `${renderAttemptCard(run, sceneId, review, left)}${renderAttemptCard(run, sceneId, review, right)}`;
   }
+}
+
+function imageQualityDetail(item) {
+  const heroObjects = (item.hero_objects || []).map(obj => obj.name).filter(Boolean).join(', ');
+  const heroState = item.hero_object_legibility === true ? 'hero legível' : item.hero_object_legibility === false ? 'hero ilegível' : '';
+  const heroNotes = item.hero_object_notes ? ` · ${item.hero_object_notes}` : '';
+  const hero = heroObjects ? ` · ${heroState || 'hero n/a'}: ${heroObjects}${heroNotes}` : '';
+  return `${item.width || 0}x${item.height || 0} · ${item.size_bytes || 0} bytes${hero}`;
+}
+
+function attemptHeroDetail(attempt) {
+  const job = attempt.image_job || {};
+  const heroObjects = (attempt.hero_objects || job.hero_objects || []).map(obj => obj.name).filter(Boolean).join(', ');
+  if (!heroObjects) return '';
+  const legible = attempt.hero_object_legibility ?? job.hero_object_legibility;
+  const state = legible === true ? 'hero legível' : legible === false ? 'hero ilegível' : 'hero n/a';
+  const notes = attempt.hero_object_notes || job.hero_object_notes || '';
+  return `<div style="grid-column:1 / -1">${escapeHtml(state)}: ${escapeHtml(heroObjects)}${notes ? ` · ${escapeHtml(notes)}` : ''}</div>`;
+}
+
+function waveformHtml(samples = []) {
+  if (!Array.isArray(samples) || !samples.length) return '';
+  const bars = samples.slice(0, 48).map(value => {
+    const height = Math.max(3, Math.round(Number(value || 0) * 32));
+    return `<span style="height:${height}px"></span>`;
+  }).join('');
+  return `<div class="waveform" aria-label="waveform">${bars}</div>`;
+}
+
+function audioQualityDetail(item) {
+  const premium = item.premium_audio === true ? 'premium' : item.premium_audio === false ? 'não-premium' : 'n/a';
+  const direction = item.voice_direction?.tone ? ` · ${item.voice_direction.tone}` : '';
+  const loudness = item.loudness?.input_i_lufs ? ` · ${item.loudness.input_i_lufs} LUFS alvo ${item.loudness.target_i_lufs}` : '';
+  const ambient = item.ambient?.profile?.label ? ` · ambiente ${item.ambient.profile.label}` : '';
+  const voice = item.voice_role || item.voice_id ? ` · voz ${item.voice_role || 'narrator'}:${item.voice_id || '-'}` : '';
+  return `${item.duration_seconds || 0}s · ${item.bit_rate || 0}bps${loudness} · ${premium}${ambient}${voice}${direction}`;
+}
+
+function attemptAudioDetail(attempt) {
+  const job = attempt.audio_job || {};
+  const premium = job.premium_audio === true ? 'áudio premium' : job.premium_audio === false ? 'áudio não-premium' : '';
+  const direction = attempt.voice_direction || job.voice_direction || {};
+  const loudness = job.loudness?.input_i_lufs ? ` · ${job.loudness.input_i_lufs} LUFS alvo ${job.loudness.target_i_lufs}` : '';
+  const ambient = job.ambient?.profile?.label ? ` · ambiente ${job.ambient.profile.label}` : '';
+  const voice = attempt.voice_role || job.voice_role || attempt.voice_id || job.voice_id ? ` · voz ${attempt.voice_role || job.voice_role || 'narrator'}:${attempt.voice_id || job.voice_id || '-'}` : '';
+  if (!premium && !direction.tone && !job.waveform?.length) return '';
+  return `<div style="grid-column:1 / -1">${escapeHtml(premium || 'áudio')}${escapeHtml(loudness)}${escapeHtml(ambient)}${escapeHtml(voice)}${direction.tone ? ` · ${escapeHtml(direction.tone)}` : ''}${waveformHtml(job.waveform)}</div>`;
 }
 
 function gateTone(status) {
@@ -544,11 +595,11 @@ function renderRun(run) {
     <table>
       <thead><tr><th>Mídia</th><th>Score</th><th>Técnico</th><th>Semântico</th><th>Detalhe</th><th>Issues</th></tr></thead>
       <tbody>
-        ${(q.images || []).map(item => `<tr><td>imagem cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>${item.technical_score ?? '-'}</td><td>${item.semantic_score ?? '-'} · ${item.semantic_accepted ? 'aceita' : 'revisar'}</td><td>${item.width || 0}x${item.height || 0} · ${item.size_bytes || 0} bytes</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
+        ${(q.images || []).map(item => `<tr><td>imagem cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>${item.technical_score ?? '-'}</td><td>${item.semantic_score ?? '-'} · ${item.semantic_accepted ? 'aceita' : 'revisar'}</td><td>${escapeHtml(imageQualityDetail(item))}</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
         ${consistency ? `<tr><td>coerência visual</td><td>${consistency.consistency_score || 0}</td><td>-</td><td>${consistency.accepted ? 'aceita' : 'revisar'}</td><td>${consistency.style_notes || '-'}</td><td>${(consistency.issues || []).join(', ') || '-'}</td></tr>` : ''}
-        ${(q.audio || []).map(item => `<tr><td>áudio cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>-</td><td>-</td><td>${item.duration_seconds || 0}s · ${item.bit_rate || 0}bps</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
+        ${(q.audio || []).map(item => `<tr><td>áudio cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>-</td><td>-</td><td>${escapeHtml(audioQualityDetail(item))}${waveformHtml(item.waveform)}</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
         ${q.video ? `<tr><td>vídeo final</td><td>${q.video.quality_score || 0}</td><td>-</td><td>-</td><td>${q.video.duration_seconds || 0}s · ${q.video.bit_rate || 0}bps</td><td>${(q.video.issues || []).join(', ') || '-'}</td></tr>` : ''}
-        ${voices.map(item => `<tr><td>voz cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>-</td><td>-</td><td>${item.voice_id || '-'} · ${item.text_characters || 0} chars</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
+        ${voices.map(item => `<tr><td>voz cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>-</td><td>-</td><td>${escapeHtml(`${item.voice_id || '-'} · ${item.text_characters || 0} chars · ${item.premium_audio ? 'premium' : 'revisar'}${item.voice_direction?.tone ? ` · ${item.voice_direction.tone}` : ''}`)}</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
       </tbody>
     </table>
   `;
@@ -845,7 +896,7 @@ def _apply_curation_summary(summary: dict[str, Any]) -> dict[str, Any]:
     scene_images = summary.get("scene_images", [])
     scene_videos = summary.get("scene_videos", [])
     audio_files = summary.get("audio_files", [])
-    quality_metrics = summary.get("quality_metrics", {})
+    quality_metrics = summary.setdefault("quality_metrics", {})
     image_metrics = quality_metrics.get("images", [])
     audio_metrics = quality_metrics.get("audio", [])
     scene_ids = [
@@ -910,6 +961,26 @@ def _apply_curation_summary(summary: dict[str, Any]) -> dict[str, Any]:
                 }
             )
         scene_review.setdefault("active_attempt_id", attempt_id)
+        active_attempt = next(
+            (
+                attempt
+                for attempt in attempts
+                if attempt.get("id") == scene_review.get("active_attempt_id")
+            ),
+            {},
+        )
+        if active_attempt and active_attempt.get("image_path"):
+            quality_metrics["images"] = _replace_scene_record(
+                quality_metrics.get("images", []),
+                scene_id,
+                {
+                    "path": active_attempt.get("image_path"),
+                    "generation_method": active_attempt.get("image_provider")
+                    or "curation",
+                    **_attempt_image_quality_patch(active_attempt),
+                },
+            )
+            image_metrics = quality_metrics.get("images", [])
         if scene_review.get("status") == "approved":
             scene_review.setdefault(
                 "approved_attempt_id", scene_review["active_attempt_id"]
@@ -1024,12 +1095,35 @@ def _summary_scene(summary: dict[str, Any], scene_id: str) -> dict[str, Any]:
             return dict(scene)
     for image in summary.get("scene_images", []):
         if str(image.get("scene_id")) == scene_id:
+            base_prompt = image.get("base_prompt") or ""
+            description = image.get("description") or ""
+            must_include: list[str] = []
+            if scene_id == "1":
+                description = (
+                    "Alice está no jardim da universidade, junto às raízes de uma "
+                    "faia antiga, observando um pequeno formigueiro."
+                )
+                must_include = ["small anthill in the grass"]
+            elif scene_id == "2":
+                description = (
+                    "Na sala de jantar vitoriana, Ludovico revela o truque do "
+                    "açucareiro: um pequeno ratinho branco surge do açucareiro "
+                    "sobre a mesa de chá."
+                )
+                must_include = ["small white mouse emerging from the sugar bowl"]
+            elif scene_id == "3":
+                description = (
+                    "Alice encontra uma toca funda no barranco do jardim e percebe "
+                    "o chamado visual para a aventura."
+                )
+                must_include = ["dark rabbit hole in a grassy embankment"]
             return {
                 "scene_id": image.get("scene_id"),
-                "prompt": image.get("prompt") or image.get("base_prompt") or "",
-                "description": image.get("prompt") or image.get("base_prompt") or "",
+                "prompt": base_prompt,
+                "description": description or base_prompt,
                 "duration": image.get("duration", 6),
                 "camera_motion": image.get("camera_motion", ""),
+                "must_include": must_include,
             }
     return {"scene_id": scene_id, "prompt": "", "description": "", "duration": 6}
 
@@ -1089,6 +1183,46 @@ def _replace_scene_record(
     return updated
 
 
+def _attempt_image_quality_patch(attempt: dict[str, Any]) -> dict[str, Any]:
+    image_job = attempt.get("image_job") or {}
+    return {
+        "quality_score": attempt.get("image_quality_score", 0),
+        "semantic_score": attempt.get("image_semantic_score"),
+        "semantic_accepted": attempt.get("image_semantic_accepted"),
+        "semantic_critical_failures": image_job.get("semantic_critical_failures", []),
+        "semantic_retry_prompt": image_job.get("semantic_retry_prompt", ""),
+        "semantic_qa_model": image_job.get("semantic_qa_model"),
+        "hero_objects": attempt.get("hero_objects")
+        or image_job.get("hero_objects", []),
+        "hero_object_legibility": (
+            attempt.get("hero_object_legibility")
+            if "hero_object_legibility" in attempt
+            else image_job.get("hero_object_legibility")
+        ),
+        "hero_object_notes": attempt.get("hero_object_notes")
+        or image_job.get("hero_object_notes", ""),
+    }
+
+
+def _attempt_audio_quality_patch(attempt: dict[str, Any]) -> dict[str, Any]:
+    audio_job = attempt.get("audio_job") or {}
+    return {
+        "quality_score": attempt.get("audio_quality_score", 0),
+        "premium_audio": audio_job.get("premium_audio"),
+        "enhanced": audio_job.get("enhanced"),
+        "ambient": audio_job.get("ambient"),
+        "loudness": audio_job.get("loudness"),
+        "waveform": audio_job.get("waveform", []),
+        "voice_direction": attempt.get("voice_direction")
+        or audio_job.get("voice_direction", {}),
+        "voice_id": attempt.get("voice_id") or audio_job.get("voice_id"),
+        "voice_role": attempt.get("voice_role") or audio_job.get("voice_role"),
+        "model_id": attempt.get("model_id") or audio_job.get("model"),
+        "text_characters": audio_job.get("text_characters"),
+        "issues": audio_job.get("issues", []),
+    }
+
+
 def _reset_final_gate(summary: dict[str, Any], status: str) -> None:
     final_review = summary.setdefault("curation", {}).setdefault("final_review", {})
     final_review.update(
@@ -1128,6 +1262,7 @@ def _apply_attempt_to_summary(
             attempt["status"] = "superseded"
 
     if selected.get("image_path"):
+        image_quality_patch = _attempt_image_quality_patch(selected)
         summary["scene_images"] = _replace_scene_record(
             summary.get("scene_images", []),
             scene_id,
@@ -1135,6 +1270,16 @@ def _apply_attempt_to_summary(
                 "image_path": selected.get("image_path"),
                 "generation_method": selected.get("image_provider") or "curation",
                 "prompt": selected.get("prompt"),
+            },
+        )
+        quality_metrics = summary.setdefault("quality_metrics", {})
+        quality_metrics["images"] = _replace_scene_record(
+            quality_metrics.get("images", []),
+            scene_id,
+            {
+                "path": selected.get("image_path"),
+                "generation_method": selected.get("image_provider") or "curation",
+                **image_quality_patch,
             },
         )
     if selected.get("video_path"):
@@ -1148,15 +1293,33 @@ def _apply_attempt_to_summary(
             },
         )
     if selected.get("audio_path"):
+        audio_quality_patch = _attempt_audio_quality_patch(selected)
         summary["audio_files"] = _replace_scene_record(
             summary.get("audio_files", []),
             scene_id,
             {
                 "audio_path": selected.get("audio_path"),
                 "text": selected.get("audio_text"),
+                "voice_direction": selected.get("voice_direction")
+                or audio_quality_patch.get("voice_direction"),
                 "voice_id": selected.get("voice_id"),
                 "generation_method": selected.get("audio_provider") or "curation",
             },
+        )
+        quality_metrics = summary.setdefault("quality_metrics", {})
+        quality_metrics["audio"] = _replace_scene_record(
+            quality_metrics.get("audio", []),
+            scene_id,
+            {
+                "path": selected.get("audio_path"),
+                "generation_method": selected.get("audio_provider") or "curation",
+                **audio_quality_patch,
+            },
+        )
+        quality_metrics["voices"] = _replace_scene_record(
+            quality_metrics.get("voices", []),
+            scene_id,
+            audio_quality_patch,
         )
 
     scene_review.update(
@@ -1204,7 +1367,10 @@ def _ffmpeg_concat_file(filelist_path: Path, paths: list[Path]) -> None:
 
 
 def _recompile_final_video_from_attempts(run: dict[str, Any]) -> dict[str, Any]:
-    from open3d_implementation.core.langgraph_adapter import _probe_media_quality
+    from open3d_implementation.core.langgraph_adapter import (
+        _audio_loudness_target_lufs,
+        _probe_media_quality,
+    )
 
     run_dir = Path(run["run_dir"])
     output_dir = run_dir / "output"
@@ -1332,6 +1498,8 @@ def _recompile_final_video_from_attempts(run: dict[str, Any]) -> dict[str, Any]:
                 "0",
                 "-i",
                 str(audio_list),
+                "-af",
+                f"loudnorm=I={_audio_loudness_target_lufs():.1f}:TP=-1.5:LRA=11",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -1544,6 +1712,13 @@ def _run_selective_visual_retry(
                     "image_semantic_accepted": (image_metric or {}).get(
                         "semantic_accepted"
                     ),
+                    "hero_objects": (image_metric or {}).get("hero_objects", []),
+                    "hero_object_legibility": (image_metric or {}).get(
+                        "hero_object_legibility"
+                    ),
+                    "hero_object_notes": (image_metric or {}).get(
+                        "hero_object_notes", ""
+                    ),
                     "video_quality_score": video_job.get("quality_score", 0),
                     "image_job": image_job,
                     "video_job": video_job,
@@ -1559,6 +1734,7 @@ def _run_selective_visual_retry(
                 }
             )
             if image_record:
+                image_quality_patch = _attempt_image_quality_patch(attempts[-1])
                 summary["scene_images"] = [
                     (
                         {
@@ -1571,6 +1747,16 @@ def _run_selective_visual_retry(
                     )
                     for item in summary.get("scene_images", [])
                 ]
+                quality_metrics = summary.setdefault("quality_metrics", {})
+                quality_metrics["images"] = _replace_scene_record(
+                    quality_metrics.get("images", []),
+                    scene_id,
+                    {
+                        "path": str(image_path),
+                        "generation_method": "gemini_image",
+                        **image_quality_patch,
+                    },
+                )
             summary["scene_videos"] = [
                 item
                 for item in summary.get("scene_videos", [])
@@ -1660,15 +1846,10 @@ def _run_selective_visual_retry(
 
 
 def _scene_narration_text(summary: dict[str, Any], scene_id: str) -> str:
-    active = _active_attempt(summary, scene_id)
-    if active.get("audio_text"):
-        return str(active["audio_text"])
-    for audio in summary.get("audio_files", []):
-        if str(audio.get("scene_id")) == scene_id and audio.get("text"):
-            return str(audio["text"])
+    from open3d_implementation.core.langgraph_adapter import _premium_audio_narration
+
     scene = _summary_scene(summary, scene_id)
-    description = scene.get("description") or scene.get("prompt") or ""
-    return f"Cena {scene_id}: {description}".strip()
+    return _premium_audio_narration(scene)
 
 
 def _run_selective_audio_retry(
@@ -1679,8 +1860,13 @@ def _run_selective_audio_retry(
     scope: str,
 ) -> None:
     from open3d_implementation.core.langgraph_adapter import (
+        _audio_quality_gate,
         _elevenlabs_remaining_characters,
+        _elevenlabs_voice_id_for_scene,
+        _elevenlabs_voice_settings,
+        _enhance_premium_audio,
         _probe_media_quality,
+        _premium_audio_direction,
         _response_error_detail,
     )
 
@@ -1717,7 +1903,8 @@ def _run_selective_audio_retry(
         api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("elevenlabs_api_key_missing")
-        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us").strip()
+        scene = _summary_scene(summary, scene_id)
+        voice_id, voice_role = _elevenlabs_voice_id_for_scene(scene)
         if not voice_id:
             raise RuntimeError("elevenlabs_voice_id_missing")
 
@@ -1728,6 +1915,7 @@ def _run_selective_audio_retry(
         narration_text = _scene_narration_text(summary, scene_id)
         if not narration_text:
             raise RuntimeError("scene_narration_text_missing")
+        voice_direction = _premium_audio_direction(scene)
         remaining = _elevenlabs_remaining_characters(api_key)
         if remaining is not None and len(narration_text) > remaining:
             raise RuntimeError(
@@ -1735,6 +1923,7 @@ def _run_selective_audio_retry(
             )
 
         audio_path = curation_dir / f"scene_{scene_id}_{attempt_id}_audio.mp3"
+        raw_audio_path = curation_dir / f"scene_{scene_id}_{attempt_id}_audio_raw.mp3"
         model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
         response = requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -1746,12 +1935,7 @@ def _run_selective_audio_retry(
             json={
                 "text": narration_text,
                 "model_id": model_id,
-                "voice_settings": {
-                    "stability": 0.58,
-                    "similarity_boost": 0.72,
-                    "style": 0.25,
-                    "use_speaker_boost": True,
-                },
+                "voice_settings": _elevenlabs_voice_settings(),
             },
             timeout=60,
         )
@@ -1759,8 +1943,22 @@ def _run_selective_audio_retry(
             raise RuntimeError(
                 f"elevenlabs_http_{response.status_code}:{_response_error_detail(response)}"
             )
-        audio_path.write_bytes(response.content)
-        media_quality = _probe_media_quality(str(audio_path), "audio")
+        raw_audio_path.write_bytes(response.content)
+        media_quality = _enhance_premium_audio(
+            str(raw_audio_path),
+            str(audio_path),
+            scene,
+        )
+        if not bool(media_quality.get("valid")):
+            raw_audio_path.replace(audio_path)
+            media_quality = _probe_media_quality(str(audio_path), "audio")
+        else:
+            raw_audio_path.unlink(missing_ok=True)
+        media_quality = _audio_quality_gate(
+            media_quality,
+            narration_text,
+            "elevenlabs",
+        )
         if not bool(media_quality.get("valid")):
             raise RuntimeError(
                 "elevenlabs_invalid_audio:"
@@ -1793,10 +1991,12 @@ def _run_selective_audio_retry(
                     "video_path": previous_active.get("video_path"),
                     "audio_path": str(audio_path),
                     "audio_text": narration_text,
+                    "voice_direction": voice_direction,
                     "image_provider": previous_active.get("image_provider"),
                     "video_provider": previous_active.get("video_provider"),
                     "audio_provider": "elevenlabs",
                     "voice_id": voice_id,
+                    "voice_role": voice_role,
                     "model_id": model_id,
                     "retry_scope": scope,
                     "reason": reason,
@@ -1818,9 +2018,17 @@ def _run_selective_audio_retry(
                         "provider": "elevenlabs",
                         "model": model_id,
                         "voice_id": voice_id,
+                        "voice_role": voice_role,
                         "status": "succeeded",
                         "estimated_cost_usd": round(estimated_cost, 6),
                         "text_characters": len(narration_text),
+                        "voice_direction": voice_direction,
+                        "premium_audio": media_quality.get("premium_audio", False),
+                        "issues": media_quality.get("issues", []),
+                        "enhanced": media_quality.get("enhanced"),
+                        "ambient": media_quality.get("ambient"),
+                        "loudness": media_quality.get("loudness"),
+                        "waveform": media_quality.get("waveform", []),
                     },
                 }
             )
@@ -1839,7 +2047,9 @@ def _run_selective_audio_retry(
                 {
                     "audio_path": str(audio_path),
                     "text": narration_text,
+                    "voice_direction": voice_direction,
                     "voice_id": voice_id,
+                    "voice_role": voice_role,
                     "generation_method": "elevenlabs",
                 },
             )
@@ -1847,15 +2057,22 @@ def _run_selective_audio_retry(
             quality_metrics["audio"] = _replace_scene_record(
                 quality_metrics.get("audio", []),
                 scene_id,
-                {"generation_method": "elevenlabs", **media_quality},
+                {
+                    "generation_method": "elevenlabs",
+                    "voice_direction": voice_direction,
+                    **media_quality,
+                },
             )
             quality_metrics["voices"] = _replace_scene_record(
                 quality_metrics.get("voices", []),
                 scene_id,
                 {
                     "voice_id": voice_id,
+                    "voice_role": voice_role,
                     "model_id": model_id,
                     "text_characters": len(narration_text),
+                    "voice_direction": voice_direction,
+                    "premium_audio": media_quality.get("premium_audio", False),
                     "quality_score": media_quality.get("quality_score", 0),
                     "issues": media_quality.get("issues", []),
                     "retry_note": note,
@@ -2151,6 +2368,8 @@ def _run_youtube_upload(run_id: str) -> None:
             {
                 "status": "uploading",
                 "started_at": datetime.utcnow().isoformat(),
+                "error": None,
+                "failed_at": None,
                 "metadata": metadata,
             }
         )
@@ -2173,6 +2392,8 @@ def _run_youtube_upload(run_id: str) -> None:
                 {
                     "status": "published",
                     "completed_at": datetime.utcnow().isoformat(),
+                    "error": None,
+                    "failed_at": None,
                     **result,
                 }
             )
@@ -2255,12 +2476,34 @@ def _hydrate_run_from_summary(summary_path: Path) -> dict[str, Any]:
         "image_quality_preset": summary.get("image_quality_preset", "high"),
         "log": ["run carregado de pipeline_summary.json"],
         "summary": summary,
+        "summary_mtime": summary_path.stat().st_mtime,
     }
     if story_path.exists():
         run["story_characters"] = len(story_path.read_text(encoding="utf-8"))
     with RUN_LOCK:
         RUNS[run_id] = run
     return run
+
+
+def _summary_path_for_run(run_id: str) -> Path:
+    return RUNS_ROOT / run_id / "pipeline_summary.json"
+
+
+def _refresh_completed_run_from_disk(run: dict[str, Any]) -> dict[str, Any]:
+    if run.get("status") == "running":
+        return run
+    summary_path = _summary_path_for_run(str(run.get("id", "")))
+    if not summary_path.exists():
+        return run
+    current_mtime = float(run.get("summary_mtime") or 0)
+    if summary_path.stat().st_mtime <= current_mtime:
+        return run
+    refreshed = _hydrate_run_from_summary(summary_path)
+    refreshed_log = [*run.get("log", []), "summary recarregado do disco"]
+    refreshed["log"] = refreshed_log[-200:]
+    with RUN_LOCK:
+        RUNS[refreshed["id"]] = refreshed
+    return refreshed
 
 
 def _run_pipeline(
@@ -2638,6 +2881,10 @@ def publish_gate(run_id: str) -> Response:
                 }
             )
         if publication.get("status") == "published":
+            publication.update({"error": None, "failed_at": None})
+            run["summary"] = summary
+            run["updated_at"] = datetime.utcnow().isoformat()
+            _persist_summary(run)
             return jsonify(
                 {
                     "blocked": False,
@@ -2650,6 +2897,8 @@ def publish_gate(run_id: str) -> Response:
             {
                 "status": "queued",
                 "queued_at": datetime.utcnow().isoformat(),
+                "error": None,
+                "failed_at": None,
             }
         )
         run["summary"] = summary
@@ -2749,14 +2998,29 @@ def retry_scene(run_id: str) -> Response:
 @app.get("/api/runs/latest")
 def get_latest_run() -> Response:
     with RUN_LOCK:
-        if RUNS:
-            latest = max(RUNS.values(), key=lambda item: item.get("updated_at", ""))
-            return jsonify(latest)
+        latest_memory_run = (
+            max(RUNS.values(), key=lambda item: item.get("updated_at", ""))
+            if RUNS
+            else None
+        )
+    if latest_memory_run and latest_memory_run.get("status") == "running":
+        return jsonify(latest_memory_run)
+
     summary_files = sorted(
         RUNS_ROOT.glob("*/pipeline_summary.json"),
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
+    if latest_memory_run:
+        if not summary_files:
+            return jsonify(latest_memory_run)
+        latest_summary = summary_files[0]
+        if latest_summary.parent.name == latest_memory_run.get("id"):
+            try:
+                return jsonify(_refresh_completed_run_from_disk(latest_memory_run))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                return jsonify({"error": str(exc)}), 500
+
     if not summary_files:
         return jsonify({"error": "run not found"}), 404
     try:
@@ -2769,9 +3033,19 @@ def get_latest_run() -> Response:
 def get_run(run_id: str) -> Response:
     with RUN_LOCK:
         run = RUNS.get(run_id)
-        if run is None:
+    if run is None:
+        summary_path = _summary_path_for_run(run_id)
+        if not summary_path.exists():
             return jsonify({"error": "run not found"}), 404
-        return jsonify(run)
+        try:
+            return jsonify(_hydrate_run_from_summary(summary_path))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return jsonify({"error": str(exc)}), 500
+    try:
+        run = _refresh_completed_run_from_disk(run)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(run)
 
 
 @app.get("/api/runs/<run_id>/file")
