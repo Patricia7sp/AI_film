@@ -3930,6 +3930,7 @@ Retorne em formato JSON:
                 if elevenlabs_api_key
                 else None
             )
+            elevenlabs_starting_chars = elevenlabs_remaining_chars
             if elevenlabs_api_key and elevenlabs_remaining_chars is not None:
                 print(
                     "📊 ElevenLabs caracteres restantes: "
@@ -4225,6 +4226,8 @@ Retorne em formato JSON:
                     "cost_estimate": {
                         **state.get("cost_estimate", {}),
                         "elevenlabs_usd": round(estimated_elevenlabs_cost, 6),
+                        "elevenlabs_characters_remaining_start": elevenlabs_starting_chars,
+                        "elevenlabs_characters_remaining_end": elevenlabs_remaining_chars,
                     },
                     "current_step": "audio_generated",
                 }

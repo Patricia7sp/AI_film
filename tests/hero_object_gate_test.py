@@ -128,3 +128,76 @@ def test_selective_audio_retry_is_premium_elevenlabs_only():
     assert "_generate_local_tts_audio" not in source
     assert "_enhance_premium_audio" in source
     assert '"audio_provider": "elevenlabs"' in source
+
+
+def test_cost_quota_blocks_publish_when_run_cost_exceeds_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_FILM_COST_LIMIT_USD", "0.50")
+    video = tmp_path / "output" / "final_video.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video-v1")
+    summary = {
+        "video_path": str(video),
+        "video_exists": True,
+        "scene_images": [{"scene_id": 1, "image_path": "scene.png"}],
+        "scene_videos": [{"scene_id": 1, "video_path": "scene.mp4"}],
+        "audio_files": [{"scene_id": 1, "audio_path": "scene.mp3"}],
+        "quality_metrics": {
+            "voices": [{"scene_id": 1, "premium_audio": True, "text_characters": 200}]
+        },
+        "cost_estimate": {"total_usd": 0.75, "elevenlabs_usd": 0.1},
+        "curation": {
+            "scenes": {
+                "1": {
+                    "status": "approved",
+                    "active_attempt_id": "attempt_1",
+                    "attempts": [],
+                }
+            },
+            "final_review": {"status": "final_approved", "video_viewed": True},
+        },
+    }
+
+    result = ui_server._apply_curation_summary(summary, tmp_path)
+
+    assert result["cost_quota"]["status"] == "blocked"
+    assert result["production_status"]["status"] == "blocked"
+    assert result["curation"]["can_publish"] is False
+
+
+def test_published_status_is_stale_when_current_video_hash_changes(tmp_path):
+    video = tmp_path / "output" / "final_video.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video-v1")
+    summary = {
+        "video_path": str(video),
+        "video_exists": True,
+        "scene_images": [{"scene_id": 1, "image_path": "scene.png"}],
+        "scene_videos": [{"scene_id": 1, "video_path": "scene.mp4"}],
+        "audio_files": [{"scene_id": 1, "audio_path": "scene.mp3"}],
+        "quality_metrics": {},
+        "cost_estimate": {"total_usd": 0.1},
+        "curation": {
+            "scenes": {
+                "1": {
+                    "status": "approved",
+                    "active_attempt_id": "attempt_1",
+                    "attempts": [],
+                }
+            },
+            "final_review": {"status": "draft", "video_viewed": False},
+        },
+    }
+    first = ui_server._apply_curation_summary(summary, tmp_path)
+    artifact = first["production_status"]["current_artifact"]
+    video.write_bytes(b"video-v2")
+    first["publication"] = {
+        "status": "published",
+        "artifact": artifact,
+        "url": "https://youtu.be/example",
+    }
+
+    result = ui_server._apply_curation_summary(first, tmp_path)
+
+    assert result["production_status"]["status"] == "published_stale"
+    assert result["production_status"]["published_current"] is False
+    assert result["curation"]["can_publish"] is False

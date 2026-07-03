@@ -9,6 +9,7 @@ inspect generated assets without exposing secrets.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import requests
 import subprocess
@@ -454,8 +455,41 @@ function attemptAudioDetail(attempt) {
 
 function gateTone(status) {
   if (status === 'final_approved') return 'approved';
+  if (status === 'published_current') return 'approved';
+  if (status === 'ready_to_publish') return 'approved';
   if (status === 'scene_review_blocked') return 'rejected';
+  if (status === 'blocked' || status === 'publish_failed') return 'rejected';
   return 'pending_review';
+}
+
+function productionStatusLabel(status) {
+  const labels = {
+    published_current: 'publicado atual',
+    published_stale: 'publicado antigo',
+    ready_to_publish: 'pronto para publicar',
+    needs_final_review: 'aguardando revisão final',
+    missing_video: 'sem vídeo final',
+    publish_failed: 'publicação falhou',
+    uploading: 'publicando',
+    queued: 'publicação na fila',
+    blocked: 'bloqueado'
+  };
+  return labels[status] || status || 'indefinido';
+}
+
+function renderCostQuota(summary) {
+  const cq = summary.cost_quota || {};
+  const providers = cq.providers || [];
+  if (!providers.length) return '';
+  return `
+    <table>
+      <thead><tr><th>Provider</th><th>Custo</th><th>Quota</th><th>Uso</th></tr></thead>
+      <tbody>
+        ${providers.map(item => `<tr><td>${escapeHtml(item.provider)}</td><td>$${Number(item.usd || 0).toFixed(4)}</td><td>${escapeHtml(item.quota || '-')}</td><td>${escapeHtml(JSON.stringify(item.usage || {}))}</td></tr>`).join('')}
+      </tbody>
+    </table>
+    ${(cq.warnings || []).length ? `<div class="blockers">${(cq.warnings || []).map(escapeHtml).join(' · ')}</div>` : ''}
+    ${(cq.blockers || []).length ? `<div class="blockers">${(cq.blockers || []).map(escapeHtml).join(' · ')}</div>` : ''}`;
 }
 
 function renderCuration(run) {
@@ -481,6 +515,7 @@ function renderCuration(run) {
   const blockers = curation.blockers || [];
   const finalReview = curation.final_review || {};
   const publication = summary.publication || {};
+  const production = summary.production_status || {};
   const q = summary.quality_metrics || {};
 
   const sceneCards = (summary.scene_images || []).map(img => {
@@ -546,18 +581,22 @@ function renderCuration(run) {
     <div class="curation-head">
       <div>
         <div class="curation-title">Sala de Curadoria</div>
-        <div class="curation-sub">${approved}/${total} cenas aprovadas · corte final: ${escapeHtml(finalReview.status || 'draft')}</div>
+        <div class="curation-sub">${approved}/${total} cenas aprovadas · corte final: ${escapeHtml(finalReview.status || 'draft')} · produção: ${escapeHtml(productionStatusLabel(production.status))}</div>
         <div class="progress"><span style="width:${progress}%"></span></div>
       </div>
-      <span class="badge ${gateTone(curation.status)}">${escapeHtml(curation.status || 'pending_review')}</span>
+      <span class="badge ${gateTone(production.status || curation.status)}">${escapeHtml(production.status || curation.status || 'pending_review')}</span>
     </div>
     ${blockers.length ? `<div class="blockers">${blockers.map(escapeHtml).join(' · ')}</div>` : ''}
+    ${(production.blockers || []).length ? `<div class="blockers">${production.blockers.map(escapeHtml).join(' · ')}</div>` : ''}
+    ${(production.warnings || []).length ? `<div class="blockers">${production.warnings.map(escapeHtml).join(' · ')}</div>` : ''}
     <div class="curation-scenes">${sceneCards}</div>
     <div class="final-gate">
       <div>
         <div class="curation-title">Corte final</div>
         <div class="curation-sub">Publicação só libera com todas as cenas aprovadas, vídeo visualizado e corte final aprovado.</div>
+        <div class="curation-sub">Status real: ${escapeHtml(productionStatusLabel(production.status))}</div>
         <div class="curation-sub">YouTube: ${escapeHtml(publication.status || 'not_started')}${publication.url ? ` · <a href="${escapeHtml(publication.url)}" target="_blank">${escapeHtml(publication.url)}</a>` : ''}${publication.error ? ` · ${escapeHtml(publication.error)}` : ''}</div>
+        ${production.published_current === false && publication.status === 'published' ? `<div class="curation-sub warn">O vídeo publicado não corresponde ao corte final atual.</div>` : ''}
       </div>
       ${summary.video_path ? `<video controls onplay="markFinalVideoViewed()" src="/api/runs/${run.id}/file?path=${encodeURIComponent('output/final_video.mp4')}"></video>` : `<span class="badge pending_review">sem vídeo</span>`}
       <div class="final-actions">
@@ -570,8 +609,9 @@ function renderCuration(run) {
 
 function renderRun(run) {
   window.lastRenderedRun = run;
-  $('state').textContent = run.status;
-  $('state').className = run.status === 'failed' ? 'bad' : run.status === 'completed' ? 'ok' : '';
+  const production = run.summary?.production_status || {};
+  $('state').textContent = production.status ? productionStatusLabel(production.status) : run.status;
+  $('state').className = ['blocked', 'publish_failed'].includes(production.status) || run.status === 'failed' ? 'bad' : ['published_current', 'ready_to_publish'].includes(production.status) || run.status === 'completed' ? 'ok' : '';
   $('scenes').textContent = run.summary?.scenes_count ?? 0;
   $('images').textContent = run.summary?.images_count ?? 0;
   $('audio').textContent = run.summary?.audio_count ?? 0;
@@ -588,6 +628,7 @@ function renderRun(run) {
   const consistency = q.visual_consistency || null;
   const voices = q.voices || [];
   monitoring.innerHTML = `
+    ${renderCostQuota(run.summary || {})}
     <table>
       <thead><tr><th>Provider job</th><th>Provider</th><th>Status</th><th>Tempo</th><th>Custo</th><th>Erro</th></tr></thead>
       <tbody>${jobs.map(job => `<tr><td>${escapeHtml(job.job_id || '-')}</td><td>${escapeHtml(job.provider || '-')} · ${escapeHtml(job.model || '-')}</td><td>${escapeHtml(job.status || '-')}</td><td>${job.elapsed_seconds || 0}s</td><td>$${(job.estimated_cost_usd || 0).toFixed(4)}</td><td>${escapeHtml(job.error || '-')}</td></tr>`).join('')}</tbody>
@@ -886,7 +927,194 @@ def _build_summary(run_dir: Path, final_state: dict[str, Any]) -> dict[str, Any]
     return summary
 
 
-def _apply_curation_summary(summary: dict[str, Any]) -> dict[str, Any]:
+def _safe_float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _video_artifact_signature(run_dir: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    video_path = Path(summary.get("video_path") or "")
+    if not video_path.is_absolute():
+        video_path = run_dir / video_path
+    if not video_path.exists() or not video_path.is_file():
+        return {"exists": False, "path": str(video_path)}
+    digest = hashlib.sha256()
+    with video_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = video_path.stat()
+    return {
+        "exists": True,
+        "path": str(video_path),
+        "size_bytes": stat.st_size,
+        "sha256": digest.hexdigest(),
+        "mtime": stat.st_mtime,
+    }
+
+
+def _cost_quota_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    cost = summary.setdefault("cost_estimate", {})
+    jobs = summary.get("runpod_jobs", [])
+    voices = summary.get("quality_metrics", {}).get("voices", [])
+    total_usd = _safe_float_value(cost.get("total_usd"))
+    warn_usd = _safe_float_value(os.getenv("AI_FILM_COST_WARN_USD", "1.00"))
+    limit_usd = _safe_float_value(os.getenv("AI_FILM_COST_LIMIT_USD", "2.00"))
+    runpod_limit = _safe_float_value(os.getenv("AI_FILM_RUNPOD_COST_LIMIT_USD", "0.75"))
+    runway_limit = _safe_float_value(os.getenv("AI_FILM_RUNWAY_COST_LIMIT_USD", "1.50"))
+    elevenlabs_character_limit = int(
+        _safe_float_value(os.getenv("AI_FILM_ELEVENLABS_CHAR_LIMIT_PER_RUN", "1200"))
+    )
+    elevenlabs_characters = sum(
+        int(_safe_float_value(item.get("text_characters")))
+        for item in voices
+        if item.get("premium_audio")
+    )
+    provider_rows = [
+        {
+            "provider": "llm",
+            "usd": round(_safe_float_value(cost.get("llm_usd")), 6),
+            "quota": "tokens",
+            "usage": {
+                "input_tokens": cost.get("llm_input_tokens", 0),
+                "output_tokens": cost.get("llm_output_tokens", 0),
+            },
+        },
+        {
+            "provider": "gemini_image",
+            "usd": round(_safe_float_value(cost.get("gemini_image_usd")), 6),
+            "quota": "images",
+            "usage": {
+                "jobs": sum(1 for job in jobs if job.get("provider") == "gemini"),
+            },
+        },
+        {
+            "provider": "elevenlabs",
+            "usd": round(_safe_float_value(cost.get("elevenlabs_usd")), 6),
+            "quota": "characters",
+            "usage": {
+                "characters": elevenlabs_characters,
+                "limit_per_run": elevenlabs_character_limit,
+                "remaining_per_run": max(
+                    0,
+                    elevenlabs_character_limit - elevenlabs_characters,
+                ),
+                "remaining_start": cost.get("elevenlabs_characters_remaining_start"),
+                "remaining_end": cost.get("elevenlabs_characters_remaining_end"),
+            },
+        },
+        {
+            "provider": "runway",
+            "usd": round(_safe_float_value(cost.get("runway_usd")), 6),
+            "quota": "jobs",
+            "usage": {
+                "jobs": sum(1 for job in jobs if job.get("provider") == "runway"),
+                "limit_usd": runway_limit,
+            },
+        },
+        {
+            "provider": "runpod",
+            "usd": round(_safe_float_value(cost.get("runpod_usd")), 6),
+            "quota": "serverless",
+            "usage": {
+                "jobs": sum(
+                    1 for job in jobs if job.get("provider") not in {"gemini", "runway"}
+                ),
+                "limit_usd": runpod_limit,
+            },
+        },
+    ]
+    warnings: list[str] = []
+    blockers: list[str] = []
+    if warn_usd and total_usd >= warn_usd:
+        warnings.append(f"custo estimado acima do alerta: ${total_usd:.4f}")
+    if limit_usd and total_usd > limit_usd:
+        blockers.append(f"custo estimado excede limite por run: ${total_usd:.4f}")
+    if runpod_limit and _safe_float_value(cost.get("runpod_usd")) > runpod_limit:
+        warnings.append("RunPod acima do limite configurado")
+    if runway_limit and _safe_float_value(cost.get("runway_usd")) > runway_limit:
+        warnings.append("Runway acima do limite configurado")
+    if (
+        elevenlabs_character_limit
+        and elevenlabs_characters > elevenlabs_character_limit
+    ):
+        blockers.append("ElevenLabs acima do limite de caracteres por run")
+    status = "blocked" if blockers else "warning" if warnings else "ok"
+    return {
+        "status": status,
+        "total_usd": round(total_usd, 6),
+        "warn_usd": warn_usd,
+        "limit_usd": limit_usd,
+        "providers": provider_rows,
+        "warnings": warnings,
+        "blockers": blockers,
+    }
+
+
+def _apply_production_status(
+    summary: dict[str, Any],
+    run_dir: Path,
+    curation_blockers: list[str],
+) -> dict[str, Any]:
+    publication = summary.setdefault("publication", {})
+    curation = summary.setdefault("curation", {})
+    final_review = curation.setdefault("final_review", {})
+    current_artifact = _video_artifact_signature(run_dir, summary)
+    published_artifact = publication.get("artifact") or {}
+    publication_status = str(publication.get("status") or "not_started")
+    published_current = (
+        publication_status == "published"
+        and bool(current_artifact.get("exists"))
+        and current_artifact.get("sha256") == published_artifact.get("sha256")
+    )
+    cost_quota = _cost_quota_summary(summary)
+    blockers = list(curation_blockers)
+    blockers.extend(cost_quota.get("blockers", []))
+
+    if publication_status in {"queued", "uploading"}:
+        status = publication_status
+    elif published_current:
+        status = "published_current"
+    elif publication_status == "failed":
+        status = "publish_failed"
+    elif (
+        publication_status == "published"
+        and final_review.get("status") != "final_approved"
+    ):
+        status = "published_stale"
+    elif blockers:
+        status = "blocked"
+    elif final_review.get("status") == "final_approved":
+        status = "ready_to_publish"
+    elif publication_status == "published":
+        status = "published_stale"
+    elif bool(current_artifact.get("exists")):
+        status = "needs_final_review"
+    else:
+        status = "missing_video"
+
+    production_status = {
+        "status": status,
+        "published_current": published_current,
+        "current_artifact": current_artifact,
+        "published_artifact": published_artifact,
+        "publication_status": publication_status,
+        "curation_status": curation.get("status"),
+        "final_review_status": final_review.get("status"),
+        "cost_quota_status": cost_quota.get("status"),
+        "blockers": blockers,
+        "warnings": cost_quota.get("warnings", []),
+    }
+    summary["cost_quota"] = cost_quota
+    summary["production_status"] = production_status
+    return production_status
+
+
+def _apply_curation_summary(
+    summary: dict[str, Any],
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
     curation = summary.setdefault("curation", {})
     scenes = curation.setdefault("scenes", {})
     if not isinstance(scenes, dict):
@@ -1050,6 +1278,9 @@ def _apply_curation_summary(summary: dict[str, Any]) -> dict[str, Any]:
     ):
         blockers.append("corte final ainda não aprovado")
 
+    curation["status"] = status
+    run_dir = run_dir or Path(".")
+    production_status = _apply_production_status(summary, run_dir, blockers)
     curation.update(
         {
             "status": status,
@@ -1060,7 +1291,7 @@ def _apply_curation_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "total_scenes": len(scene_ids),
             "blockers": blockers,
             "can_final_approve": can_final_approve,
-            "can_publish": status == "final_approved",
+            "can_publish": production_status.get("status") == "ready_to_publish",
         }
     )
     return summary
@@ -1334,7 +1565,7 @@ def _apply_attempt_to_summary(
     _reset_final_gate(summary, "stale_after_attempt_change")
     run["summary"] = summary
     _recompile_final_video_from_attempts(run)
-    run["summary"] = _apply_curation_summary(summary)
+    run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
     run["updated_at"] = datetime.utcnow().isoformat()
     _persist_summary(run)
     return run
@@ -1594,7 +1825,7 @@ def _run_selective_visual_retry(
         scene_review["note"] = note
         scene_review["reason"] = reason
         scene_review["updated_at"] = datetime.utcnow().isoformat()
-        run["summary"] = _apply_curation_summary(summary)
+        run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
         run["updated_at"] = datetime.utcnow().isoformat()
         _persist_summary(run)
 
@@ -1796,7 +2027,9 @@ def _run_selective_visual_retry(
             run = RUNS.get(run_id)
             if run is None:
                 return
-            summary = _apply_curation_summary(run.get("summary", {}))
+            summary = _apply_curation_summary(
+                run.get("summary", {}), Path(run["run_dir"])
+            )
             run["summary"] = summary
             run["updated_at"] = datetime.utcnow().isoformat()
             _persist_summary(run)
@@ -1836,7 +2069,9 @@ def _run_selective_visual_retry(
             )
             scene_review["retry_status"] = "failed"
             scene_review["status"] = "retry_requested"
-            run["summary"] = _apply_curation_summary(run["summary"])
+            run["summary"] = _apply_curation_summary(
+                run["summary"], Path(run["run_dir"])
+            )
             run["updated_at"] = datetime.utcnow().isoformat()
             _persist_summary(run)
         _append_log(
@@ -1893,7 +2128,7 @@ def _run_selective_audio_retry(
                 "updated_at": datetime.utcnow().isoformat(),
             }
         )
-        run["summary"] = _apply_curation_summary(summary)
+        run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
         run["updated_at"] = datetime.utcnow().isoformat()
         _persist_summary(run)
 
@@ -2095,7 +2330,9 @@ def _run_selective_audio_retry(
             run = RUNS.get(run_id)
             if run is None:
                 return
-            run["summary"] = _apply_curation_summary(run.get("summary", {}))
+            run["summary"] = _apply_curation_summary(
+                run.get("summary", {}), Path(run["run_dir"])
+            )
             run["updated_at"] = datetime.utcnow().isoformat()
             _persist_summary(run)
         _append_log(
@@ -2135,7 +2372,9 @@ def _run_selective_audio_retry(
             )
             scene_review["retry_status"] = "failed"
             scene_review["status"] = "retry_requested"
-            run["summary"] = _apply_curation_summary(run["summary"])
+            run["summary"] = _apply_curation_summary(
+                run["summary"], Path(run["run_dir"])
+            )
             run["updated_at"] = datetime.utcnow().isoformat()
             _persist_summary(run)
         _append_log(
@@ -2387,16 +2626,18 @@ def _run_youtube_upload(run_id: str) -> None:
             if run is None:
                 return
             summary = run.get("summary", {})
-            summary.setdefault("curation", {})["status"] = "published"
+            artifact = _video_artifact_signature(Path(run["run_dir"]), summary)
             summary.setdefault("publication", {}).update(
                 {
                     "status": "published",
                     "completed_at": datetime.utcnow().isoformat(),
                     "error": None,
                     "failed_at": None,
+                    "artifact": artifact,
                     **result,
                 }
             )
+            summary = _apply_curation_summary(summary, Path(run["run_dir"]))
             run["summary"] = summary
             run["updated_at"] = datetime.utcnow().isoformat()
             _persist_summary(run)
@@ -2462,7 +2703,7 @@ def _hydrate_run_from_summary(summary_path: Path) -> dict[str, Any]:
     run_dir = summary_path.parent
     run_id = run_dir.name
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    summary = _apply_curation_summary(summary)
+    summary = _apply_curation_summary(summary, run_dir)
     story_path = run_dir / "historia.txt"
     run = {
         "id": run_id,
@@ -2571,7 +2812,7 @@ def _run_pipeline(
         final_state = result.output_for_node("enhanced_langgraph_workflow_asset")
         validation = result.output_for_node("enhanced_validation_asset")
         summary = _build_summary(run_dir=run_dir, final_state=final_state)
-        summary = _apply_curation_summary(summary)
+        summary = _apply_curation_summary(summary, run_dir)
         summary["image_style"] = image_style
         summary["image_quality_preset"] = image_quality_preset
         summary["dagster"] = {
@@ -2740,7 +2981,7 @@ def set_run_curation(run_id: str) -> Response:
             "attempts": attempts,
             "updated_at": datetime.utcnow().isoformat(),
         }
-        run["summary"] = _apply_curation_summary(summary)
+        run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
         run["updated_at"] = datetime.utcnow().isoformat()
         _persist_summary(run)
         return jsonify(run)
@@ -2806,7 +3047,7 @@ def mark_final_video_viewed(run_id: str) -> Response:
         final_review = summary.setdefault("curation", {}).setdefault("final_review", {})
         final_review["video_viewed"] = True
         final_review["viewed_at"] = datetime.utcnow().isoformat()
-        run["summary"] = _apply_curation_summary(summary)
+        run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
         run["updated_at"] = datetime.utcnow().isoformat()
         _persist_summary(run)
         return jsonify(run)
@@ -2823,7 +3064,7 @@ def approve_final_cut(run_id: str) -> Response:
         summary = run.get("summary")
         if not summary:
             return jsonify({"error": "run summary is not ready"}), 409
-        summary = _apply_curation_summary(summary)
+        summary = _apply_curation_summary(summary, Path(run["run_dir"]))
         curation = summary.setdefault("curation", {})
         if not curation.get("can_final_approve"):
             return (
@@ -2843,7 +3084,7 @@ def approve_final_cut(run_id: str) -> Response:
                 "note": note,
             }
         )
-        run["summary"] = _apply_curation_summary(summary)
+        run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
         run["updated_at"] = datetime.utcnow().isoformat()
         _persist_summary(run)
         return jsonify(run)
@@ -2858,9 +3099,10 @@ def publish_gate(run_id: str) -> Response:
         summary = run.get("summary")
         if not summary:
             return jsonify({"error": "run summary is not ready"}), 409
-        summary = _apply_curation_summary(summary)
+        summary = _apply_curation_summary(summary, Path(run["run_dir"]))
         curation = summary.get("curation", {})
         publication = summary.setdefault("publication", {})
+        production = summary.get("production_status", {})
         run["summary"] = summary
         run["updated_at"] = datetime.utcnow().isoformat()
         _persist_summary(run)
@@ -2880,7 +3122,7 @@ def publish_gate(run_id: str) -> Response:
                     "message": "youtube upload already running",
                 }
             )
-        if publication.get("status") == "published":
+        if production.get("status") == "published_current":
             publication.update({"error": None, "failed_at": None})
             run["summary"] = summary
             run["updated_at"] = datetime.utcnow().isoformat()
@@ -2967,7 +3209,7 @@ def retry_scene(run_id: str) -> Response:
             "retry_scope": scope,
             "updated_at": datetime.utcnow().isoformat(),
         }
-        run["summary"] = _apply_curation_summary(summary)
+        run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
         run["updated_at"] = datetime.utcnow().isoformat()
         _persist_summary(run)
 
