@@ -260,6 +260,7 @@ Thumbs.db
 # Scripts de teste (ignorar)
 test_*.py
 *_test.py
+!tests/hero_object_gate_test.py
 teste_*.py
 *_teste.py
 debug_*.py
