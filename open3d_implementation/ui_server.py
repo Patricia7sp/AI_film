@@ -8,10 +8,9 @@ inspect generated assets without exposing secrets.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
-import requests
 import subprocess
 import sys
 import threading
@@ -21,22 +20,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import requests
+from dagster._core.errors import DagsterError
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, redirect, request, send_file
-from dagster._core.errors import DagsterError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPEN3D_ROOT = Path(__file__).resolve().parent
 STORY_PATH = REPO_ROOT / "data" / "historia.txt"
 RUNS_ROOT = Path(os.getenv("AI_FILM_RUNS_ROOT", "/tmp/ai_film_ui_runs"))
 ALLOWED_IMAGE_STYLES = {
+    "comic_storybook",
     "cinematic_realism",
     "storybook_animation",
     "editorial_black_white",
     "watercolor_illustration",
     "anime_cinematic",
 }
-ALLOWED_IMAGE_QUALITY_PRESETS = {"balanced", "high"}
+ALLOWED_IMAGE_QUALITY_PRESETS = {"balanced", "high", "turbo"}
 ALLOWED_CURATION_STATUSES = {
     "approved",
     "rejected",
@@ -166,6 +167,7 @@ INDEX_HTML = r"""<!doctype html>
     .badge.approved { color: var(--ok); border-color: rgba(110, 211, 154, .35); }
     .badge.rejected { color: var(--bad); border-color: rgba(212, 103, 94, .35); }
     .badge.pending_review, .badge.retry_requested { color: var(--warn); border-color: rgba(224, 168, 92, .35); }
+    .badge.controlled { color: var(--warn); border-color: rgba(224, 168, 92, .55); background: rgba(224, 168, 92, .08); }
     .curation { margin: 14px 0; border: 1px solid var(--line); border-radius: 8px; background: #0d0f12; overflow: hidden; }
     .curation-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-bottom: 1px solid var(--line); }
     .curation-title { font: 600 18px/1.2 ui-serif, Georgia, serif; }
@@ -230,6 +232,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <label for="style">Estilo das imagens</label>
       <select id="style">
+        <option value="comic_storybook">História em quadrinhos premium</option>
         <option value="cinematic_realism">Cinematográfico realista</option>
         <option value="storybook_animation">Animação storybook</option>
         <option value="editorial_black_white">Preto e branco editorial</option>
@@ -239,6 +242,7 @@ INDEX_HTML = r"""<!doctype html>
       <label for="qualityPreset">Qualidade da imagem</label>
       <select id="qualityPreset">
         <option value="high">Alta</option>
+        <option value="turbo">Turbo SDXL</option>
         <option value="balanced">Balanceada</option>
       </select>
       <input id="file" type="file" accept=".txt,.md,text/plain" style="margin-bottom:12px">
@@ -293,7 +297,10 @@ async function api(path, options) {
 async function refreshHealth() {
   try {
     const data = await api('/api/health');
-    $('health').textContent = `online · ${data.models.gemini_text} · imagem ${data.image_provider}:${data.models.gemini_image_quality}`;
+    const imageModel = data.image_provider === 'comfyui'
+      ? data.models.comfyui_checkpoint
+      : data.models.gemini_image_quality;
+    $('health').textContent = `online · ${data.models.gemini_text} · imagem ${data.image_provider}:${imageModel}`;
     $('health').className = 'pill ok';
   } catch (err) {
     $('health').textContent = 'offline';
@@ -381,6 +388,7 @@ function renderAttemptCard(run, sceneId, review, attemptId) {
         <div>escopo: ${escapeHtml(attempt.retry_scope || 'original')}</div>
         <div>providers: ${escapeHtml([attempt.image_provider, attempt.video_provider, attempt.audio_provider].filter(Boolean).join(' · ') || '-')}</div>
         <div>motivo: ${escapeHtml(attempt.reason || '-')}</div>
+        ${controlledWorkflowDetail(attempt)}
         ${attemptHeroDetail(attempt)}
         ${attemptAudioDetail(attempt)}
         ${attempt.error ? `<div style="grid-column:1 / -1" class="bad">erro: ${escapeHtml(attempt.error)}</div>` : ''}
@@ -411,7 +419,20 @@ function imageQualityDetail(item) {
   const heroState = item.hero_object_legibility === true ? 'hero legível' : item.hero_object_legibility === false ? 'hero ilegível' : '';
   const heroNotes = item.hero_object_notes ? ` · ${item.hero_object_notes}` : '';
   const hero = heroObjects ? ` · ${heroState || 'hero n/a'}: ${heroObjects}${heroNotes}` : '';
-  return `${item.width || 0}x${item.height || 0} · ${item.size_bytes || 0} bytes${hero}`;
+  const controlled = item.control_workflow_required ? ` · requer ${item.recommended_generation_strategy || 'workflow controlado'}` : '';
+  const used = item.controlled_workflow ? ` · ControlNet: ${item.controlnet_model || 'ativo'}` : '';
+  return `${item.width || 0}x${item.height || 0} · ${item.size_bytes || 0} bytes${hero}${controlled}${used}`;
+}
+
+function controlledWorkflowDetail(record) {
+  if (record?.controlled_workflow) {
+    const reference = record.control_image ? ` · ref ${escapeHtml(record.control_image)}` : '';
+    return `<div style="grid-column:1 / -1"><span class="badge controlled">ControlNet</span> retry controlado usado${record.controlnet_model ? ` · ${escapeHtml(record.controlnet_model)}` : ''}${reference}</div>`;
+  }
+  if (!record?.control_workflow_required) return '';
+  const strategy = record.recommended_generation_strategy || 'controlled_inpaint';
+  const action = record.operator_next_action || 'Usar inpaint/ControlNet antes de novo retry.';
+  return `<div style="grid-column:1 / -1"><span class="badge controlled">${escapeHtml(strategy)}</span> ${escapeHtml(action)}</div>`;
 }
 
 function attemptHeroDetail(attempt) {
@@ -529,7 +550,22 @@ function renderCuration(run) {
     const reasonId = `curation-reason-${sceneId}`;
     const scopeId = `curation-scope-${sceneId}`;
     const attemptId = review.active_attempt_id || 'attempt_1';
-    const attempts = review.attempts?.length ? review.attempts : [{id: attemptId, status: 'active', image_path: img.image_path, video_path: clip.video_path, audio_path: audio.audio_path}];
+    const attempts = review.attempts?.length ? review.attempts : [{
+      id: attemptId,
+      status: 'active',
+      image_path: img.image_path,
+      video_path: clip.video_path,
+      audio_path: audio.audio_path,
+      image_quality_score: imageMetric.quality_score,
+      image_semantic_score: imageMetric.semantic_score,
+      image_semantic_accepted: imageMetric.semantic_accepted,
+      hero_objects: imageMetric.hero_objects || [],
+      hero_object_legibility: imageMetric.hero_object_legibility,
+      hero_object_notes: imageMetric.hero_object_notes || '',
+      control_workflow_required: imageMetric.control_workflow_required || false,
+      recommended_generation_strategy: imageMetric.recommended_generation_strategy || 'txt2img_retry',
+      operator_next_action: imageMetric.operator_next_action || ''
+    }];
     review.attempts = attempts;
     const defaults = comparisonSelections[sceneId] || defaultCompareSelection(review);
     const leftAttempt = attempts.find(attempt => attempt.id === defaults.left)?.id || attemptId;
@@ -552,6 +588,7 @@ function renderCuration(run) {
             <span class="badge ${escapeHtml(review.status || 'pending_review')}">${escapeHtml(review.status || 'pending_review')}</span>
             <div style="margin-top:8px">pré-gate: ${escapeHtml(autoVerdict)}</div>
             <div>imagem: ${escapeHtml(imageMetric.quality_score || 0)} · semântico ${escapeHtml(imageMetric.semantic_score ?? '-')}</div>
+            ${controlledWorkflowDetail(imageMetric)}
             <div>vídeo: ${escapeHtml(clip.quality_score || '-')}</div>
             <div>áudio: ${escapeHtml(audioMetric.quality_score || '-')}</div>
             <div>tentativa ativa: ${escapeHtml(attemptId)}</div>
@@ -728,11 +765,18 @@ async function requestSceneRetry(sceneId) {
     return;
   }
   await setCuration(sceneId, 'retry_requested');
-  const data = await api(`/api/runs/${currentRun}/retry-scene`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({scene_id: sceneId, note, reason, scope})
-  });
+  let data;
+  try {
+    data = await api(`/api/runs/${currentRun}/retry-scene`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scene_id: sceneId, note, reason, scope})
+    });
+  } catch (err) {
+    logLine(`retry bloqueado para cena ${sceneId}: ${err.message}`);
+    await poll();
+    return;
+  }
   currentRun = data.id;
   logLine(`retry ${scope} iniciado para cena ${sceneId}: ${currentRun}`);
   await poll();
@@ -1414,6 +1458,55 @@ def _replace_scene_record(
     return updated
 
 
+def _find_scene_quality_record(
+    summary: dict[str, Any],
+    scene_id: str,
+) -> dict[str, Any]:
+    for record in summary.get("quality_metrics", {}).get("images", []):
+        if str(record.get("scene_id")) == scene_id:
+            return dict(record)
+    return {}
+
+
+def _controlled_image_retry_available() -> bool:
+    provider = os.getenv("IMAGE_GENERATION_PROVIDER", "comfyui").strip().lower()
+    controlnet_model = os.getenv(
+        "COMFYUI_CONTROLNET_CANNY_MODEL",
+        "controlnet-canny-sdxl-1.0.safetensors",
+    ).strip()
+    return bool(
+        provider == "comfyui"
+        and os.getenv("RUNPOD_API_KEY")
+        and os.getenv("RUNPOD_ENDPOINT_ID")
+        and controlnet_model
+    )
+
+
+def _controlled_retry_blocker(
+    summary: dict[str, Any],
+    scene_id: str,
+    scope: str,
+) -> dict[str, Any] | None:
+    if scope not in {"image", "image_video", "full_scene"}:
+        return None
+    image_metric = _find_scene_quality_record(summary, scene_id)
+    if not bool(image_metric.get("control_workflow_required")):
+        return None
+    if _controlled_image_retry_available():
+        return None
+    return {
+        "error": "controlled_workflow_unavailable",
+        "scene_id": scene_id,
+        "scope": scope,
+        "recommended_generation_strategy": image_metric.get(
+            "recommended_generation_strategy", "controlled_inpaint"
+        ),
+        "operator_next_action": image_metric.get("operator_next_action")
+        or "Prepare ControlNet/inpaint before retrying this visual scene.",
+        "issues": image_metric.get("issues", []),
+    }
+
+
 def _attempt_image_quality_patch(attempt: dict[str, Any]) -> dict[str, Any]:
     image_job = attempt.get("image_job") or {}
     return {
@@ -1432,6 +1525,20 @@ def _attempt_image_quality_patch(attempt: dict[str, Any]) -> dict[str, Any]:
         ),
         "hero_object_notes": attempt.get("hero_object_notes")
         or image_job.get("hero_object_notes", ""),
+        "control_workflow_required": attempt.get("control_workflow_required")
+        or image_job.get("control_workflow_required", False),
+        "recommended_generation_strategy": attempt.get(
+            "recommended_generation_strategy"
+        )
+        or image_job.get("recommended_generation_strategy", "txt2img_retry"),
+        "operator_next_action": attempt.get("operator_next_action")
+        or image_job.get("operator_next_action", ""),
+        "controlled_workflow": attempt.get("controlled_workflow")
+        or image_job.get("controlled_workflow", False),
+        "controlnet_model": attempt.get("controlnet_model")
+        or image_job.get("controlnet_model", ""),
+        "control_image": attempt.get("control_image")
+        or image_job.get("control_image", ""),
     }
 
 
@@ -1796,9 +1903,14 @@ def _run_selective_visual_retry(
 ) -> None:
     from open3d_implementation.core.langgraph_adapter import (
         _build_image_prompt,
+        _comfyui_controlnet_available,
         _generate_runway_clip,
-        _probe_image_quality,
+        _resolve_comfyui_checkpoint,
+        _resolve_image_style,
+        _resolve_quality_preset,
+        _run_comfyui_image_attempt,
         _run_gemini_image_attempt,
+        _safe_float,
         _scene_audio_duration,
         _scene_seed,
     )
@@ -1840,7 +1952,7 @@ def _run_selective_visual_retry(
         summary = run.get("summary", {})
         scene = _summary_scene(summary, scene_id)
         image_style = str(
-            run.get("image_style") or summary.get("image_style") or "cinematic_realism"
+            run.get("image_style") or summary.get("image_style") or "comic_storybook"
         )
         quality_preset_key = str(
             run.get("image_quality_preset")
@@ -1850,14 +1962,43 @@ def _run_selective_visual_retry(
         visual_bible = summary.get("visual_bible", {})
         instruction = _retry_instruction(reason, note, scope)
         active_attempt = _active_attempt(summary, scene_id)
+        source_image_metric = _find_scene_quality_record(summary, scene_id)
         base_image_path = _run_path(run, active_attempt.get("image_path"))
         image_path = base_image_path
         image_record = None
         image_metric = None
         image_job = None
+        image_provider = (
+            os.getenv("IMAGE_GENERATION_PROVIDER", "comfyui").strip().lower()
+        )
+        if image_provider not in {"comfyui", "gemini"}:
+            image_provider = "comfyui"
+        quality_preset = _resolve_quality_preset(quality_preset_key)
+        checkpoint_name = _resolve_comfyui_checkpoint(image_style)
+        style_label = _resolve_image_style(image_style)["label"]
+        controlled_workflow = bool(
+            image_provider == "comfyui"
+            and source_image_metric.get("control_workflow_required")
+            and _comfyui_controlnet_available()
+        )
+        if (
+            source_image_metric.get("control_workflow_required")
+            and image_provider == "comfyui"
+            and _comfyui_controlnet_available()
+            and (not base_image_path or not base_image_path.exists())
+        ):
+            raise RuntimeError("controlled_retry_reference_image_missing")
 
         if scope in {"image", "image_video", "full_scene"}:
             image_path = curation_dir / f"scene_{scene_id}_{attempt_id}_image.png"
+            if controlled_workflow:
+                instruction = (
+                    f"{instruction} Use the controlled ControlNet retry path: "
+                    "make the required hero object large, sharp, natural and readable "
+                    "while preserving approved character identity and global style. "
+                    "Use the control image as composition guidance only; do not render "
+                    "visible construction outlines, black strokes, labels or guide lines."
+                ).strip()
             directed_prompt = _build_image_prompt(
                 scene,
                 image_style,
@@ -1865,18 +2006,51 @@ def _run_selective_visual_retry(
                 instruction,
             )
             seed = _scene_seed(run_id, image_style, f"{scene_id}:{attempt_id}:curation")
-            image_job, image_record, image_metric = _run_gemini_image_attempt(
-                scene=scene,
-                image_path=str(image_path),
-                directed_prompt=directed_prompt,
-                image_style=image_style,
-                style_label=image_style.replace("_", " "),
-                quality_preset_key=quality_preset_key,
-                scene_seed=seed,
-                visual_bible=visual_bible,
-                attempt=int(attempt_id.split("_")[-1]),
-                reference_image_path=str(base_image_path) if base_image_path else None,
-            )
+            if image_provider == "comfyui":
+                runpod_api_key = os.getenv("RUNPOD_API_KEY", "")
+                runpod_endpoint_id = os.getenv("RUNPOD_ENDPOINT_ID", "")
+                if not (runpod_api_key and runpod_endpoint_id):
+                    raise RuntimeError("comfyui_retry_missing_runpod_credentials")
+                image_job, image_record, image_metric = _run_comfyui_image_attempt(
+                    scene=scene,
+                    image_path=str(image_path),
+                    directed_prompt=directed_prompt,
+                    image_style=image_style,
+                    style_label=style_label,
+                    quality_preset_key=quality_preset_key,
+                    quality_preset=quality_preset,
+                    checkpoint_name=checkpoint_name,
+                    scene_seed=seed,
+                    visual_bible=visual_bible,
+                    runpod_endpoint_id=runpod_endpoint_id,
+                    runpod_api_key=runpod_api_key,
+                    runpod_gpu_usd_per_second=_safe_float(
+                        os.getenv("RUNPOD_GPU_USD_PER_SECOND", "0.00044")
+                    ),
+                    attempt=int(attempt_id.split("_")[-1]),
+                    controlled_workflow=controlled_workflow,
+                    control_image_path=(
+                        str(base_image_path) if controlled_workflow else None
+                    ),
+                    reference_image_path=(
+                        str(base_image_path) if base_image_path else None
+                    ),
+                )
+            else:
+                image_job, image_record, image_metric = _run_gemini_image_attempt(
+                    scene=scene,
+                    image_path=str(image_path),
+                    directed_prompt=directed_prompt,
+                    image_style=image_style,
+                    style_label=style_label,
+                    quality_preset_key=quality_preset_key,
+                    scene_seed=seed,
+                    visual_bible=visual_bible,
+                    attempt=int(attempt_id.split("_")[-1]),
+                    reference_image_path=(
+                        str(base_image_path) if base_image_path else None
+                    ),
+                )
             if not image_record or not image_metric:
                 raise RuntimeError(
                     f"selective_image_retry_failed:{image_job.get('error') if image_job else 'unknown'}"
@@ -1933,7 +2107,14 @@ def _run_selective_visual_retry(
                     "image_path": str(image_path),
                     "video_path": str(video_path),
                     "audio_path": active_attempt.get("audio_path"),
-                    "image_provider": "gemini",
+                    "image_provider": (
+                        image_record.get("generation_method")
+                        if image_record
+                        else image_provider
+                    ),
+                    "controlled_workflow": controlled_workflow,
+                    "controlnet_model": (image_job or {}).get("controlnet_model", ""),
+                    "control_image": (image_job or {}).get("control_image", ""),
                     "video_provider": "runway",
                     "retry_scope": scope,
                     "reason": reason,
@@ -1949,6 +2130,15 @@ def _run_selective_visual_retry(
                     ),
                     "hero_object_notes": (image_metric or {}).get(
                         "hero_object_notes", ""
+                    ),
+                    "control_workflow_required": (image_metric or {}).get(
+                        "control_workflow_required", False
+                    ),
+                    "recommended_generation_strategy": (image_metric or {}).get(
+                        "recommended_generation_strategy", "txt2img_retry"
+                    ),
+                    "operator_next_action": (image_metric or {}).get(
+                        "operator_next_action", ""
                     ),
                     "video_quality_score": video_job.get("quality_score", 0),
                     "image_job": image_job,
@@ -1971,7 +2161,16 @@ def _run_selective_visual_retry(
                         {
                             **item,
                             "image_path": str(image_path),
-                            "generation_method": "gemini_image",
+                            "generation_method": image_record.get(
+                                "generation_method", image_provider
+                            ),
+                            "controlled_workflow": image_record.get(
+                                "controlled_workflow", False
+                            ),
+                            "controlnet_model": image_record.get(
+                                "controlnet_model", ""
+                            ),
+                            "control_image": image_record.get("control_image", ""),
                         }
                         if str(item.get("scene_id")) == scene_id
                         else item
@@ -1984,7 +2183,9 @@ def _run_selective_visual_retry(
                     scene_id,
                     {
                         "path": str(image_path),
-                        "generation_method": "gemini_image",
+                        "generation_method": image_record.get(
+                            "generation_method", image_provider
+                        ),
                         **image_quality_patch,
                     },
                 )
@@ -2100,8 +2301,8 @@ def _run_selective_audio_retry(
         _elevenlabs_voice_id_for_scene,
         _elevenlabs_voice_settings,
         _enhance_premium_audio,
-        _probe_media_quality,
         _premium_audio_direction,
+        _probe_media_quality,
         _response_error_detail,
     )
 
@@ -2439,6 +2640,8 @@ def _youtube_auth_status() -> dict[str, Any]:
                     "has_refresh_token": bool(credentials.refresh_token),
                 }
             )
+        except ImportError:
+            status["google_auth_dependency_missing"] = True
         except (OSError, ValueError):
             status["token_invalid"] = True
     return status
@@ -2713,7 +2916,7 @@ def _hydrate_run_from_summary(summary_path: Path) -> dict[str, Any]:
         "updated_at": datetime.utcnow().isoformat(),
         "retry_of": None,
         "target_scene_id": None,
-        "image_style": summary.get("image_style", "cinematic_realism"),
+        "image_style": summary.get("image_style", "comic_storybook"),
         "image_quality_preset": summary.get("image_quality_preset", "high"),
         "log": ["run carregado de pipeline_summary.json"],
         "summary": summary,
@@ -2754,6 +2957,7 @@ def _run_pipeline(
     image_quality_preset: str,
 ) -> None:
     from dagster import DagsterInstance, materialize
+
     from orchestration.enhanced_dagster_pipeline import (
         enhanced_langgraph_workflow_asset,
         enhanced_multimodal_input_asset,
@@ -2865,9 +3069,13 @@ def health() -> Response:
                 "gemini_image_quality": os.getenv(
                     "GEMINI_IMAGE_QUALITY_MODEL", "gemini-3-pro-image"
                 ),
+                "comfyui_checkpoint": os.getenv(
+                    "COMFYUI_DEFAULT_CHECKPOINT",
+                    "ai-film-comic-storybook-xl.safetensors",
+                ),
                 "openai_fast": os.getenv("OPENAI_FAST_MODEL", "gpt-5.4-nano"),
             },
-            "image_provider": os.getenv("IMAGE_GENERATION_PROVIDER", "gemini"),
+            "image_provider": os.getenv("IMAGE_GENERATION_PROVIDER", "comfyui"),
             "video_provider": os.getenv("VIDEO_GENERATION_PROVIDER", "runway"),
             "orchestrator": "dagster",
             "image_styles": sorted(ALLOWED_IMAGE_STYLES),
@@ -2918,7 +3126,7 @@ def create_run() -> Response:
     story_text = str(payload.get("story_text", "")).strip()
     if not story_text:
         return jsonify({"error": "story_text is required"}), 400
-    image_style = str(payload.get("image_style", "cinematic_realism")).strip()
+    image_style = str(payload.get("image_style", "comic_storybook")).strip()
     image_quality_preset = str(payload.get("image_quality_preset", "high")).strip()
     if image_style not in ALLOWED_IMAGE_STYLES:
         return jsonify({"error": "invalid image_style"}), 400
@@ -3197,6 +3405,9 @@ def retry_scene(run_id: str) -> Response:
         summary = run.get("summary") or {}
         if not summary:
             return jsonify({"error": "run summary is not ready"}), 409
+        controlled_blocker = _controlled_retry_blocker(summary, scene_id, scope)
+        if controlled_blocker:
+            return jsonify(controlled_blocker), 409
         curation = summary.setdefault("curation", {})
         scenes = curation.setdefault("scenes", {})
         existing = scenes.get(scene_id, {})
