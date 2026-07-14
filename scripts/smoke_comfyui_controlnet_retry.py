@@ -199,7 +199,9 @@ def _build_smoke_workflow() -> tuple[dict[str, Any], dict[str, Any]]:
 
 def main() -> int:
     load_dotenv(OPEN3D_ROOT / ".env", override=True)
-    endpoint_id = _required_env("RUNPOD_ENDPOINT_ID")
+    endpoint_id = os.getenv("COMFYUI_SMOKE_ENDPOINT_ID", "").strip() or _required_env(
+        "RUNPOD_ENDPOINT_ID"
+    )
     api_key = _required_env("RUNPOD_API_KEY")
     preset_key = os.getenv("COMFYUI_CONTROLNET_SMOKE_PRESET", "high")
     preset = _resolve_quality_preset(preset_key)

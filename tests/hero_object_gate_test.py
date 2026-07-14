@@ -31,6 +31,7 @@ from open3d_implementation.core.langgraph_adapter import (  # noqa: E402
     _scene_negative_prompt,
 )
 from scripts import smoke_comfyui_controlnet_retry as controlnet_smoke  # noqa: E402
+from scripts import smoke_comfyui_ipadapter_sequence as ipadapter_smoke  # noqa: E402
 
 
 def _names(scene):
@@ -389,6 +390,21 @@ def test_controlnet_smoke_saves_intermediate_and_final_outputs(tmp_path):
     intermediate_path = Path(saved["intermediate_path"])
     assert intermediate_path.read_bytes() == intermediate_bytes
     assert intermediate_path.name == "result_base_inpaint.png"
+
+
+def test_ipadapter_sequence_smoke_uses_approved_anchor():
+    anchor_workflow = ipadapter_smoke._build_anchor_workflow()
+    sequence_workflow = ipadapter_smoke._build_sequence_workflow()
+
+    assert "20" not in anchor_workflow
+    assert "21" not in anchor_workflow
+    assert "22" not in anchor_workflow
+    assert sequence_workflow["20"]["inputs"]["image"] == (
+        ipadapter_smoke.REFERENCE_IMAGE_NAME
+    )
+    assert sequence_workflow["21"]["class_type"] == "IPAdapterUnifiedLoader"
+    assert sequence_workflow["22"]["inputs"]["weight"] == 0.55
+    assert sequence_workflow["3"]["inputs"]["model"] == ["22", 0]
 
 
 def test_inpaint_reference_masks_only_the_small_hero_object_region(tmp_path):
