@@ -352,6 +352,12 @@ def test_controlnet_smoke_uses_production_prompt_contract():
     assert workflow["9"]["inputs"]["control_net_name"] == (
         "controlnet-depth-sdxl-1.0.safetensors"
     )
+    assert workflow["20"]["inputs"]["image"] == (
+        controlnet_smoke.IPADAPTER_REFERENCE_IMAGE_NAME
+    )
+    assert workflow["21"]["class_type"] == "IPAdapterUnifiedLoader"
+    assert workflow["22"]["class_type"] == "IPAdapterAdvanced"
+    assert workflow["3"]["inputs"]["model"] == ["22", 0]
     assert "13" not in workflow
     assert "14" not in workflow
     assert "15" not in workflow

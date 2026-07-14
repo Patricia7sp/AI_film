@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test the AI Film ComfyUI ControlNet retry workflow on RunPod."""
+"""Smoke test the AI Film ComfyUI ControlNet and IP-Adapter workflow on RunPod."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from open3d_implementation.core.langgraph_adapter import (  # noqa: E402
     _build_image_prompt,
     _encode_comfyui_control_image,
     _encode_comfyui_inpaint_image,
+    _encode_comfyui_reference_image,
     _probe_image_quality,
     _resolve_comfyui_checkpoint,
     _resolve_quality_preset,
@@ -38,6 +39,7 @@ from open3d_implementation.core.langgraph_adapter import (  # noqa: E402
 
 CONTROL_IMAGE_NAME = "controlnet_retry_reference.png"
 INPAINT_IMAGE_NAME = "controlnet_retry_inpaint.png"
+IPADAPTER_REFERENCE_IMAGE_NAME = "ipadapter_story_reference.png"
 
 
 def _required_env(name: str) -> str:
@@ -189,6 +191,8 @@ def _build_smoke_workflow() -> tuple[dict[str, Any], dict[str, Any]]:
         control_image_name=CONTROL_IMAGE_NAME,
         inpaint_image_name=INPAINT_IMAGE_NAME,
         refiner_enabled=False,
+        reference_image_name=IPADAPTER_REFERENCE_IMAGE_NAME,
+        ipadapter_enabled=True,
     )
     return workflow, smoke_scene
 
@@ -216,11 +220,15 @@ def main() -> int:
         height=preset["height"],
         scene=smoke_scene,
     )
+    reference_image = _encode_comfyui_reference_image(
+        str(CONTROL_SOURCE_PATH),
+        image_name=IPADAPTER_REFERENCE_IMAGE_NAME,
+    )
     job_id = _submit_workflow(
         endpoint_id,
         api_key,
         workflow,
-        [control_image, inpaint_image],
+        [control_image, inpaint_image, reference_image],
     )
     payload = _poll_job(endpoint_id, api_key, job_id)
     saved_images = _save_workflow_images(payload, OUTPUT_PATH)
