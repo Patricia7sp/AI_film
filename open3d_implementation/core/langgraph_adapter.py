@@ -2108,6 +2108,9 @@ def _run_comfyui_image_attempt(
     headers = {"Authorization": f"Bearer {runpod_api_key}"}
     model_family = _comfyui_model_family()
     flux2_enabled = model_family == "flux2_klein"
+    effective_checkpoint = (
+        _comfyui_flux2_model_names()[0] if flux2_enabled else checkpoint_name
+    )
     effective_controlled_workflow = controlled_workflow and not flux2_enabled
     control_image_name = (
         f"control_scene_{scene['scene_id']}_attempt_{attempt}.png"
@@ -2206,7 +2209,7 @@ def _run_comfyui_image_attempt(
         "style": image_style,
         "style_label": style_label,
         "quality_preset": quality_preset_key,
-        "checkpoint": checkpoint_name,
+        "checkpoint": effective_checkpoint,
         "model_family": model_family,
         "flux2_models": (list(_comfyui_flux2_model_names()) if flux2_enabled else []),
         "seed": scene_seed,
@@ -2339,7 +2342,7 @@ def _run_comfyui_image_attempt(
                 "base_prompt": scene["prompt"],
                 "style": image_style,
                 "quality_preset": quality_preset_key,
-                "checkpoint": checkpoint_name,
+                "checkpoint": effective_checkpoint,
                 "seed": scene_seed,
                 "duration": scene.get("duration", 6),
                 "camera_motion": scene.get(
@@ -2375,7 +2378,7 @@ def _run_comfyui_image_attempt(
                 "attempt": attempt,
                 "style": image_style,
                 "quality_preset": quality_preset_key,
-                "checkpoint": checkpoint_name,
+                "checkpoint": effective_checkpoint,
                 "model_family": model_family,
                 "seed": scene_seed,
                 "controlled_workflow": effective_controlled_workflow,
@@ -4482,6 +4485,12 @@ Retorne em formato JSON:
             style_label = _resolve_image_style(image_style)["label"]
             checkpoint_name = _resolve_comfyui_checkpoint(image_style)
             image_provider = _image_generation_provider()
+            model_family = _comfyui_model_family()
+            active_image_model = (
+                _comfyui_flux2_model_names()[0]
+                if image_provider == "comfyui" and model_family == "flux2_klein"
+                else checkpoint_name
+            )
             visual_bible = state.get("visual_bible") or _build_visual_bible(
                 state.get("story_text", ""),
                 image_style,
@@ -4490,7 +4499,8 @@ Retorne em formato JSON:
             print(
                 "🖼️ Gerando imagens... "
                 f"provider={image_provider}, estilo={style_label}, "
-                f"qualidade={quality_preset_key}, checkpoint={checkpoint_name}"
+                f"qualidade={quality_preset_key}, model_family={model_family}, "
+                f"modelo={active_image_model}"
             )
 
             scene_images = []
