@@ -20,6 +20,7 @@ START_SCRIPT_PATH = ROOT / "runpod_worker" / "start_ai_film.sh"
 MODEL_DOWNLOAD_SCRIPT_PATH = ROOT / "scripts" / "runpod_download_hf_model.sh"
 CONTROLNET_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_controlnet_volume.sh"
 IPADAPTER_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_ipadapter_volume.sh"
+FLUX2_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_flux2_volume.sh"
 CONTROLNET_COMMAND_PRINTER_PATH = (
     ROOT / "scripts" / "print_runpod_controlnet_install_command.py"
 )
@@ -82,7 +83,7 @@ def validate_dockerfile() -> List[str]:
         return ["runpod_worker/Dockerfile is missing"]
     text = DOCKERFILE_PATH.read_text(encoding="utf-8", errors="replace")
     required = (
-        "RUNPOD_COMFYUI_BASE_IMAGE=runpod/worker-comfyui:5.8.5-base",
+        "RUNPOD_COMFYUI_BASE_IMAGE=runpod/worker-comfyui:5.8.6-base",
         "FROM ${RUNPOD_COMFYUI_BASE_IMAGE}",
         "models/checkpoints",
         "ai-film-comic-storybook-xl.safetensors",
@@ -130,6 +131,8 @@ def validate_worker_wrapper() -> List[str]:
         "controlnet",
         "clip_vision",
         "ipadapter",
+        "diffusion_models",
+        "text_encoders",
         "/runpod-volume/models/${model_dir}",
         "/comfyui/models/${model_dir}",
         "exec /start.sh",
@@ -154,6 +157,9 @@ def validate_model_downloader() -> List[str]:
         "controlnet-sdxl-depth",
         "ipadapter-plus-sdxl",
         "clip-vision-vit-h",
+        "flux2-klein-base-4b",
+        "flux2-qwen-3-4b",
+        "flux2-vae",
         "models/controlnet",
         "HF_TOKEN",
         "curl -fL",
@@ -204,6 +210,27 @@ def validate_ipadapter_preparer() -> List[str]:
     return failures
 
 
+def validate_flux2_preparer() -> List[str]:
+    failures = validate_shell_script(
+        FLUX2_PREP_SCRIPT_PATH, "scripts/runpod_prepare_flux2_volume.sh"
+    )
+    if failures:
+        return failures
+    text = FLUX2_PREP_SCRIPT_PATH.read_text(encoding="utf-8", errors="replace")
+    required = (
+        "flux2-klein-base-4b",
+        "flux2-qwen-3-4b",
+        "flux2-vae",
+        "models/diffusion_models",
+        "models/text_encoders",
+        "AI_FILM_FLUX2_VOLUME_READY",
+    )
+    for item in required:
+        if item not in text:
+            failures.append(f"runpod_prepare_flux2_volume.sh missing: {item}")
+    return failures
+
+
 def validate_controlnet_command_printer() -> List[str]:
     if not CONTROLNET_COMMAND_PRINTER_PATH.exists():
         return ["scripts/print_runpod_controlnet_install_command.py is missing"]
@@ -234,6 +261,9 @@ def validate_controlnet_pod_controller() -> List[str]:
         "networkVolumeId",
         "controlnet-canny-sdxl-1.0",
         "controlnet-depth-sdxl-1.0",
+        "flux-2-klein-base-4b.safetensors",
+        "qwen_3_4b.safetensors",
+        "flux2-vae.safetensors",
         "status.json",
         "19123/http",
     )
@@ -333,6 +363,10 @@ def main() -> int:
     ipadapter_failures = validate_ipadapter_preparer()
     failures.extend(ipadapter_failures)
     print(f"- IP-Adapter preparer: {'ok' if not ipadapter_failures else 'failed'}")
+
+    flux2_failures = validate_flux2_preparer()
+    failures.extend(flux2_failures)
+    print(f"- FLUX.2 preparer: {'ok' if not flux2_failures else 'failed'}")
 
     command_printer_failures = validate_controlnet_command_printer()
     failures.extend(command_printer_failures)

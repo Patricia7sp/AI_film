@@ -17,7 +17,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Mapping, TypedDict
 
 import requests
 
@@ -181,6 +181,40 @@ def _resolve_comfyui_checkpoint(style_key: str | None) -> str:
         os.getenv(style_specific_key)
         or os.getenv("COMFYUI_DEFAULT_CHECKPOINT")
         or "ai-film-semantic-juggernaut-xl.safetensors"
+    )
+
+
+def _comfyui_model_family() -> str:
+    family = os.getenv("COMFYUI_MODEL_FAMILY", "sdxl").strip().lower()
+    if family not in {"sdxl", "flux2_klein"}:
+        return "sdxl"
+    return family
+
+
+def _comfyui_flux2_model_names() -> tuple[str, str, str]:
+    return (
+        os.getenv(
+            "COMFYUI_FLUX2_DIFFUSION_MODEL",
+            "flux-2-klein-base-4b.safetensors",
+        ).strip(),
+        os.getenv("COMFYUI_FLUX2_TEXT_ENCODER", "qwen_3_4b.safetensors").strip(),
+        os.getenv("COMFYUI_FLUX2_VAE", "flux2-vae.safetensors").strip(),
+    )
+
+
+def _comfyui_flux2_steps() -> int:
+    raw_steps = os.getenv("COMFYUI_FLUX2_STEPS", "20").strip()
+    try:
+        steps = int(raw_steps)
+    except ValueError:
+        steps = 20
+    return max(4, min(40, steps))
+
+
+def _comfyui_flux2_cfg() -> float:
+    return max(
+        1.0,
+        min(10.0, _safe_float(os.getenv("COMFYUI_FLUX2_CFG", "5.0"), 5.0)),
     )
 
 
@@ -1685,6 +1719,105 @@ def _encode_comfyui_inpaint_image(
     return {"name": image_name, "image": f"data:image/png;base64,{encoded}"}
 
 
+def _build_flux2_klein_workflow(
+    directed_prompt: str,
+    quality_preset: Mapping[str, object],
+    scene_seed: int,
+    scene_id: object,
+) -> Dict[str, Dict[str, object]]:
+    """Build the official ComfyUI FLUX.2 Klein Base 4B text-to-image graph."""
+    diffusion_model, text_encoder, vae_model = _comfyui_flux2_model_names()
+    dimensions: dict[str, int] = {}
+    for key in ("width", "height"):
+        value = quality_preset.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"flux2_invalid_{key}")
+        if value < 256 or value > 2048 or value % 64 != 0:
+            raise ValueError(f"flux2_invalid_{key}")
+        dimensions[key] = value
+    width = dimensions["width"]
+    height = dimensions["height"]
+    return {
+        "1": {
+            "inputs": {
+                "unet_name": diffusion_model,
+                "weight_dtype": "default",
+            },
+            "class_type": "UNETLoader",
+        },
+        "2": {
+            "inputs": {
+                "clip_name": text_encoder,
+                "type": "flux2",
+                "device": "default",
+            },
+            "class_type": "CLIPLoader",
+        },
+        "3": {
+            "inputs": {"vae_name": vae_model},
+            "class_type": "VAELoader",
+        },
+        "4": {
+            "inputs": {"text": directed_prompt, "clip": ["2", 0]},
+            "class_type": "CLIPTextEncode",
+        },
+        "5": {
+            "inputs": {"text": "", "clip": ["2", 0]},
+            "class_type": "CLIPTextEncode",
+        },
+        "6": {
+            "inputs": {"noise_seed": scene_seed},
+            "class_type": "RandomNoise",
+        },
+        "7": {
+            "inputs": {
+                "model": ["1", 0],
+                "positive": ["4", 0],
+                "negative": ["5", 0],
+                "cfg": _comfyui_flux2_cfg(),
+            },
+            "class_type": "CFGGuider",
+        },
+        "8": {
+            "inputs": {"sampler_name": "euler"},
+            "class_type": "KSamplerSelect",
+        },
+        "9": {
+            "inputs": {
+                "steps": _comfyui_flux2_steps(),
+                "width": width,
+                "height": height,
+            },
+            "class_type": "Flux2Scheduler",
+        },
+        "10": {
+            "inputs": {"width": width, "height": height, "batch_size": 1},
+            "class_type": "EmptyFlux2LatentImage",
+        },
+        "11": {
+            "inputs": {
+                "noise": ["6", 0],
+                "guider": ["7", 0],
+                "sampler": ["8", 0],
+                "sigmas": ["9", 0],
+                "latent_image": ["10", 0],
+            },
+            "class_type": "SamplerCustomAdvanced",
+        },
+        "12": {
+            "inputs": {"samples": ["11", 0], "vae": ["3", 0]},
+            "class_type": "VAEDecode",
+        },
+        "13": {
+            "inputs": {
+                "filename_prefix": f"scene_{scene_id}_flux2_klein",
+                "images": ["12", 0],
+            },
+            "class_type": "SaveImage",
+        },
+    }
+
+
 def _build_comfyui_workflow(
     directed_prompt: str,
     checkpoint_name: str,
@@ -1973,22 +2106,25 @@ def _run_comfyui_image_attempt(
         f"https://api.runpod.ai/v2/{runpod_endpoint_id}/status/{{job_id}}"
     )
     headers = {"Authorization": f"Bearer {runpod_api_key}"}
+    model_family = _comfyui_model_family()
+    flux2_enabled = model_family == "flux2_klein"
+    effective_controlled_workflow = controlled_workflow and not flux2_enabled
     control_image_name = (
         f"control_scene_{scene['scene_id']}_attempt_{attempt}.png"
-        if controlled_workflow and control_image_path
+        if effective_controlled_workflow and control_image_path
         else None
     )
     inpaint_image_name = (
         f"inpaint_scene_{scene['scene_id']}_attempt_{attempt}.png"
-        if controlled_workflow and control_image_path
+        if effective_controlled_workflow and control_image_path
         else None
     )
     reference_image_name = (
         f"ipadapter_scene_{scene['scene_id']}_attempt_{attempt}.png"
-        if reference_image_path and _comfyui_ipadapter_enabled()
+        if (not flux2_enabled and reference_image_path and _comfyui_ipadapter_enabled())
         else None
     )
-    refiner_enabled = bool(controlled_workflow and _comfyui_refiner_enabled())
+    refiner_enabled = bool(effective_controlled_workflow and _comfyui_refiner_enabled())
     refiner_checkpoint = _comfyui_refiner_checkpoint() if refiner_enabled else ""
     input_images = []
     if control_image_name and control_image_path:
@@ -2018,28 +2154,43 @@ def _run_comfyui_image_attempt(
             )
         )
 
-    workflow = _build_comfyui_workflow(
-        directed_prompt=directed_prompt,
-        checkpoint_name=checkpoint_name,
-        quality_preset=quality_preset,
-        scene_seed=scene_seed,
-        scene_id=scene["scene_id"],
-        negative_prompt=_scene_negative_prompt(scene),
-        controlled_workflow=controlled_workflow,
-        control_image_name=control_image_name,
-        inpaint_image_name=inpaint_image_name,
-        refiner_enabled=refiner_enabled,
-        refiner_checkpoint_name=refiner_checkpoint,
-        reference_image_name=reference_image_name,
-        ipadapter_enabled=bool(reference_image_name),
-        style_lora_name=_comfyui_style_lora_name(image_style),
+    if flux2_enabled:
+        workflow = _build_flux2_klein_workflow(
+            directed_prompt=directed_prompt,
+            quality_preset=quality_preset,
+            scene_seed=scene_seed,
+            scene_id=scene["scene_id"],
+        )
+        generation_method = "comfyui_flux2_klein"
+    else:
+        workflow = _build_comfyui_workflow(
+            directed_prompt=directed_prompt,
+            checkpoint_name=checkpoint_name,
+            quality_preset=quality_preset,
+            scene_seed=scene_seed,
+            scene_id=scene["scene_id"],
+            negative_prompt=_scene_negative_prompt(scene),
+            controlled_workflow=effective_controlled_workflow,
+            control_image_name=control_image_name,
+            inpaint_image_name=inpaint_image_name,
+            refiner_enabled=refiner_enabled,
+            refiner_checkpoint_name=refiner_checkpoint,
+            reference_image_name=reference_image_name,
+            ipadapter_enabled=bool(reference_image_name),
+            style_lora_name=_comfyui_style_lora_name(image_style),
+        )
+        generation_method = (
+            "comfyui_controlnet_inpaint_refiner"
+            if effective_controlled_workflow and refiner_enabled
+            else (
+                "comfyui_controlnet_inpaint"
+                if effective_controlled_workflow
+                else "comfyui"
+            )
+        )
+    controlnet_model = (
+        _comfyui_controlnet_model() if effective_controlled_workflow else ""
     )
-    generation_method = (
-        "comfyui_controlnet_inpaint_refiner"
-        if controlled_workflow and refiner_enabled
-        else "comfyui_controlnet_inpaint" if controlled_workflow else "comfyui"
-    )
-    controlnet_model = _comfyui_controlnet_model() if controlled_workflow else ""
 
     print(
         "📤 Enviando job para o endpoint RunPod Serverless "
@@ -2056,6 +2207,8 @@ def _run_comfyui_image_attempt(
         "style_label": style_label,
         "quality_preset": quality_preset_key,
         "checkpoint": checkpoint_name,
+        "model_family": model_family,
+        "flux2_models": (list(_comfyui_flux2_model_names()) if flux2_enabled else []),
         "seed": scene_seed,
         "width": quality_preset["width"],
         "height": quality_preset["height"],
@@ -2068,7 +2221,10 @@ def _run_comfyui_image_attempt(
             * (_comfyui_refiner_scale() if refiner_enabled else 1.0)
         ),
         "generation_method": generation_method,
-        "controlled_workflow": controlled_workflow,
+        "controlled_workflow": effective_controlled_workflow,
+        "control_deferred_to_native_flux2_edit": bool(
+            flux2_enabled and (controlled_workflow or reference_image_path)
+        ),
         "controlnet_model": controlnet_model,
         "control_image": control_image_name or "",
         "inpaint_image": inpaint_image_name or "",
@@ -2078,7 +2234,9 @@ def _run_comfyui_image_attempt(
             _comfyui_ipadapter_weight() if reference_image_name else 0.0
         ),
         "style_lora": _comfyui_style_lora_name(image_style),
-        "inpaint_denoise": _comfyui_inpaint_denoise() if controlled_workflow else 1.0,
+        "inpaint_denoise": (
+            _comfyui_inpaint_denoise() if effective_controlled_workflow else 1.0
+        ),
         "refiner_enabled": refiner_enabled,
         "refiner_checkpoint": refiner_checkpoint,
         "refiner_scale": _comfyui_refiner_scale() if refiner_enabled else 1.0,
@@ -2190,7 +2348,8 @@ def _run_comfyui_image_attempt(
                 ),
                 "runpod_job_id": job_id,
                 "generation_method": generation_method,
-                "controlled_workflow": controlled_workflow,
+                "model_family": model_family,
+                "controlled_workflow": effective_controlled_workflow,
                 "controlnet_model": controlnet_model,
                 "control_image": control_image_name or "",
                 "inpaint_image": inpaint_image_name or "",
@@ -2217,8 +2376,9 @@ def _run_comfyui_image_attempt(
                 "style": image_style,
                 "quality_preset": quality_preset_key,
                 "checkpoint": checkpoint_name,
+                "model_family": model_family,
                 "seed": scene_seed,
-                "controlled_workflow": controlled_workflow,
+                "controlled_workflow": effective_controlled_workflow,
                 "controlnet_model": controlnet_model,
                 "control_image": control_image_name or "",
                 "inpaint_image": inpaint_image_name or "",
@@ -3969,7 +4129,10 @@ def _aggregate_quality(
         if "semantic_gate_blocked" in item.get("issues", [])
         or (
             item.get("semantic_accepted") is False
-            and item.get("generation_method") in {"gemini_image", "comfyui", "mock"}
+            and (
+                item.get("generation_method") in {"gemini_image", "mock"}
+                or str(item.get("generation_method", "")).startswith("comfyui")
+            )
         )
     ]
     gate_status = "blocked" if blocked_images else "passed"
@@ -4652,7 +4815,7 @@ Retorne em formato JSON:
                     # Verifica se a imagem já foi gerada com sucesso acima; se não, cai no mock
                     if any(
                         img["scene_id"] == scene["scene_id"]
-                        and img["generation_method"] == "comfyui"
+                        and str(img["generation_method"]).startswith("comfyui")
                         for img in scene_images
                     ):
                         continue

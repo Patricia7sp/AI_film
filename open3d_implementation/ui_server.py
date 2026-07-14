@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 import uuid
@@ -28,7 +29,9 @@ from flask import Flask, Response, jsonify, redirect, request, send_file
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPEN3D_ROOT = Path(__file__).resolve().parent
 STORY_PATH = REPO_ROOT / "data" / "historia.txt"
-RUNS_ROOT = Path(os.getenv("AI_FILM_RUNS_ROOT", "/tmp/ai_film_ui_runs"))
+RUNS_ROOT = Path(
+    os.getenv("AI_FILM_RUNS_ROOT", str(Path(tempfile.gettempdir()) / "ai_film_ui_runs"))
+)
 ALLOWED_IMAGE_STYLES = {
     "comic_storybook",
     "cinematic_realism",
@@ -1470,12 +1473,14 @@ def _find_scene_quality_record(
 
 def _controlled_image_retry_available() -> bool:
     provider = os.getenv("IMAGE_GENERATION_PROVIDER", "comfyui").strip().lower()
+    model_family = os.getenv("COMFYUI_MODEL_FAMILY", "sdxl").strip().lower()
     controlnet_model = os.getenv(
         "COMFYUI_CONTROLNET_CANNY_MODEL",
         "controlnet-canny-sdxl-1.0.safetensors",
     ).strip()
     return bool(
         provider == "comfyui"
+        and model_family == "sdxl"
         and os.getenv("RUNPOD_API_KEY")
         and os.getenv("RUNPOD_ENDPOINT_ID")
         and controlnet_model

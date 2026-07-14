@@ -74,6 +74,42 @@ COMFYUI_DEFAULT_CHECKPOINT=ai-film-semantic-juggernaut-xl.safetensors
 COMFYUI_CHECKPOINT_COMIC_STORYBOOK=ai-film-semantic-juggernaut-xl.safetensors
 ```
 
+### PASSO 2A.1: FLUX.2 Klein Base 4B (tier semântico principal)
+
+O tier principal em validação é o FLUX.2 Klein Base 4B. Ele usa pesos Apache
+2.0, suporta text-to-image e edição multi-referência nativa e fica no Network
+Volume, sem Docker Desktop local:
+
+```bash
+bash scripts/runpod_prepare_flux2_volume.sh
+```
+
+Arquivos esperados:
+
+```text
+models/diffusion_models/flux-2-klein-base-4b.safetensors
+models/text_encoders/qwen_3_4b.safetensors
+models/vae/flux2-vae.safetensors
+```
+
+Não altere o endpoint principal durante o download ou no primeiro boot. Crie
+um endpoint temporário com a imagem `flux2-klein-COMMIT_SHA`, execute:
+
+```bash
+COMFYUI_FLUX2_SMOKE_ENDPOINT_ID=ENDPOINT_TEMPORARIO \
+python scripts/smoke_comfyui_flux2_klein.py
+```
+
+Somente após o smoke semântico e a revisão humana, ative:
+
+```bash
+COMFYUI_MODEL_FAMILY=flux2_klein
+```
+
+`COMFYUI_MODEL_FAMILY=sdxl` preserva o rollback para Juggernaut/Animagine,
+ControlNet e IP-Adapter. O controle nativo multi-referência do FLUX.2 deve ser
+ativado em uma etapa separada depois que o text-to-image passar o gate.
+
 **Modelo inicial recomendado:** `Juggernaut XL v9`, salvo no volume como
 `ai-film-semantic-juggernaut-xl.safetensors`. Ele é um checkpoint SDXL em arquivo
 único (`.safetensors`) e entra como baseline semantic-first: primeiro a cena
@@ -143,9 +179,10 @@ o Network Volume antes de ligar o endpoint.
 
 ### PASSO 2B: Build da imagem customizada (fallback)
 
-A imagem usa `runpod/worker-comfyui:5.8.5-base` por compatibilidade com os
-drivers CUDA disponíveis nos workers RTX A4000/A4500 do RunPod. A base
-`5.8.6-base` falhou no pre-flight de GPU com driver 12.6/12.8. O Dockerfile
+A imagem FLUX.2 usa `runpod/worker-comfyui:5.8.6-base` para disponibilizar os
+nodes core do workflow Klein. Essa imagem deve ser validada primeiro em um
+endpoint canário L4/Ada/Ampere; não substitua o endpoint SDXL em GPUs antigas
+que falharam no pre-flight de driver. O Dockerfile
 em `runpod_worker/Dockerfile` (neste repositório) baixa um
 checkpoint realista para produção cinematográfica
 (`ai-film-cinematic-realism.safetensors`) e mantém SD1.5
@@ -173,8 +210,8 @@ publica duas tags no GitHub Container Registry (GHCR), usando apenas o
 `GITHUB_TOKEN` efêmero do próprio workflow:
 
 ```text
-ghcr.io/patricia7sp/ai-film-comfyui-worker:storybook-ipadapter-latest
-ghcr.io/patricia7sp/ai-film-comfyui-worker:storybook-ipadapter-COMMIT_SHA
+ghcr.io/patricia7sp/ai-film-comfyui-worker:flux2-klein-latest
+ghcr.io/patricia7sp/ai-film-comfyui-worker:flux2-klein-COMMIT_SHA
 ```
 
 Use a tag com SHA no release do endpoint RunPod para deploy reproduzível. A tag

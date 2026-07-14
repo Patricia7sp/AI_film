@@ -1,4 +1,4 @@
-ARG RUNPOD_COMFYUI_BASE_IMAGE=runpod/worker-comfyui:5.8.5-base
+ARG RUNPOD_COMFYUI_BASE_IMAGE=runpod/worker-comfyui:5.8.6-base
 FROM ${RUNPOD_COMFYUI_BASE_IMAGE}
 
 WORKDIR /comfyui

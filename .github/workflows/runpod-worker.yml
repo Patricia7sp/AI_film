@@ -42,8 +42,8 @@ jobs:
           context: ./runpod_worker
           push: true
           tags: |
-            ghcr.io/patricia7sp/ai-film-comfyui-worker:storybook-ipadapter-latest
-            ghcr.io/patricia7sp/ai-film-comfyui-worker:storybook-ipadapter-${{ github.sha }}
+            ghcr.io/patricia7sp/ai-film-comfyui-worker:flux2-klein-latest
+            ghcr.io/patricia7sp/ai-film-comfyui-worker:flux2-klein-${{ github.sha }}
           cache-from: type=gha,scope=runpod-worker
           cache-to: type=gha,mode=max,scope=runpod-worker
           provenance: mode=max

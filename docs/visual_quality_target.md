@@ -20,22 +20,26 @@ the production standard:
   typography, credits or signs unless explicitly required by the story.
 - Video readiness: still images should be composed for later animation, with
   clear foreground/background separation and motion intent per scene.
-- Cost discipline: use ComfyUI/RunPod SDXL as the first image tier; escalate to
-  more expensive providers only after a measurable failure case.
+- Cost discipline: use self-hosted ComfyUI/RunPod FLUX.2 Klein as the first
+  image tier; keep SDXL/IP-Adapter as a measured fallback and escalate to paid
+  APIs only after a recorded semantic failure.
 
 Current first model target:
 
 - Provider: ComfyUI on RunPod Serverless
-- Model family: SDXL checkpoint
-- Checkpoint filename: `ai-film-comic-storybook-xl.safetensors`
-- Loader: `CheckpointLoaderSimple`
-- Initial Hugging Face source alias: `comic-sdxl`
+- Model family: FLUX.2 Klein Base 4B
+- Diffusion filename: `flux-2-klein-base-4b.safetensors`
+- Text encoder: `qwen_3_4b.safetensors`
+- VAE: `flux2-vae.safetensors`
+- Core loaders: `UNETLoader`, `CLIPLoader(type=flux2)`, `VAELoader`
 - Intended visual style: `comic_storybook`
+- License: Apache 2.0 for the 4B model family
 
-Reference-control stack:
+Fallback and reference-control stack:
 
-- IP-Adapter Plus SDXL preserves approved character/object appearance from a
-  reference frame without replacing the scene prompt.
+- FLUX.2 native image editing and multi-reference conditioning are the target
+  continuity layer after the text-to-image semantic gate passes.
+- IP-Adapter Plus SDXL remains the rollback path for approved references.
 - ControlNet Depth controls staging and hero-object placement.
 - Inpainting limits object repairs to the rejected region.
 - An optional original/licensed style LoRA may stabilize the film's visual
@@ -43,6 +47,14 @@ Reference-control stack:
   object-specific references.
 - Treat all model and training-data choices as commercial-use choices. Do not
   use non-commercial checkpoints in publishable or monetizable runs.
+
+Rollout gate:
+
+- Keep `COMFYUI_MODEL_FAMILY=sdxl` in the active environment until a temporary
+  FLUX.2 endpoint passes the semantic smoke.
+- Run `scripts/smoke_comfyui_flux2_klein.py` against that endpoint.
+- Switch the active endpoint and set `COMFYUI_MODEL_FAMILY=flux2_klein` only
+  after the generated frame passes both automated semantic QA and human review.
 
 Acceptance bar for the next image test:
 

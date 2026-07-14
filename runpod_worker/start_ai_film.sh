@@ -2,7 +2,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-MODEL_DIRS=(checkpoints controlnet loras vae clip_vision ipadapter upscale_models)
+MODEL_DIRS=(checkpoints controlnet diffusion_models loras text_encoders vae clip_vision ipadapter upscale_models)
 
 for model_dir in "${MODEL_DIRS[@]}"; do
     target_dir="/comfyui/models/${model_dir}"

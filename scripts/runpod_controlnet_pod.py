@@ -65,15 +65,23 @@ if [[ -d "/runpod-volume" ]]; then VOLUME_ROOT="/runpod-volume"; elif [[ -d "/wo
 CONTROLNET_DIR="${VOLUME_ROOT}/models/controlnet"
 IPADAPTER_DIR="${VOLUME_ROOT}/models/ipadapter"
 CLIP_VISION_DIR="${VOLUME_ROOT}/models/clip_vision"
+DIFFUSION_MODELS_DIR="${VOLUME_ROOT}/models/diffusion_models"
+TEXT_ENCODERS_DIR="${VOLUME_ROOT}/models/text_encoders"
+VAE_DIR="${VOLUME_ROOT}/models/vae"
 STATUS_DIR="/tmp/ai-film-status"
 mkdir -p "${STATUS_DIR}"
 write_status() {
   status="$1"; detail="$2"
   printf "{\"status\":\"%s\",\"detail\":\"%s\",\"volume_root\":\"%s\"}\n" "${status}" "${detail}" "${VOLUME_ROOT}" > "${STATUS_DIR}/status.json"
 }
+handle_error() {
+  write_status "failed" "download command failed"
+  sleep 600
+}
+trap handle_error ERR
 write_status "starting" "installing dependencies"
 python3 -m http.server 19123 --bind 0.0.0.0 --directory "${STATUS_DIR}" >/tmp/ai-film-status-server.log 2>&1 &
-mkdir -p "${CONTROLNET_DIR}" "${IPADAPTER_DIR}" "${CLIP_VISION_DIR}"
+mkdir -p "${CONTROLNET_DIR}" "${IPADAPTER_DIR}" "${CLIP_VISION_DIR}" "${DIFFUSION_MODELS_DIR}" "${TEXT_ENCODERS_DIR}" "${VAE_DIR}"
 download_model() {
   url="$1"; target="$2"; minimum_bytes="$3"; partial="${target}.partial"
   if [[ -f "${target}" ]] && [[ "$(stat -c%s "${target}")" -ge "${minimum_bytes}" ]]; then
@@ -95,9 +103,12 @@ download_model "https://huggingface.co/diffusers/controlnet-canny-sdxl-1.0/resol
 download_model "https://huggingface.co/diffusers/controlnet-depth-sdxl-1.0/resolve/main/diffusion_pytorch_model.safetensors" "${CONTROLNET_DIR}/controlnet-depth-sdxl-1.0.safetensors" 1073741824
 download_model "https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors" "${IPADAPTER_DIR}/ip-adapter-plus_sdxl_vit-h.safetensors" 536870912
 download_model "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors" "${CLIP_VISION_DIR}/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors" 1073741824
+download_model "https://huggingface.co/Comfy-Org/flux2-klein/resolve/main/split_files/diffusion_models/flux-2-klein-base-4b.safetensors" "${DIFFUSION_MODELS_DIR}/flux-2-klein-base-4b.safetensors" 6442450944
+download_model "https://huggingface.co/Comfy-Org/flux2-klein/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors" "${TEXT_ENCODERS_DIR}/qwen_3_4b.safetensors" 7516192768
+download_model "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors" "${VAE_DIR}/flux2-vae.safetensors" 107374182
 echo "AI_FILM_VISUAL_CONTROL_VOLUME_CONTENTS"
-ls -lh "${CONTROLNET_DIR}" "${IPADAPTER_DIR}" "${CLIP_VISION_DIR}"
-write_status "ready" "AI_FILM_VISUAL_CONTROL_VOLUME_READY"
+ls -lh "${CONTROLNET_DIR}" "${IPADAPTER_DIR}" "${CLIP_VISION_DIR}" "${DIFFUSION_MODELS_DIR}" "${TEXT_ENCODERS_DIR}" "${VAE_DIR}"
+write_status "ready" "AI_FILM_VISUAL_CONTROL_AND_FLUX2_VOLUME_READY"
 sleep 600'"""
 
 

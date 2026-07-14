@@ -4,6 +4,8 @@ import sys
 from io import BytesIO
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -13,11 +15,13 @@ from open3d_implementation.core.langgraph_adapter import (  # noqa: E402
     DEFAULT_IMAGE_STYLE,
     _audio_quality_gate,
     _build_comfyui_workflow,
+    _build_flux2_klein_workflow,
     _build_image_prompt,
     _build_scene_contract,
     _combine_image_quality,
     _comfyui_control_image_mode,
     _comfyui_controlnet_model,
+    _comfyui_model_family,
     _comfyui_refiner_enabled,
     _elevenlabs_voice_id_for_scene,
     _encode_comfyui_control_image,
@@ -213,6 +217,54 @@ def test_image_generation_defaults_to_comfyui_comic_storybook(monkeypatch):
     assert _resolve_comfyui_checkpoint("comic_storybook") == (
         "ai-film-semantic-juggernaut-xl.safetensors"
     )
+
+
+def test_comfyui_model_family_is_explicit_and_safe_by_default(monkeypatch):
+    monkeypatch.delenv("COMFYUI_MODEL_FAMILY", raising=False)
+    assert _comfyui_model_family() == "sdxl"
+
+    monkeypatch.setenv("COMFYUI_MODEL_FAMILY", "flux2_klein")
+    assert _comfyui_model_family() == "flux2_klein"
+
+    monkeypatch.setenv("COMFYUI_MODEL_FAMILY", "unknown")
+    assert _comfyui_model_family() == "sdxl"
+
+
+def test_flux2_klein_workflow_matches_official_comfyui_graph(monkeypatch):
+    monkeypatch.delenv("COMFYUI_FLUX2_STEPS", raising=False)
+    monkeypatch.delenv("COMFYUI_FLUX2_CFG", raising=False)
+    workflow = _build_flux2_klein_workflow(
+        directed_prompt="one child Alice reading beneath an oak tree",
+        quality_preset=_resolve_quality_preset("high"),
+        scene_seed=20260713,
+        scene_id=1,
+    )
+
+    assert workflow["1"]["class_type"] == "UNETLoader"
+    assert workflow["1"]["inputs"]["unet_name"] == ("flux-2-klein-base-4b.safetensors")
+    assert workflow["2"]["class_type"] == "CLIPLoader"
+    assert workflow["2"]["inputs"]["type"] == "flux2"
+    assert workflow["3"]["class_type"] == "VAELoader"
+    assert workflow["7"]["class_type"] == "CFGGuider"
+    assert workflow["7"]["inputs"]["cfg"] == 5.0
+    assert workflow["9"]["class_type"] == "Flux2Scheduler"
+    assert workflow["9"]["inputs"]["steps"] == 20
+    assert workflow["10"]["class_type"] == "EmptyFlux2LatentImage"
+    assert workflow["11"]["class_type"] == "SamplerCustomAdvanced"
+    assert workflow["13"]["class_type"] == "SaveImage"
+    assert workflow["4"]["inputs"]["text"] == (
+        "one child Alice reading beneath an oak tree"
+    )
+
+
+def test_flux2_klein_workflow_rejects_unsafe_dimensions():
+    with pytest.raises(ValueError, match="flux2_invalid_width"):
+        _build_flux2_klein_workflow(
+            directed_prompt="story frame",
+            quality_preset={"width": 833, "height": 1216},
+            scene_seed=1,
+            scene_id=1,
+        )
 
 
 def test_selective_visual_retry_has_comfyui_path_not_hidden_gemini_default():

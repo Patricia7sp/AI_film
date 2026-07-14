@@ -41,13 +41,31 @@ case "$MODEL_REF" in
     MODEL_FILENAME="${2:-CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors}"
     MIN_SIZE_GB="1.0"
     ;;
+  flux2-klein-base-4b)
+    MODEL_URL="https://huggingface.co/Comfy-Org/flux2-klein/resolve/main/split_files/diffusion_models/flux-2-klein-base-4b.safetensors"
+    RELATIVE_PATH="${3:-models/diffusion_models}"
+    MODEL_FILENAME="${2:-flux-2-klein-base-4b.safetensors}"
+    MIN_SIZE_GB="6.0"
+    ;;
+  flux2-qwen-3-4b)
+    MODEL_URL="https://huggingface.co/Comfy-Org/flux2-klein/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
+    RELATIVE_PATH="${3:-models/text_encoders}"
+    MODEL_FILENAME="${2:-qwen_3_4b.safetensors}"
+    MIN_SIZE_GB="7.0"
+    ;;
+  flux2-vae)
+    MODEL_URL="https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors"
+    RELATIVE_PATH="${3:-models/vae}"
+    MODEL_FILENAME="${2:-flux2-vae.safetensors}"
+    MIN_SIZE_GB="0.1"
+    ;;
   http://*|https://*)
     MODEL_URL="$MODEL_REF"
     ;;
   *)
     echo "Unknown model ref: ${MODEL_REF}" >&2
-    echo "Usage: $0 [semantic-sdxl|animation-sdxl|comic-sdxl|comic-sdxl-full|controlnet-sdxl-canny|controlnet-sdxl-depth|ipadapter-plus-sdxl|clip-vision-vit-h|huggingface-model-url] [filename] [relative-path]" >&2
-    echo "IP-Adapter aliases download the SDXL Plus adapter and its ViT-H image encoder into the Network Volume." >&2
+    echo "Usage: $0 [semantic-sdxl|animation-sdxl|comic-sdxl|comic-sdxl-full|controlnet-sdxl-canny|controlnet-sdxl-depth|ipadapter-plus-sdxl|clip-vision-vit-h|flux2-klein-base-4b|flux2-qwen-3-4b|flux2-vae|huggingface-model-url] [filename] [relative-path]" >&2
+    echo "Visual-control and FLUX.2 aliases download directly into the RunPod Network Volume." >&2
     exit 2
     ;;
 esac
