@@ -1,0 +1,7 @@
+[flake8]
+max-line-length = 120
+extend-ignore = E203
+per-file-ignores =
+    open3d_implementation/core/langgraph_adapter.py:E203,E501
+    open3d_implementation/ui_server.py:E501
+    scripts/runpod_controlnet_pod.py:E501

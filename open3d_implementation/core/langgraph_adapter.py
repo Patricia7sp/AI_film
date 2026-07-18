@@ -5,19 +5,19 @@ Integrates LangGraph workflows with Open3D visualization
 
 import ast
 import base64
+import hashlib
 import importlib
 import json
-import hashlib
 import math
 import os
 import re
 import shutil
-import subprocess
 import struct
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Mapping, TypedDict
 
 import requests
 
@@ -55,6 +55,17 @@ class Open3DAgentState(TypedDict, total=False):
 
 
 IMAGE_STYLE_PRESETS: Dict[str, Dict[str, str]] = {
+    "comic_storybook": {
+        "label": "Comic storybook",
+        "prompt": (
+            "premium comic storybook animation, original family-friendly illustrated characters, "
+            "expressive clean faces with large readable eyes, bold readable silhouettes, "
+            "hand-inked comic linework, painted storybook backgrounds, warm theatrical lighting, "
+            "consistent character identity across a single narrative film frame, "
+            "high-end animated feature concept art, "
+            "clear emotional acting, no brand imitation, no copyrighted character likeness"
+        ),
+    },
     "cinematic_realism": {
         "label": "Cinematic realism",
         "prompt": (
@@ -93,24 +104,32 @@ IMAGE_STYLE_PRESETS: Dict[str, Dict[str, str]] = {
     },
 }
 
-DEFAULT_IMAGE_STYLE = "cinematic_realism"
+DEFAULT_IMAGE_STYLE = "comic_storybook"
 
 IMAGE_QUALITY_PRESETS: Dict[str, Dict[str, Any]] = {
     "balanced": {
         "width": 768,
         "height": 1024,
         "steps": 28,
-        "cfg": 6.5,
-        "sampler_name": "euler",
+        "cfg": 5.0,
+        "sampler_name": "euler_ancestral",
         "scheduler": "normal",
     },
     "high": {
         "width": 832,
         "height": 1216,
-        "steps": 40,
-        "cfg": 7.2,
+        "steps": 35,
+        "cfg": 5.0,
         "sampler_name": "dpmpp_2m",
         "scheduler": "karras",
+    },
+    "turbo": {
+        "width": 832,
+        "height": 1216,
+        "steps": 8,
+        "cfg": 2.0,
+        "sampler_name": "euler_ancestral",
+        "scheduler": "normal",
     },
 }
 
@@ -125,7 +144,20 @@ IMAGE_NEGATIVE_PROMPT = (
     "unrequested rabbit, unrequested bunny, unrequested white rabbit, kitten beside the lap when the prompt says in lap, "
     "oversaturated grass, random modern clothing, incorrect era clothing, text, letters, words, captions, "
     "subtitles, title card, fake typography, poster layout, book page layout, page border, decorative frame, "
-    "watermark, logo, signature, artist mark, UI overlay, label, sign, banner, credits"
+    "watermark, logo, signature, artist mark, UI overlay, label, sign, banner, credits, "
+    "character sheet, model sheet, reference sheet, turnaround sheet, expression sheet, pose sheet, "
+    "concept art grid, costume design grid, multiple panels, split screen, tiled layout, lineup, "
+    "many versions of the same character, multiple poses of the same character, plain beige character sheet background, "
+    "anthropomorphic mouse, mouse wearing clothes, mouse holding teacup, mouse as main character, giant mouse, "
+    "human-sized mouse, mascot mouse, mouse portrait"
+)
+
+IMAGE_NEGATIVE_CORE = (
+    "low quality, worst quality, blurry, distorted, deformed, bad anatomy, malformed face, "
+    "extra fingers, fused hands, extra limbs, duplicate character, duplicate face, cropped head, "
+    "text, captions, watermark, logo, signature, multiple panels, split screen, character sheet, "
+    "adult Alice, fantasy ball gown, wrong era clothing, anthropomorphic mouse, mouse wearing clothes, "
+    "mouse as main character, giant mouse, mascot mouse"
 )
 
 
@@ -148,8 +180,72 @@ def _resolve_comfyui_checkpoint(style_key: str | None) -> str:
     return (
         os.getenv(style_specific_key)
         or os.getenv("COMFYUI_DEFAULT_CHECKPOINT")
-        or "v1-5-pruned-emaonly.safetensors"
+        or "ai-film-semantic-juggernaut-xl.safetensors"
     )
+
+
+def _comfyui_model_family() -> str:
+    family = os.getenv("COMFYUI_MODEL_FAMILY", "sdxl").strip().lower()
+    if family not in {"sdxl", "flux2_klein"}:
+        return "sdxl"
+    return family
+
+
+def _comfyui_flux2_model_names() -> tuple[str, str, str]:
+    return (
+        os.getenv(
+            "COMFYUI_FLUX2_DIFFUSION_MODEL",
+            "flux-2-klein-base-4b.safetensors",
+        ).strip(),
+        os.getenv("COMFYUI_FLUX2_TEXT_ENCODER", "qwen_3_4b.safetensors").strip(),
+        os.getenv("COMFYUI_FLUX2_VAE", "flux2-vae.safetensors").strip(),
+    )
+
+
+def _comfyui_flux2_steps() -> int:
+    raw_steps = os.getenv("COMFYUI_FLUX2_STEPS", "20").strip()
+    try:
+        steps = int(raw_steps)
+    except ValueError:
+        steps = 20
+    return max(4, min(40, steps))
+
+
+def _comfyui_flux2_cfg() -> float:
+    return max(
+        1.0,
+        min(10.0, _safe_float(os.getenv("COMFYUI_FLUX2_CFG", "5.0"), 5.0)),
+    )
+
+
+def _comfyui_semantic_repair_backend() -> str:
+    backend = os.getenv("COMFYUI_SEMANTIC_REPAIR_BACKEND", "sdxl").strip().lower()
+    if backend not in {"sdxl", "qwen_image_edit_2511"}:
+        return "sdxl"
+    return backend
+
+
+def _comfyui_qwen_edit_model_names() -> tuple[str, str, str]:
+    return (
+        os.getenv(
+            "COMFYUI_QWEN_EDIT_DIFFUSION_MODEL",
+            "qwen_image_edit_2511_fp8mixed.safetensors",
+        ).strip(),
+        os.getenv(
+            "COMFYUI_QWEN_EDIT_TEXT_ENCODER",
+            "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        ).strip(),
+        os.getenv("COMFYUI_QWEN_EDIT_VAE", "qwen_image_vae.safetensors").strip(),
+    )
+
+
+def _comfyui_qwen_edit_steps() -> int:
+    raw_steps = os.getenv("COMFYUI_QWEN_EDIT_STEPS", "40").strip()
+    try:
+        steps = int(raw_steps)
+    except ValueError:
+        steps = 40
+    return max(20, min(60, steps))
 
 
 def _cancel_runpod_job(endpoint_id: str, api_key: str, job_id: str) -> None:
@@ -507,6 +603,7 @@ def _hero_object_requirements(scene: Dict[str, Any]) -> List[Dict[str, str]]:
         ]
     ).lower()
     hero_objects: List[Dict[str, str]] = []
+    is_prop_reference = scene.get("scene_role") == "prop_reference"
 
     if _text_has_any_phrase(scene_text, ["formigueiro", "formigas", "anthill", "ants"]):
         hero_objects.append(
@@ -532,9 +629,17 @@ def _hero_object_requirements(scene: Dict[str, Any]) -> List[Dict[str, str]]:
         hero_objects.append(
             {
                 "name": "white mouse emerging from open sugar bowl",
-                "placement": "central lower-third hero object on the tea table",
-                "minimum_legibility": "mouse head/body and open sugar bowl rim must be clearly recognizable at thumbnail size",
-                "camera": "object-first medium close insert with Alice and Ludovico still visible as context",
+                "placement": (
+                    "centered on a neutral tabletop beside a separate lid and teaspoon"
+                    if is_prop_reference
+                    else "foreground on the tea table beside a teaspoon that anchors physical scale"
+                ),
+                "minimum_legibility": "mouse head and front paws are sharp, while the mouse remains much smaller than the normal tabletop sugar bowl",
+                "camera": (
+                    "isolated prop design reference with no people"
+                    if is_prop_reference
+                    else "foreground prop insert with Alice and Ludovico still visible in the midground"
+                ),
             }
         )
 
@@ -576,8 +681,16 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
     visual_object_text = _scene_visual_object_text(scene)
     full_scene_text = _scene_text(scene)
     hero_objects = _hero_object_requirements(scene)
-    required: List[str] = []
+    required: List[str] = [
+        str(item).strip() for item in scene.get("must_include", []) if str(item).strip()
+    ]
+    explicit_forbidden = [
+        str(item).strip()
+        for item in scene.get("must_not_include", [])
+        if str(item).strip()
+    ]
     forbidden: List[str] = [
+        *explicit_forbidden,
         "visible text, typography, subtitles, captions, watermark, signature",
         "duplicate protagonist, cloned face, repeated same person",
         "unrelated extra people not explicitly required by this scene",
@@ -585,6 +698,7 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
     ]
     character_rules: List[str] = []
     animal_rules: List[str] = []
+    is_prop_reference = scene.get("scene_role") == "prop_reference"
 
     if "alice" in scene_text:
         required.append(
@@ -663,11 +777,12 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
         ],
     ):
         required.append(
-            "fully visible open sugar bowl containing or releasing a small white mouse"
+            "one normal tabletop handleless sugar bowl containing or releasing a tiny white mouse, with one separate lid flat beside it"
         )
-        required.append(
-            "Alice and Ludovico visible together at the Victorian tea table"
-        )
+        if not is_prop_reference:
+            required.append(
+                "Alice and Ludovico visible together at the Victorian tea table"
+            )
         forbidden.extend(
             [
                 "coin trick replacing the mouse",
@@ -675,11 +790,18 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
                 "empty sugar bowl",
                 "teapot replacing the sugar bowl",
                 "mouse hidden outside the sugar bowl",
+                "handles on the sugar bowl",
+                "oversized serving bowl or tureen",
+                "mouse filling most of the sugar bowl",
                 "tight close-up that crops away the tea-table context",
             ]
         )
         animal_rules.append(
-            "The white mouse emerging from the sugar bowl is mandatory and must be visible; do not substitute it with a coin, napkin, teapot or vague magic trick. Keep a medium-wide tea-table frame so Alice, Ludovico, the sugar bowl and the mouse are readable together."
+            (
+                "The tiny white mouse emerging from the sugar bowl is mandatory. Show only its head and front paws above the rim, use the teaspoon as scale evidence, and show no person or hand."
+                if is_prop_reference
+                else "The tiny white mouse emerging from the sugar bowl is mandatory and must be visible; do not substitute it with a coin, napkin, teapot or vague magic trick. Anchor physical scale with a teaspoon beside the normal tabletop bowl, and keep Alice and Ludovico readable in the midground."
+            )
         )
 
     if hero_objects:
@@ -713,7 +835,7 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
             "If a kitten is in Alice's lap, it must touch the dress and sit on the lap, not beside her."
         )
 
-    if "chá" in scene_text or "tea" in scene_text:
+    if _text_has_any_phrase(scene_text, ["chá", "tea", "tea table", "tea service"]):
         required.append("Victorian tea table props explicitly described by the scene")
         forbidden.append("modern tea room objects or unrelated guests")
 
@@ -729,11 +851,86 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
 
 def _scene_negative_prompt(scene: Dict[str, Any]) -> str:
     contract = _build_scene_contract(scene)
-    return f"{IMAGE_NEGATIVE_PROMPT}, {', '.join(contract['forbidden'])}"
+    scene_text = _scene_text(scene)
+    color_forbidden: List[str] = []
+    if _text_has_any_phrase(
+        scene_text,
+        ["ratinho branco", "white mouse", "small white mouse"],
+    ):
+        color_forbidden.extend(
+            [
+                "black mouse",
+                "dark mouse",
+                "grey mouse",
+                "black animal blob",
+                "mouse silhouette",
+                "solid black mouse head",
+                "teacup",
+                "coffee cup",
+                "cup handle",
+                "saucer",
+            ]
+        )
+    ordered_constraints: List[str] = []
+    seen_constraints = set()
+    for constraint in [*color_forbidden, *contract["forbidden"]]:
+        normalized = str(constraint).strip()
+        key = normalized.lower()
+        if normalized and key not in seen_constraints:
+            ordered_constraints.append(normalized)
+            seen_constraints.add(key)
+    scene_constraints = ", ".join(ordered_constraints[:18])
+    return f"{scene_constraints}, {IMAGE_NEGATIVE_CORE}"[:1200]
+
+
+def _hero_object_composition_directive(
+    scene: Dict[str, Any],
+    hero_objects: List[Dict[str, str]],
+) -> str:
+    if not hero_objects:
+        return ""
+    scene_text = _scene_text(scene)
+    if scene.get("scene_role") == "prop_reference":
+        return (
+            "Isolated prop-reference composition: one compact handleless sugar bowl "
+            "centered on a neutral tabletop, separate lid lying flat and one normal "
+            "teaspoon beside it for scale. Only a tiny natural mouse head and front "
+            "paws peek above the rim. No person, hand, face, body, room or narrative "
+            "character. Product-design reference camera with the full prop set visible. "
+        )
+    directives = [
+        "Controlled hero-object composition: keep the required small object in the foreground as a prop, not as the protagonist.",
+        "Use a staged story frame with foreground/midground/background separation: foreground hero prop, midground named characters, background environment.",
+        "Do not replace named human characters with the small object; the object is evidence inside the scene.",
+    ]
+    if _text_has_any_phrase(
+        scene_text,
+        ["açucareiro", "acucareiro", "sugar bowl", "ratinho", "white mouse"],
+    ):
+        directives.extend(
+            [
+                "Foreground lower third: an open porcelain sugar bowl on the tea table, large enough to read, with only a tiny natural white mouse peeking from inside the bowl.",
+                "The mouse is a small natural animal but visually legible: white head, ears, black eyes and snout peeking over the sugar bowl rim; no clothes, no bow tie, no jacket, no teacup, no standing pose, no portrait, no mascot expression.",
+                "The sugar bowl is a lidded porcelain serving vessel with no cup handle, no teacup shape and no saucer; place its open lid beside or behind the bowl.",
+                "Midground: Alice is a 10-year-old Victorian child in a modest ivory-white dress and Ludovico is one adult male professor; both must be visible behind or beside the sugar bowl.",
+                "The sugar bowl remains the hero prop while Alice and Ludovico remain the story characters.",
+            ]
+        )
+    return " ".join(directives)[:1200] + " "
 
 
 def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
     style = _resolve_image_style(style_key)
+    if style_key == "comic_storybook":
+        continuity_style_rule = "keep the same premium comic/storybook animation medium; do not switch to photorealism, engraving, watercolor or flat anime"
+        palette = "storybook warm neutrals, soft garden greens, ivory fabric, expressive cinematic color keys, no neon fantasy saturation"
+        lens = "animation storyboard camera language, medium shot or medium-close shot, readable silhouette, clear acting pose, hero object visible"
+        production_design = "late Victorian storybook world with simplified but intentional props, painted backgrounds, clean linework and readable staging"
+    else:
+        continuity_style_rule = "do not switch between watercolor, engraving, black-and-white, photorealism, anime or cartoon unless the selected style says so"
+        palette = "muted woodland greens, warm ivory fabric, restrained cinematic contrast, no saturated fantasy colors"
+        lens = "eye-level 35mm film frame, medium-wide composition, clear subject separation, no extreme close-up unless required by the scene"
+        production_design = "late Victorian naturalism, real fabric texture, practical window or garden light, grounded historical props, no fantasy styling"
     protagonist = (
         "Alice, one curious approximately 10-year-old Victorian child, modest ivory-white day dress, brown hair, natural child proportions, consistent face family across scenes"
         if _story_has_any(story_text, ["alice"])
@@ -761,17 +958,17 @@ def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
         "aspect_ratio": "portrait 9:16 vertical film frame",
         "visual_continuity": [
             "every scene belongs to the same film, same medium, same palette, same character design",
-            "do not switch between watercolor, engraving, black-and-white, photorealism, anime or cartoon unless the selected style says so",
+            continuity_style_rule,
             "same protagonist face, age, wardrobe logic and silhouette across every scene",
             "preserve the protagonist identity from the first accepted frame when a reference image is provided",
-            "keep cinematic realism as a physical film still, not an illustration, engraving, doll render or staged fashion portrait",
+            "keep every frame storyboard-ready for later image-to-video animation",
         ],
         "protagonist": protagonist,
         "protagonist_identity": protagonist_identity,
         "animals": animals,
-        "palette": "muted woodland greens, warm ivory fabric, restrained cinematic contrast, no saturated fantasy colors",
-        "lens": "eye-level 35mm film frame, medium-wide composition, clear subject separation, no extreme close-up unless required by the scene",
-        "production_design": "late Victorian naturalism, real fabric texture, practical window or garden light, grounded historical props, no fantasy styling",
+        "palette": palette,
+        "lens": lens,
+        "production_design": production_design,
         "forbidden": [
             "duplicate Alice or duplicate main character",
             "adult Alice",
@@ -856,9 +1053,11 @@ def _character_reference_accepted(image_metric: Dict[str, Any] | None) -> bool:
     critical_failures = image_metric.get("semantic_critical_failures", [])
     if critical_failures:
         return False
-    return (
-        _safe_float(image_metric.get("quality_score")) >= 85
-        or _safe_float(image_metric.get("semantic_score")) >= 80
+    return bool(
+        image_metric.get("technical_accepted")
+        and image_metric.get("semantic_accepted")
+        and _safe_float(image_metric.get("semantic_score"))
+        >= _image_semantic_min_score()
     )
 
 
@@ -887,6 +1086,13 @@ def _motion_plan(scene: Dict[str, Any]) -> Dict[str, str]:
 def _shot_plan(scene: Dict[str, Any]) -> Dict[str, str]:
     scene_id = _safe_int(scene.get("scene_id"), 1)
     scene_text = _scene_positive_text(scene)
+    if scene.get("scene_role") == "prop_reference":
+        return {
+            "shot_type": "isolated prop design reference",
+            "camera_angle": "eye-level tabletop product reference on a neutral background",
+            "blocking": "compact sugar bowl centered with separate lid and teaspoon beside it; no people or hands",
+            "focal_priority": "tiny mouse head and paws first, compact bowl second, lid and teaspoon third",
+        }
     if _text_has_any(scene_text, ["formigueiro", "anthill", "ants"]):
         return {
             "shot_type": "low observational medium shot",
@@ -899,9 +1105,9 @@ def _shot_plan(scene: Dict[str, Any]) -> Dict[str, str]:
         ["açucareiro", "acucareiro", "ratinho", "white mouse", "sugar bowl"],
     ):
         return {
-            "shot_type": "object-first medium-close insert inside a readable two-shot",
-            "camera_angle": "eye-level table camera close enough that the sugar bowl and mouse are readable at thumbnail size",
-            "blocking": "open sugar bowl and white mouse dominate the central lower third; Alice and Ludovico lean in from opposite sides as contextual faces and hands",
+            "shot_type": "foreground prop insert inside a readable two-shot",
+            "camera_angle": "low tabletop camera with a teaspoon beside the sugar bowl to prove realistic physical scale",
+            "blocking": "normal-size handleless sugar bowl and teaspoon sit in the foreground; only the tiny mouse head and paws peek above the rim while Alice and Ludovico remain in the midground",
             "focal_priority": "white mouse and open sugar bowl first, Alice and Ludovico second, tea service third",
         }
     if _text_has_any(scene_text, ["toca", "rabbit hole", "coelho"]):
@@ -956,7 +1162,6 @@ def _build_image_prompt(
     style = _resolve_image_style(style_key)
     base_prompt = str(scene.get("prompt") or scene.get("description") or "").strip()
     description = str(scene.get("description") or "").strip()
-    source_excerpt = str(scene.get("source_excerpt") or "").strip()
     composition_notes = str(scene.get("composition_notes") or "").strip()
     must_include = ", ".join(
         str(item) for item in scene.get("must_include", []) if item
@@ -964,7 +1169,6 @@ def _build_image_prompt(
     must_not_include = ", ".join(
         str(item) for item in scene.get("must_not_include", []) if item
     )
-    bible_text = _visual_bible_text(visual_bible or _build_visual_bible("", style_key))
     scene_text = _scene_text(scene)
     scene_contract = _build_scene_contract(scene)
     shot_plan = _shot_plan(scene)
@@ -983,7 +1187,8 @@ def _build_image_prompt(
             "not incidental background details. If the object would not be identifiable in a thumbnail, "
             "move the camera closer, enlarge the object in frame, simplify surrounding props, and keep it "
             f"in sharp focus. Required hero objects: {' | '.join(hero_object_lines)}. "
-        )
+        )[:550]
+    hero_object_composition = _hero_object_composition_directive(scene, hero_objects)
     contract_rules = []
     if "alice" in scene_text:
         contract_rules.append(
@@ -1008,7 +1213,7 @@ def _build_image_prompt(
         contract_rules.append(
             "If the scene says the kitten is in Alice's lap, the kitten must physically rest on her lap, touching the dress, not standing beside her."
         )
-    if "chá" in scene_text or "tea" in scene_text:
+    if _text_has_any_phrase(scene_text, ["chá", "tea", "tea table", "tea service"]):
         contract_rules.append(
             "Tea-table scenes must show the requested tea table props and characters; do not replace named characters with another Victorian girl."
         )
@@ -1017,41 +1222,153 @@ def _build_image_prompt(
         if retry_instruction.strip()
         else ""
     )
+    required_text = "; ".join(scene_contract["required"])[:420]
+    forbidden_text = "; ".join(scene_contract["forbidden"])[:260]
+    character_rules_text = (
+        "; ".join(scene_contract["character_rules"])
+        or "keep the protagonist visually consistent with the film bible"
+    )[:350]
+    animal_rules_text = (
+        "; ".join(scene_contract["animal_rules"])
+        or "only show animals and objects explicitly requested by this scene"
+    )[:350]
+    compact_bible = (
+        f"Film style: {visual_bible.get('style_label', style['label'])}; "
+        f"medium: {style['prompt'][:180]}; "
+        f"protagonist: {str(visual_bible.get('protagonist_identity', visual_bible.get('protagonist', 'consistent named protagonist')))[:180]}; "
+        f"palette: {str(visual_bible.get('palette', ''))[:100]}."
+    )[:560]
     return (
-        f"{bible_text} "
-        f"{style['prompt']}. "
-        "Full-bleed clean film still only: no text, no letters, no subtitles, no captions, "
-        "no title card, no poster typography, no book page, no decorative border, no watermark, "
-        "no signature, no UI overlay anywhere in the frame. "
-        "Single coherent scene, exactly one instance of the main character, one clear focal subject, "
-        "do not repeat the same person anywhere else in the image, anatomically correct body, "
-        "symmetrical face, natural eyes, natural hands, full head visible, no cropped face. "
-        "If a child appears: fully clothed Victorian child, modest historical dress, "
-        "age-appropriate pose, non-sexual framing, exactly one child unless the scene explicitly asks for siblings. "
-        "If the story asks for Alice, she is a curious Victorian child, not an adult, not a princess, "
-        "not wearing a fantasy ball gown. If the story asks for cats or kittens, do not show dogs. "
-        f"Scene contract: {' '.join(contract_rules) if contract_rules else 'Obey must_include and must_not_include literally.'} "
-        f"Structured required elements: {'; '.join(scene_contract['required'])}. "
-        f"Structured forbidden elements: {'; '.join(scene_contract['forbidden'])}. "
-        f"{hero_object_clause}"
-        f"Character continuity rules: {'; '.join(scene_contract['character_rules']) or 'keep the protagonist visually consistent with the film bible'}. "
-        f"Animal/object rules: {'; '.join(scene_contract['animal_rules']) or 'only show animals and objects explicitly requested by this scene'}. "
-        f"Scene description: {description}. "
-        f"Grounding excerpt from original story: {source_excerpt[:900] or 'not provided'}. "
-        f"Scene-specific composition direction: {composition_notes or 'use a composition that is distinct from the other scenes while preserving the same film identity'}. "
+        f"Scene-first instruction: {description[:360]}. "
+        f"Visual prompt: {base_prompt[:520]}. "
+        f"Must include: {(must_include or 'the exact subject and objects described by the scene')[:360]}. "
+        f"Must not include: {(must_not_include or 'duplicate characters, wrong animals, unrelated people, fantasy costumes')[:220]}. "
+        f"Structured required elements: {required_text}. "
+        f"Structured forbidden elements: {forbidden_text}. "
         f"Shot list: shot_type={shot_plan['shot_type']}; camera_angle={shot_plan['camera_angle']}; blocking={shot_plan['blocking']}; focal_priority={shot_plan['focal_priority']}. "
-        f"Must include: {must_include or 'the exact subject and objects described by the scene'}. "
-        f"Must not include: {must_not_include or 'duplicate characters, wrong animals, unrelated people, fantasy costumes'}. "
-        f"Visual prompt: {base_prompt}. "
-        f"Camera motion intent for video: {_motion_plan(scene)['description']}. "
+        f"Composition direction: {(composition_notes or 'distinct scene composition, same film identity')[:260]}. "
+        f"{hero_object_clause}"
+        f"{hero_object_composition}"
+        f"{compact_bible} "
+        "One finished narrative story frame, one continuous environment, one camera angle, one moment in time, one clear focal subject. "
+        "Full-bleed clean film still, no typography, no border, no watermark. "
+        "Do not repeat the same character; use natural hands, complete face, complete body. "
+        f"Scene contract: {(' '.join(contract_rules) if contract_rules else 'Obey must_include and must_not_include literally.')[:500]} "
+        f"Character continuity rules: {character_rules_text}. "
+        f"Animal/object rules: {animal_rules_text}. "
         "Composition: vertical 9:16 frame, clear subject separation from background, rule of thirds, "
         "no random close-up unless explicitly requested, no isolated body parts."
         f"{retry_clause}"
     )
 
 
+def _build_flux2_image_prompt(
+    scene: Dict[str, Any],
+    style_key: str,
+    visual_bible: Dict[str, Any] | None = None,
+    retry_instruction: str = "",
+) -> str:
+    """Build a compact, priority-ordered prompt for FLUX.2's Qwen encoder."""
+
+    def compact(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        return value[:limit].rsplit(" ", 1)[0].rstrip(" ,;")
+
+    style = _resolve_image_style(style_key)
+    is_prop_reference = scene.get("scene_role") == "prop_reference"
+    contract = _build_scene_contract(scene)
+    shot = _shot_plan(scene)
+    description = str(scene.get("description") or scene.get("prompt") or "").strip()
+    identity = (
+        "no character, person, face, hand or body is allowed in this prop reference"
+        if is_prop_reference
+        else str(
+            (visual_bible or {}).get("protagonist_identity")
+            or (visual_bible or {}).get("protagonist")
+            or "keep every named character consistent with the film"
+        ).strip()
+    )
+    required = "; ".join(str(item) for item in contract["required"] if item)
+    forbidden_items = [str(item) for item in contract["forbidden"] if item]
+    if style_key == "comic_storybook":
+        forbidden_items = [
+            item
+            for item in forbidden_items
+            if not item.startswith("style switch, illustration/engraving/cartoon")
+        ]
+        forbidden_items.append(
+            "photorealism, engraving, watercolor, flat anime or mixed art styles"
+        )
+    forbidden = "; ".join(forbidden_items)
+    hero_objects = contract.get("hero_objects", [])
+    hero_clause = ""
+    if hero_objects:
+        hero_names = ", ".join(str(item["name"]) for item in hero_objects)
+        hero_clause = (
+            f"Isolated reference props: {hero_names}. Show the complete prop set on a "
+            "neutral background at believable tabletop scale, with no person or hand."
+            if is_prop_reference
+            else (
+                f"Foreground hero props: {hero_names}. Keep each prop at believable tabletop "
+                "scale and fully recognizable, without enlarging it into furniture or a container."
+            )
+        )
+    correction = (
+        f"Retry correction: {retry_instruction.strip()}"
+        if retry_instruction.strip()
+        else ""
+    )
+    opening = (
+        "Create one isolated vertical 9:16 prop design reference on a plain neutral background."
+        if is_prop_reference
+        else "Create one finished vertical 9:16 narrative frame, one camera angle and one moment."
+    )
+    art_direction = (
+        f"Art direction: {style['label']} prop-design linework; clean ink contours, "
+        "polished painted color, accurate porcelain geometry and no character-design elements."
+        if is_prop_reference
+        else (
+            f"Art direction: {style['label']}; {compact(style['prompt'], 320)}. "
+            "Original premium family comic animation, cinematic lighting, clean expressive faces, "
+            "consistent ink lines and polished painted color."
+        )
+    )
+    global_exclusions = (
+        "No person, face, hand, body, character, room, visible text, caption, border or watermark."
+        if is_prop_reference
+        else (
+            "No visible text, caption, border, watermark, character duplication, unrelated people, "
+            "adult-looking child, distorted anatomy or mixed visual medium."
+        )
+    )
+    sections = [
+        opening,
+        f"Story action: {compact(description, 500)}",
+        f"Required subjects and facts: {compact(required, 900)}",
+        f"Character identity: {compact(identity, 420)}",
+        (
+            f"Camera: {shot['shot_type']}; {shot['camera_angle']}. "
+            f"Blocking: {shot['blocking']}. Focus priority: {shot['focal_priority']}."
+        ),
+        hero_clause,
+        art_direction,
+        f"Hard exclusions: {compact(forbidden, 700)}",
+        global_exclusions,
+        correction,
+    ]
+    return compact(" ".join(section for section in sections if section), 3600)
+
+
 def _image_semantic_min_score() -> int:
     return _safe_int(os.getenv("IMAGE_SEMANTIC_MIN_SCORE", "88"), 88)
+
+
+def _image_min_edge_sharpness() -> float:
+    return max(
+        8.0,
+        min(60.0, _safe_float(os.getenv("IMAGE_MIN_EDGE_SHARPNESS", "24"), 24.0)),
+    )
 
 
 def _strict_image_semantic_gate() -> bool:
@@ -1063,7 +1380,147 @@ def _strict_image_semantic_gate() -> bool:
 
 
 def _image_generation_max_attempts() -> int:
-    return max(1, min(3, _safe_int(os.getenv("IMAGE_GENERATION_MAX_ATTEMPTS", "3"), 3)))
+    return max(1, min(4, _safe_int(os.getenv("IMAGE_GENERATION_MAX_ATTEMPTS", "4"), 4)))
+
+
+def _qwen_semantic_retry_enabled(
+    model_family: str,
+    repair_source_path: str | None,
+) -> bool:
+    return bool(
+        repair_source_path
+        and model_family == "flux2_klein"
+        and _comfyui_semantic_repair_backend() == "qwen_image_edit_2511"
+    )
+
+
+def _select_comfyui_retry_route(
+    *,
+    model_family: str,
+    attempt: int,
+    repair_source_path: str | None,
+    previous_metric: Dict[str, Any] | None,
+) -> tuple[bool, str | None, str]:
+    """Select a bounded repair backend instead of repeating one failed method."""
+    if model_family != "flux2_klein" or not repair_source_path:
+        return False, None, "controlled_inpaint"
+
+    configured_backend = _comfyui_semantic_repair_backend()
+    if attempt == 2 and configured_backend == "qwen_image_edit_2511":
+        return True, "qwen_image_edit_2511", "controlled_inpaint"
+
+    strategy = str(
+        (previous_metric or {}).get(
+            "recommended_generation_strategy",
+            "controlled_inpaint",
+        )
+    )
+    if strategy not in {"controlled_inpaint", "masked_inpaint"}:
+        strategy = "controlled_inpaint"
+    return True, "sdxl", strategy
+
+
+def _non_retryable_comfyui_job_error(job_monitor: Dict[str, Any]) -> bool:
+    error = str(job_monitor.get("error") or "").lower()
+    return any(
+        marker in error
+        for marker in (
+            "missing_node_type",
+            "node '",
+            "not in []",
+            "prompt_outputs_failed_validation",
+        )
+    )
+
+
+def _semantic_retry_instruction(
+    scene: Dict[str, Any],
+    image_metric: Dict[str, Any],
+) -> str:
+    explicit_retry = str(image_metric.get("semantic_retry_prompt") or "").strip()
+    if explicit_retry:
+        return explicit_retry
+
+    contract = _build_scene_contract(scene)
+    required = "; ".join(str(item) for item in contract.get("required", []) if item)
+    character_rules = "; ".join(
+        str(item) for item in contract.get("character_rules", []) if item
+    )
+    forbidden = "; ".join(str(item) for item in contract.get("forbidden", []) if item)
+    hero_notes = str(image_metric.get("hero_object_notes") or "").strip()
+    return (
+        "Preserve the approved camera, composition, lighting, palette and style. "
+        "Correct only the remaining semantic mismatch. "
+        f"Required: {required or 'obey every required scene element'}. "
+        f"Character rules: {character_rules or 'preserve exact identity and age'}. "
+        f"Hero-object QA: {hero_notes or 'keep the hero object physically small, natural and fully legible'}. "
+        f"Forbidden: {forbidden or 'duplicates, text, watermark and unrelated objects'}."
+    )[:1800]
+
+
+def _build_qwen_semantic_edit_prompt(
+    scene: Dict[str, Any],
+    directed_prompt: str,
+    *,
+    masked_edit: bool = False,
+    prop_reference_slot: int = 3,
+) -> str:
+    contract = _build_scene_contract(scene)
+    required = "; ".join(str(item) for item in contract.get("required", []) if item)
+    character_rules = "; ".join(
+        str(item) for item in contract.get("character_rules", []) if item
+    )
+    forbidden = "; ".join(str(item) for item in contract.get("forbidden", []) if item)
+    scene_text = _scene_text(scene)
+    spatial_constraints = ""
+    if _text_has_any_phrase(
+        scene_text,
+        ["açucareiro", "acucareiro", "sugar bowl", "ratinho", "white mouse"],
+    ):
+        spatial_constraints = (
+            "The handleless sugar bowl is a compact 12-centimeter tabletop object, "
+            "roughly one adult hand-span wide and no more than 18 percent of the "
+            "frame width. It must never become a serving bowl. The natural mouse is "
+            "tiny: show only its head and front paws peeking above the rim; its body "
+            "must remain hidden inside the bowl. Keep the separate lid and a normal "
+            "teaspoon beside it as unambiguous scale references. "
+        )
+    if masked_edit:
+        prompt = (
+            "Edit only the masked tabletop region in Image 1. Preserve every "
+            "unmasked pixel exactly, especially both people, their faces, hands, "
+            "clothes, the library, camera, lighting and portrait framing. "
+            f"Image {prop_reference_slot} is the approved prop reference. Replace "
+            "the old bowl, mouse, lid and spoon inside the mask with the exact "
+            f"object design and physical proportions from Image {prop_reference_slot}, "
+            "without copying its background. "
+            f"{spatial_constraints}"
+            "Produce one seamless story frame, not a collage or design sheet."
+        )
+        return re.sub(r"\s+", " ", prompt).strip()[:1200]
+    prompt = (
+        "Image 1 is a rejected draft, not an approved identity reference. "
+        "Lock Image 1 canvas dimensions, portrait aspect ratio, camera position, "
+        "room geometry and subject blocking; do not crop, zoom or turn it square. "
+        "When Image 2 is provided, it is the approved Alice identity and age "
+        "reference; replace Alice in Image 1 with the same unmistakably ten-year-old "
+        "child from Image 2. Preserve her round preteen facial family, exact hair, "
+        "flat child torso, short child proportions and modest ivory Victorian dress. "
+        "Never age her into a teenager or adult and never add makeup or adult curves. "
+        "When Image 3 is provided, it is the approved hero-object design reference; "
+        "copy its compact bowl geometry, separate lid, teaspoon scale and tiny mouse "
+        "visibility into the masked tabletop region without copying its background. "
+        "Preserve only its camera, room, lighting, palette and rendering style. "
+        "Rebuild every character or prop that violates the scene contract; never "
+        "preserve a duplicate person, wrong age, wrong gender, wrong object type, "
+        "wrong handle or wrong physical scale. "
+        f"{spatial_constraints}"
+        f"Exact required content: {required}. "
+        f"Character rules: {character_rules}. "
+        f"Hard exclusions: {forbidden}. "
+        f"Correction from semantic QA: {directed_prompt}"
+    )
+    return re.sub(r"\s+", " ", prompt).strip()[:3600]
 
 
 def _visual_consistency_min_score() -> int:
@@ -1119,9 +1576,9 @@ def _replace_scene_asset(
 
 
 def _image_generation_provider() -> str:
-    provider = os.getenv("IMAGE_GENERATION_PROVIDER", "gemini").strip().lower()
+    provider = os.getenv("IMAGE_GENERATION_PROVIDER", "comfyui").strip().lower()
     if provider not in {"gemini", "comfyui"}:
-        return "gemini"
+        return "comfyui"
     return provider
 
 
@@ -1141,20 +1598,796 @@ def _gemini_image_usd_per_image(quality_preset_key: str) -> float:
     )
 
 
+def _comfyui_controlnet_model() -> str:
+    if _comfyui_control_image_mode() == "semantic_depth":
+        return os.getenv(
+            "COMFYUI_CONTROLNET_DEPTH_MODEL",
+            "controlnet-depth-sdxl-1.0.safetensors",
+        ).strip()
+    return os.getenv(
+        "COMFYUI_CONTROLNET_CANNY_MODEL",
+        "controlnet-canny-sdxl-1.0.safetensors",
+    ).strip()
+
+
+def _comfyui_controlnet_available() -> bool:
+    return bool(_comfyui_controlnet_model())
+
+
+def _comfyui_ipadapter_enabled() -> bool:
+    return os.getenv("COMFYUI_IPADAPTER_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _comfyui_ipadapter_weight() -> float:
+    return max(
+        0.35,
+        min(0.90, _safe_float(os.getenv("COMFYUI_IPADAPTER_WEIGHT", "0.72"), 0.72)),
+    )
+
+
+def _comfyui_style_lora_name(style_key: str) -> str:
+    key = f"COMFYUI_STYLE_LORA_{style_key.upper()}"
+    return os.getenv(key, os.getenv("COMFYUI_STYLE_LORA", "")).strip()
+
+
+def _comfyui_style_lora_strength() -> float:
+    return max(
+        0.0,
+        min(1.0, _safe_float(os.getenv("COMFYUI_STYLE_LORA_STRENGTH", "0.65"), 0.65)),
+    )
+
+
+def _comfyui_control_image_mode() -> str:
+    mode = os.getenv("COMFYUI_CONTROL_IMAGE_MODE", "semantic_depth").strip().lower()
+    if mode not in {"semantic_depth", "semantic_hero", "source_edges"}:
+        return "semantic_depth"
+    return mode
+
+
+def _comfyui_controlnet_strength() -> float:
+    return max(
+        0.1,
+        min(
+            1.0,
+            _safe_float(os.getenv("COMFYUI_CONTROLNET_STRENGTH", "0.78"), 0.78),
+        ),
+    )
+
+
+def _comfyui_inpaint_denoise() -> float:
+    return max(
+        0.65,
+        min(0.95, _safe_float(os.getenv("COMFYUI_INPAINT_DENOISE", "0.85"), 0.85)),
+    )
+
+
+def _comfyui_qwen_inpaint_denoise() -> float:
+    return max(
+        0.85,
+        min(
+            1.0,
+            _safe_float(
+                os.getenv("COMFYUI_QWEN_INPAINT_DENOISE", "1.0"),
+                1.0,
+            ),
+        ),
+    )
+
+
+def _comfyui_refiner_enabled() -> bool:
+    return os.getenv("COMFYUI_REFINER_ENABLED", "false").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _comfyui_refiner_scale() -> float:
+    return max(
+        1.0,
+        min(1.5, _safe_float(os.getenv("COMFYUI_REFINER_SCALE", "1.25"), 1.25)),
+    )
+
+
+def _comfyui_refiner_denoise() -> float:
+    return max(
+        0.10,
+        min(0.40, _safe_float(os.getenv("COMFYUI_REFINER_DENOISE", "0.18"), 0.18)),
+    )
+
+
+def _comfyui_refiner_steps() -> int:
+    return max(
+        6,
+        min(18, _safe_int(os.getenv("COMFYUI_REFINER_STEPS", "6"), 6)),
+    )
+
+
+def _comfyui_refiner_checkpoint() -> str:
+    return os.getenv(
+        "COMFYUI_REFINER_CHECKPOINT",
+        "ai-film-dreamshaper-xl-turbo-sfw.safetensors",
+    ).strip()
+
+
+def _draw_semantic_hero_control_image(
+    scene: Dict[str, Any],
+    width: int,
+    height: int,
+):
+    from PIL import Image, ImageDraw, ImageFilter
+
+    image = Image.new("RGB", (width, height), "black")
+    draw = ImageDraw.Draw(image)
+    line = max(4, width // 120)
+    thin = max(2, line // 2)
+    white = (255, 255, 255)
+    gray = (170, 170, 170)
+    scene_text = _scene_text(scene)
+
+    def ellipse(box, *, outline=white, width_px=line):
+        draw.ellipse(tuple(int(v) for v in box), outline=outline, width=width_px)
+
+    def line_xy(points, *, fill=white, width_px=line):
+        draw.line([(int(x), int(y)) for x, y in points], fill=fill, width=width_px)
+
+    def rect(box, *, outline=white, width_px=line):
+        draw.rectangle(tuple(int(v) for v in box), outline=outline, width=width_px)
+
+    if _text_has_any_phrase(
+        scene_text,
+        ["açucareiro", "acucareiro", "sugar bowl", "ratinho", "white mouse"],
+    ):
+        line_xy(
+            [(width * 0.06, height * 0.76), (width * 0.94, height * 0.76)],
+            fill=gray,
+            width_px=thin,
+        )
+        bowl = (width * 0.36, height * 0.64, width * 0.60, height * 0.74)
+        lid = (width * 0.64, height * 0.68, width * 0.78, height * 0.73)
+        ellipse(bowl, width_px=line + 1)
+        ellipse(lid, outline=gray, width_px=thin)
+        mouse = (width * 0.46, height * 0.61, width * 0.51, height * 0.66)
+        ellipse(mouse, width_px=thin)
+        ellipse(
+            (width * 0.455, height * 0.595, width * 0.475, height * 0.62),
+            width_px=thin,
+        )
+        ellipse(
+            (width * 0.495, height * 0.595, width * 0.515, height * 0.62),
+            width_px=thin,
+        )
+        line_xy(
+            [(width * 0.24, height * 0.71), (width * 0.34, height * 0.71)],
+            width_px=thin,
+        )
+    elif _text_has_any_phrase(
+        scene_text, ["formigueiro", "formigas", "anthill", "ants"]
+    ):
+        line_xy(
+            [(width * 0.06, height * 0.76), (width * 0.94, height * 0.76)],
+            fill=gray,
+            width_px=thin,
+        )
+        mound = (width * 0.24, height * 0.62, width * 0.78, height * 0.88)
+        ellipse(mound, width_px=line + 1)
+        ellipse(
+            (width * 0.42, height * 0.68, width * 0.58, height * 0.78),
+            outline=gray,
+            width_px=thin,
+        )
+        for idx in range(7):
+            x = width * (0.31 + idx * 0.055)
+            y = height * (0.61 + (idx % 3) * 0.035)
+            ellipse((x, y, x + width * 0.025, y + width * 0.018), width_px=thin)
+        ellipse(
+            (width * 0.63, height * 0.25, width * 0.75, height * 0.37),
+            outline=gray,
+            width_px=thin,
+        )
+        line_xy(
+            [
+                (width * 0.69, height * 0.37),
+                (width * 0.61, height * 0.56),
+                (width * 0.77, height * 0.56),
+            ],
+            fill=gray,
+            width_px=thin,
+        )
+    elif _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        line_xy(
+            [(width * 0.06, height * 0.76), (width * 0.94, height * 0.76)],
+            fill=gray,
+            width_px=thin,
+        )
+        ellipse(
+            (width * 0.20, height * 0.57, width * 0.80, height * 0.91),
+            width_px=line + 1,
+        )
+        ellipse(
+            (width * 0.32, height * 0.65, width * 0.68, height * 0.86),
+            outline=gray,
+            width_px=line,
+        )
+        ellipse(
+            (width * 0.08, height * 0.27, width * 0.23, height * 0.41),
+            outline=gray,
+            width_px=thin,
+        )
+        line_xy(
+            [
+                (width * 0.15, height * 0.41),
+                (width * 0.11, height * 0.63),
+                (width * 0.29, height * 0.63),
+            ],
+            fill=gray,
+            width_px=thin,
+        )
+    else:
+        hero_names = " ".join(item["name"] for item in _hero_object_requirements(scene))
+        if _text_has_any_phrase(hero_names, ["key"]):
+            ellipse(
+                (width * 0.34, height * 0.56, width * 0.49, height * 0.66),
+                width_px=line,
+            )
+            line_xy([(width * 0.49, height * 0.61), (width * 0.72, height * 0.61)])
+            line_xy([(width * 0.66, height * 0.61), (width * 0.66, height * 0.69)])
+            line_xy([(width * 0.71, height * 0.61), (width * 0.71, height * 0.67)])
+        elif _text_has_any_phrase(hero_names, ["letter", "card"]):
+            rect(
+                (width * 0.26, height * 0.54, width * 0.74, height * 0.78),
+                width_px=line,
+            )
+            line_xy(
+                [
+                    (width * 0.26, height * 0.54),
+                    (width * 0.50, height * 0.67),
+                    (width * 0.74, height * 0.54),
+                ]
+            )
+        else:
+            rect(
+                (width * 0.25, height * 0.55, width * 0.75, height * 0.80),
+                width_px=line,
+            )
+            ellipse(
+                (width * 0.43, height * 0.35, width * 0.57, height * 0.49),
+                outline=gray,
+                width_px=thin,
+            )
+
+    return image.filter(ImageFilter.GaussianBlur(radius=0.35))
+
+
+def _draw_semantic_hero_depth_image(
+    scene: Dict[str, Any],
+    width: int,
+    height: int,
+):
+    from PIL import Image, ImageDraw, ImageFilter
+
+    image = Image.new("L", (width, height), 24)
+    draw = ImageDraw.Draw(image)
+    scene_text = _scene_text(scene)
+    draw.rectangle((0, int(height * 0.76), width, height), fill=72)
+
+    def ellipse(box, fill):
+        draw.ellipse(tuple(int(v) for v in box), fill=fill)
+
+    if _text_has_any_phrase(
+        scene_text,
+        ["açucareiro", "acucareiro", "sugar bowl", "ratinho", "white mouse"],
+    ):
+        ellipse((width * 0.36, height * 0.64, width * 0.60, height * 0.74), 205)
+        ellipse((width * 0.64, height * 0.68, width * 0.78, height * 0.73), 150)
+        ellipse((width * 0.46, height * 0.61, width * 0.51, height * 0.66), 238)
+        ellipse((width * 0.455, height * 0.595, width * 0.475, height * 0.62), 245)
+        ellipse((width * 0.495, height * 0.595, width * 0.515, height * 0.62), 245)
+        draw.line(
+            (
+                int(width * 0.24),
+                int(height * 0.71),
+                int(width * 0.34),
+                int(height * 0.71),
+            ),
+            fill=160,
+            width=max(2, width // 180),
+        )
+    elif _text_has_any_phrase(
+        scene_text, ["formigueiro", "formigas", "anthill", "ants"]
+    ):
+        ellipse((width * 0.24, height * 0.60, width * 0.78, height * 0.90), 190)
+        ellipse((width * 0.42, height * 0.67, width * 0.58, height * 0.79), 90)
+    elif _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        ellipse((width * 0.18, height * 0.55, width * 0.82, height * 0.94), 176)
+        ellipse((width * 0.31, height * 0.64, width * 0.69, height * 0.88), 52)
+    else:
+        draw.rounded_rectangle(
+            (
+                int(width * 0.24),
+                int(height * 0.48),
+                int(width * 0.76),
+                int(height * 0.84),
+            ),
+            radius=max(8, width // 24),
+            fill=198,
+        )
+
+    return image.filter(ImageFilter.GaussianBlur(radius=max(1, width // 240))).convert(
+        "RGB"
+    )
+
+
+def _encode_comfyui_control_image(
+    source_image_path: str,
+    *,
+    image_name: str,
+    width: int,
+    height: int,
+    scene: Dict[str, Any] | None = None,
+) -> Dict[str, str]:
+    from io import BytesIO
+
+    from PIL import Image, ImageFilter, ImageOps
+
+    control_mode = _comfyui_control_image_mode()
+    if scene and control_mode == "semantic_depth":
+        control_image = _draw_semantic_hero_depth_image(scene, width, height)
+    elif scene and control_mode == "semantic_hero":
+        control_image = _draw_semantic_hero_control_image(scene, width, height)
+    else:
+        source_path = Path(source_image_path)
+        if not source_path.exists():
+            raise RuntimeError("control_image_missing")
+        with Image.open(source_path) as source_image:
+            control_image = (
+                source_image.convert("L")
+                .resize((width, height), Image.Resampling.LANCZOS)
+                .filter(ImageFilter.FIND_EDGES)
+            )
+            control_image = ImageOps.autocontrast(control_image).convert("RGB")
+    buffer = BytesIO()
+    control_image.save(buffer, format="PNG", optimize=True)
+
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return {"name": image_name, "image": f"data:image/png;base64,{encoded}"}
+
+
+def _encode_comfyui_reference_image(
+    source_image_path: str,
+    *,
+    image_name: str,
+    target_size: tuple[int, int] | None = None,
+) -> Dict[str, str]:
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    source_path = Path(source_image_path)
+    if not source_path.exists():
+        raise RuntimeError("ipadapter_reference_image_missing")
+    with Image.open(source_path) as source_image:
+        reference = source_image.convert("RGB")
+        if target_size:
+            contained = ImageOps.contain(
+                reference,
+                target_size,
+                method=Image.Resampling.LANCZOS,
+            )
+            background = Image.new("RGB", target_size, reference.getpixel((0, 0)))
+            offset = (
+                (target_size[0] - contained.width) // 2,
+                (target_size[1] - contained.height) // 2,
+            )
+            background.paste(contained, offset)
+            reference = background
+        else:
+            reference.thumbnail((1024, 1536), Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    reference.save(buffer, format="PNG", optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return {"name": image_name, "image": f"data:image/png;base64,{encoded}"}
+
+
+def _hero_object_focus_boxes(
+    scene: Dict[str, Any],
+) -> List[tuple[float, float, float, float]]:
+    configured_boxes = scene.get("inpaint_focus_boxes")
+    if configured_boxes is not None:
+        if not isinstance(configured_boxes, list) or not configured_boxes:
+            raise ValueError("invalid_inpaint_focus_boxes")
+        if len(configured_boxes) > 4:
+            raise ValueError("too_many_inpaint_focus_boxes")
+        validated_boxes: List[tuple[float, float, float, float]] = []
+        for box in configured_boxes:
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                raise ValueError("invalid_inpaint_focus_box")
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in box
+            ):
+                raise ValueError("invalid_inpaint_focus_box_coordinate")
+            left, top, right, bottom = (float(value) for value in box)
+            if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+                raise ValueError("inpaint_focus_box_out_of_bounds")
+            validated_boxes.append((left, top, right, bottom))
+        return validated_boxes
+
+    scene_text = _scene_text(scene)
+    if _text_has_any_phrase(
+        scene_text,
+        ["açucareiro", "acucareiro", "sugar bowl", "ratinho", "white mouse"],
+    ):
+        return [
+            (0.10, 0.63, 0.66, 0.89),
+            (0.57, 0.76, 0.92, 0.91),
+            (0.07, 0.77, 0.76, 0.85),
+        ]
+    if _text_has_any_phrase(scene_text, ["formigueiro", "formigas", "anthill", "ants"]):
+        return [(0.16, 0.52, 0.84, 0.94)]
+    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        return [(0.12, 0.48, 0.88, 0.96)]
+    return [(0.20, 0.34, 0.80, 0.88)]
+
+
+def _hero_object_quality_box(
+    scene: Dict[str, Any],
+) -> tuple[float, float, float, float]:
+    scene_text = _scene_text(scene)
+    if _text_has_any_phrase(
+        scene_text,
+        ["açucareiro", "acucareiro", "sugar bowl", "ratinho", "white mouse"],
+    ):
+        return (0.28, 0.44, 0.76, 0.76)
+    if _text_has_any_phrase(scene_text, ["formigueiro", "formigas", "anthill", "ants"]):
+        return (0.24, 0.58, 0.80, 0.90)
+    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        return (0.20, 0.56, 0.80, 0.90)
+    return (0.28, 0.40, 0.72, 0.82)
+
+
+def _encode_comfyui_inpaint_image(
+    source_image_path: str,
+    *,
+    image_name: str,
+    width: int,
+    height: int,
+    scene: Dict[str, Any],
+) -> Dict[str, str]:
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw, ImageFilter
+
+    source_path = Path(source_image_path)
+    if not source_path.exists():
+        raise RuntimeError("inpaint_reference_image_missing")
+    with Image.open(source_path) as source_image:
+        inpaint_image = source_image.convert("RGB").resize(
+            (width, height), Image.Resampling.LANCZOS
+        )
+
+    alpha = Image.new("L", (width, height), 255)
+    draw = ImageDraw.Draw(alpha)
+    for left, top, right, bottom in _hero_object_focus_boxes(scene):
+        draw.rounded_rectangle(
+            (
+                int(width * left),
+                int(height * top),
+                int(width * right),
+                int(height * bottom),
+            ),
+            radius=max(10, width // 30),
+            fill=0,
+        )
+    alpha = alpha.filter(ImageFilter.GaussianBlur(radius=max(6, width // 80)))
+    inpaint_rgba = inpaint_image.convert("RGBA")
+    inpaint_rgba.putalpha(alpha)
+
+    buffer = BytesIO()
+    inpaint_rgba.save(buffer, format="PNG", optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return {"name": image_name, "image": f"data:image/png;base64,{encoded}"}
+
+
+def _build_flux2_klein_workflow(
+    directed_prompt: str,
+    quality_preset: Mapping[str, object],
+    scene_seed: int,
+    scene_id: object,
+) -> Dict[str, Dict[str, object]]:
+    """Build the official ComfyUI FLUX.2 Klein Base 4B text-to-image graph."""
+    diffusion_model, text_encoder, vae_model = _comfyui_flux2_model_names()
+    dimensions: dict[str, int] = {}
+    for key in ("width", "height"):
+        value = quality_preset.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"flux2_invalid_{key}")
+        if value < 256 or value > 2048 or value % 64 != 0:
+            raise ValueError(f"flux2_invalid_{key}")
+        dimensions[key] = value
+    width = dimensions["width"]
+    height = dimensions["height"]
+    return {
+        "1": {
+            "inputs": {
+                "unet_name": diffusion_model,
+                "weight_dtype": "default",
+            },
+            "class_type": "UNETLoader",
+        },
+        "2": {
+            "inputs": {
+                "clip_name": text_encoder,
+                "type": "flux2",
+                "device": "default",
+            },
+            "class_type": "CLIPLoader",
+        },
+        "3": {
+            "inputs": {"vae_name": vae_model},
+            "class_type": "VAELoader",
+        },
+        "4": {
+            "inputs": {"text": directed_prompt, "clip": ["2", 0]},
+            "class_type": "CLIPTextEncode",
+        },
+        "5": {
+            "inputs": {"text": "", "clip": ["2", 0]},
+            "class_type": "CLIPTextEncode",
+        },
+        "6": {
+            "inputs": {"noise_seed": scene_seed},
+            "class_type": "RandomNoise",
+        },
+        "7": {
+            "inputs": {
+                "model": ["1", 0],
+                "positive": ["4", 0],
+                "negative": ["5", 0],
+                "cfg": _comfyui_flux2_cfg(),
+            },
+            "class_type": "CFGGuider",
+        },
+        "8": {
+            "inputs": {"sampler_name": "euler"},
+            "class_type": "KSamplerSelect",
+        },
+        "9": {
+            "inputs": {
+                "steps": _comfyui_flux2_steps(),
+                "width": width,
+                "height": height,
+            },
+            "class_type": "Flux2Scheduler",
+        },
+        "10": {
+            "inputs": {"width": width, "height": height, "batch_size": 1},
+            "class_type": "EmptyFlux2LatentImage",
+        },
+        "11": {
+            "inputs": {
+                "noise": ["6", 0],
+                "guider": ["7", 0],
+                "sampler": ["8", 0],
+                "sigmas": ["9", 0],
+                "latent_image": ["10", 0],
+            },
+            "class_type": "SamplerCustomAdvanced",
+        },
+        "12": {
+            "inputs": {"samples": ["11", 0], "vae": ["3", 0]},
+            "class_type": "VAEDecode",
+        },
+        "13": {
+            "inputs": {
+                "filename_prefix": f"scene_{scene_id}_flux2_klein",
+                "images": ["12", 0],
+            },
+            "class_type": "SaveImage",
+        },
+    }
+
+
+def _build_qwen_image_edit_2511_workflow(
+    edit_prompt: str,
+    input_image_name: str,
+    scene_seed: int,
+    scene_id: object,
+    negative_prompt: str,
+    reference_image_name: str | None = None,
+    prop_reference_image_name: str | None = None,
+    inpaint_image_name: str | None = None,
+    inpaint_denoise: float | None = None,
+) -> Dict[str, Dict[str, object]]:
+    """Build the native ComfyUI Qwen-Image-Edit-2511 semantic repair graph."""
+    diffusion_model, text_encoder, vae_model = _comfyui_qwen_edit_model_names()
+    workflow: Dict[str, Dict[str, object]] = {
+        "1": {
+            "inputs": {"image": input_image_name},
+            "class_type": "LoadImage",
+        },
+        "2": {
+            "inputs": {"image": ["1", 0]},
+            "class_type": "FluxKontextImageScale",
+        },
+        "3": {
+            "inputs": {"unet_name": diffusion_model, "weight_dtype": "default"},
+            "class_type": "UNETLoader",
+        },
+        "4": {
+            "inputs": {
+                "clip_name": text_encoder,
+                "type": "qwen_image",
+                "device": "default",
+            },
+            "class_type": "CLIPLoader",
+        },
+        "5": {
+            "inputs": {"vae_name": vae_model},
+            "class_type": "VAELoader",
+        },
+        "6": {
+            "inputs": {
+                "clip": ["4", 0],
+                "vae": ["5", 0],
+                "image1": ["2", 0],
+                "prompt": edit_prompt,
+            },
+            "class_type": "TextEncodeQwenImageEditPlus",
+        },
+        "7": {
+            "inputs": {
+                "clip": ["4", 0],
+                "vae": ["5", 0],
+                "image1": ["2", 0],
+                "prompt": "",
+            },
+            "class_type": "TextEncodeQwenImageEditPlus",
+        },
+        "8": {
+            "inputs": {
+                "conditioning": ["6", 0],
+                "reference_latents_method": "index_timestep_zero",
+            },
+            "class_type": "FluxKontextMultiReferenceLatentMethod",
+        },
+        "9": {
+            "inputs": {
+                "conditioning": ["7", 0],
+                "reference_latents_method": "index_timestep_zero",
+            },
+            "class_type": "FluxKontextMultiReferenceLatentMethod",
+        },
+        "10": {
+            "inputs": {"model": ["3", 0], "shift": 3.1},
+            "class_type": "ModelSamplingAuraFlow",
+        },
+        "11": {
+            "inputs": {
+                "pixels": ["2", 0],
+                "vae": ["5", 0],
+            },
+            "class_type": "VAEEncode",
+        },
+        "12": {
+            "inputs": {
+                "seed": scene_seed,
+                "steps": _comfyui_qwen_edit_steps(),
+                "cfg": 3.0,
+                "sampler_name": "euler",
+                "scheduler": "simple",
+                "denoise": 1.0,
+                "model": ["10", 0],
+                "positive": ["8", 0],
+                "negative": ["9", 0],
+                "latent_image": ["11", 0],
+            },
+            "class_type": "KSampler",
+        },
+        "13": {
+            "inputs": {"samples": ["12", 0], "vae": ["5", 0]},
+            "class_type": "VAEDecode",
+        },
+        "14": {
+            "inputs": {
+                "filename_prefix": f"scene_{scene_id}_qwen_edit_2511",
+                "images": ["13", 0],
+            },
+            "class_type": "SaveImage",
+        },
+    }
+    if reference_image_name:
+        workflow["15"] = {
+            "inputs": {"image": reference_image_name},
+            "class_type": "LoadImage",
+        }
+        workflow["16"] = {
+            "inputs": {"image": ["15", 0]},
+            "class_type": "FluxKontextImageScale",
+        }
+        workflow["6"]["inputs"]["image2"] = ["16", 0]
+        workflow["7"]["inputs"]["image2"] = ["16", 0]
+    if inpaint_image_name:
+        workflow["17"] = {
+            "inputs": {"image": inpaint_image_name},
+            "class_type": "LoadImage",
+        }
+        workflow["18"] = {
+            "inputs": {
+                "pixels": ["17", 0],
+                "vae": ["5", 0],
+            },
+            "class_type": "VAEEncode",
+        }
+        workflow["19"] = {
+            "inputs": {
+                "samples": ["18", 0],
+                "mask": ["17", 1],
+            },
+            "class_type": "SetLatentNoiseMask",
+        }
+        workflow["12"]["inputs"]["latent_image"] = ["19", 0]
+        workflow["12"]["inputs"]["denoise"] = (
+            _comfyui_qwen_inpaint_denoise()
+            if inpaint_denoise is None
+            else max(0.15, min(1.0, float(inpaint_denoise)))
+        )
+    if prop_reference_image_name:
+        workflow["20"] = {
+            "inputs": {"image": prop_reference_image_name},
+            "class_type": "LoadImage",
+        }
+        workflow["21"] = {
+            "inputs": {"image": ["20", 0]},
+            "class_type": "FluxKontextImageScale",
+        }
+        prop_slot = "image3" if reference_image_name else "image2"
+        workflow["6"]["inputs"][prop_slot] = ["21", 0]
+        workflow["7"]["inputs"][prop_slot] = ["21", 0]
+    return workflow
+
+
 def _build_comfyui_workflow(
     directed_prompt: str,
     checkpoint_name: str,
     quality_preset: Dict[str, Any],
     scene_seed: int,
     scene_id: Any,
+    negative_prompt: str | None = None,
+    controlled_workflow: bool = False,
+    controlnet_name: str | None = None,
+    controlnet_strength: float | None = None,
+    control_image_name: str | None = None,
+    inpaint_image_name: str | None = None,
+    refiner_enabled: bool | None = None,
+    refiner_checkpoint_name: str | None = None,
+    diagnostic_intermediate: bool = False,
+    reference_image_name: str | None = None,
+    ipadapter_enabled: bool = False,
+    ipadapter_weight: float | None = None,
+    ipadapter_weight_type: str = "linear",
+    style_lora_name: str | None = None,
+    style_lora_strength: float | None = None,
 ) -> Dict[str, Any]:
-    return {
+    positive_node: List[Any] = ["1", 0]
+    base_model_node: List[Any] = ["4", 0]
+    base_clip_node: List[Any] = ["4", 1]
+    workflow: Dict[str, Any] = {
         "1": {
             "inputs": {"text": directed_prompt, "clip": ["4", 1]},
             "class_type": "CLIPTextEncode",
         },
         "2": {
-            "inputs": {"text": IMAGE_NEGATIVE_PROMPT, "clip": ["4", 1]},
+            "inputs": {
+                "text": negative_prompt or IMAGE_NEGATIVE_PROMPT,
+                "clip": ["4", 1],
+            },
             "class_type": "CLIPTextEncode",
         },
         "3": {
@@ -1196,6 +2429,312 @@ def _build_comfyui_workflow(
             "class_type": "SaveImage",
         },
     }
+    resolved_lora_name = (style_lora_name or "").strip()
+    if resolved_lora_name:
+        lora_strength = (
+            _comfyui_style_lora_strength()
+            if style_lora_strength is None
+            else max(0.0, min(1.0, style_lora_strength))
+        )
+        workflow["23"] = {
+            "inputs": {
+                "model": ["4", 0],
+                "clip": ["4", 1],
+                "lora_name": resolved_lora_name,
+                "strength_model": lora_strength,
+                "strength_clip": lora_strength,
+            },
+            "class_type": "LoraLoader",
+        }
+        base_model_node = ["23", 0]
+        base_clip_node = ["23", 1]
+        workflow["1"]["inputs"]["clip"] = base_clip_node
+        workflow["2"]["inputs"]["clip"] = base_clip_node
+
+    if ipadapter_enabled and reference_image_name:
+        resolved_weight_type = ipadapter_weight_type.strip().lower()
+        if resolved_weight_type not in {
+            "linear",
+            "composition",
+            "composition precise",
+            "style transfer",
+            "style transfer precise",
+            "style and composition",
+        }:
+            raise ValueError(
+                f"unsupported_ipadapter_weight_type:{resolved_weight_type}"
+            )
+        workflow["20"] = {
+            "inputs": {"image": reference_image_name},
+            "class_type": "LoadImage",
+        }
+        workflow["21"] = {
+            "inputs": {
+                "model": base_model_node,
+                "preset": "PLUS (high strength)",
+            },
+            "class_type": "IPAdapterUnifiedLoader",
+        }
+        workflow["22"] = {
+            "inputs": {
+                "model": ["21", 0],
+                "ipadapter": ["21", 1],
+                "image": ["20", 0],
+                "weight": (
+                    _comfyui_ipadapter_weight()
+                    if ipadapter_weight is None
+                    else max(0.35, min(0.90, ipadapter_weight))
+                ),
+                "weight_type": resolved_weight_type,
+                "combine_embeds": "concat",
+                "start_at": 0.0,
+                "end_at": 0.75,
+                "embeds_scaling": "V only",
+            },
+            "class_type": "IPAdapterAdvanced",
+        }
+        base_model_node = ["22", 0]
+
+    workflow["3"]["inputs"]["model"] = base_model_node
+    if controlled_workflow:
+        resolved_controlnet = (controlnet_name or _comfyui_controlnet_model()).strip()
+        if not resolved_controlnet:
+            raise ValueError("comfyui_controlnet_model_missing")
+        if control_image_name:
+            workflow["8"] = {
+                "inputs": {"image": control_image_name},
+                "class_type": "LoadImage",
+            }
+        else:
+            workflow["8"] = {
+                "inputs": {
+                    "width": quality_preset["width"],
+                    "height": quality_preset["height"],
+                    "batch_size": 1,
+                    "color": 0,
+                },
+                "class_type": "EmptyImage",
+            }
+        workflow["9"] = {
+            "inputs": {"control_net_name": resolved_controlnet},
+            "class_type": "ControlNetLoader",
+        }
+        workflow["10"] = {
+            "inputs": {
+                "conditioning": ["1", 0],
+                "control_net": ["9", 0],
+                "image": ["8", 0],
+                "strength": (
+                    _comfyui_controlnet_strength()
+                    if controlnet_strength is None
+                    else controlnet_strength
+                ),
+            },
+            "class_type": "ControlNetApply",
+        }
+        positive_node = ["10", 0]
+        workflow["3"]["inputs"]["positive"] = positive_node
+
+    if inpaint_image_name:
+        workflow["11"] = {
+            "inputs": {"image": inpaint_image_name},
+            "class_type": "LoadImage",
+        }
+        workflow["12"] = {
+            "inputs": {
+                "pixels": ["11", 0],
+                "vae": ["4", 2],
+                "mask": ["11", 1],
+                "grow_mask_by": 16,
+            },
+            "class_type": "VAEEncodeForInpaint",
+        }
+        workflow["3"]["inputs"]["latent_image"] = ["12", 0]
+        workflow["3"]["inputs"]["denoise"] = _comfyui_inpaint_denoise()
+
+    should_refine = (
+        _comfyui_refiner_enabled() if refiner_enabled is None else refiner_enabled
+    )
+    if should_refine and controlled_workflow:
+        if diagnostic_intermediate:
+            workflow["18"] = {
+                "inputs": {"samples": ["3", 0], "vae": ["4", 2]},
+                "class_type": "VAEDecode",
+            }
+            workflow["19"] = {
+                "inputs": {
+                    "filename_prefix": f"scene_{scene_id}_base_inpaint",
+                    "images": ["18", 0],
+                },
+                "class_type": "SaveImage",
+            }
+        workflow["13"] = {
+            "inputs": {
+                "samples": ["3", 0],
+                "upscale_method": "bislerp",
+                "scale_by": _comfyui_refiner_scale(),
+            },
+            "class_type": "LatentUpscaleBy",
+        }
+        refiner_model: List[Any] = ["4", 0]
+        refiner_positive: List[Any] = positive_node
+        refiner_negative: List[Any] = ["2", 0]
+        resolved_refiner_checkpoint = (refiner_checkpoint_name or "").strip()
+        if resolved_refiner_checkpoint:
+            workflow["15"] = {
+                "inputs": {"ckpt_name": resolved_refiner_checkpoint},
+                "class_type": "CheckpointLoaderSimple",
+            }
+            workflow["17"] = {
+                "inputs": {
+                    "text": negative_prompt or IMAGE_NEGATIVE_PROMPT,
+                    "clip": ["15", 1],
+                },
+                "class_type": "CLIPTextEncode",
+            }
+            refiner_model = ["15", 0]
+            refiner_negative = ["17", 0]
+            workflow["6"]["inputs"]["vae"] = ["15", 2]
+
+        workflow["14"] = {
+            "inputs": {
+                "seed": scene_seed + 1,
+                "steps": _comfyui_refiner_steps(),
+                "cfg": 2.0 if resolved_refiner_checkpoint else quality_preset["cfg"],
+                "sampler_name": (
+                    "dpmpp_2m"
+                    if resolved_refiner_checkpoint
+                    else quality_preset["sampler_name"]
+                ),
+                "scheduler": (
+                    "normal"
+                    if resolved_refiner_checkpoint
+                    else quality_preset["scheduler"]
+                ),
+                "denoise": _comfyui_refiner_denoise(),
+                "model": refiner_model,
+                "positive": refiner_positive,
+                "negative": refiner_negative,
+                "latent_image": ["13", 0],
+            },
+            "class_type": "KSampler",
+        }
+        workflow["6"]["inputs"]["samples"] = ["14", 0]
+    return workflow
+
+
+def _resolve_ipadapter_reference(
+    *,
+    controlled_workflow: bool,
+    control_strategy: str,
+    reference_image_path: str | None,
+    prop_reference_image_path: str | None,
+) -> tuple[str | None, str, str, float | None]:
+    """Choose identity or prop conditioning without mixing their semantics."""
+    if (
+        controlled_workflow
+        and control_strategy == "masked_inpaint"
+        and prop_reference_image_path
+    ):
+        return (
+            prop_reference_image_path,
+            "hero_prop",
+            "composition precise",
+            0.82,
+        )
+    if reference_image_path:
+        return reference_image_path, "character", "linear", None
+    return None, "", "linear", None
+
+
+def _submit_runpod_job(
+    *,
+    run_url: str,
+    request_payload: Mapping[str, object],
+    headers: Mapping[str, str],
+) -> tuple[requests.Response, List[Dict[str, int | str]]]:
+    """Submit once, with one bounded retry for RunPod capacity propagation."""
+    retry_seconds = max(
+        0,
+        min(
+            60,
+            _safe_int(
+                os.getenv("RUNPOD_ENDPOINT_PROPAGATION_RETRY_SECONDS", "20"),
+                20,
+            ),
+        ),
+    )
+    submission_attempts: List[Dict[str, int | str]] = []
+
+    response = requests.post(
+        run_url,
+        json=request_payload,
+        headers=headers,
+        timeout=30,
+    )
+    submission_attempts.append({"attempt": 1, "http_status": response.status_code})
+
+    endpoint_paused = (
+        response.status_code == 409 and "ENDPOINT_PAUSED" in response.text.upper()
+    )
+    if not endpoint_paused or retry_seconds == 0:
+        return response, submission_attempts
+
+    submission_attempts[0]["retry_after_seconds"] = retry_seconds
+    print(
+        "RunPod ainda propaga a capacidade do endpoint; "
+        f"nova submissão em {retry_seconds}s..."
+    )
+    time.sleep(retry_seconds)
+    response = requests.post(
+        run_url,
+        json=request_payload,
+        headers=headers,
+        timeout=30,
+    )
+    submission_attempts.append({"attempt": 2, "http_status": response.status_code})
+    return response, submission_attempts
+
+
+def _apply_runpod_execution_telemetry(
+    job_monitor: Dict[str, Any],
+    status_payload: Mapping[str, object],
+    gpu_usd_per_second: float,
+) -> None:
+    """Use RunPod's execution clock so queue time is never reported as GPU cost."""
+    status = str(status_payload.get("status") or "")
+    job_monitor["last_remote_status"] = status
+
+    delay_time = status_payload.get("delayTime")
+    if delay_time is not None:
+        job_monitor["queue_seconds"] = round(
+            max(0.0, _safe_float(delay_time)) / 1000,
+            3,
+        )
+
+    execution_time = status_payload.get("executionTime")
+    if execution_time is not None:
+        execution_seconds = round(
+            max(0.0, _safe_float(execution_time)) / 1000,
+            3,
+        )
+        job_monitor["execution_seconds"] = execution_seconds
+        job_monitor["estimated_cost_usd"] = round(
+            execution_seconds * gpu_usd_per_second,
+            6,
+        )
+        job_monitor["cost_estimate_status"] = "provider_execution_time_configured_rate"
+        return
+
+    if status == "IN_QUEUE":
+        job_monitor["execution_seconds"] = 0.0
+        job_monitor["estimated_cost_usd"] = 0.0
+        job_monitor["cost_estimate_status"] = "not_started"
+        return
+
+    job_monitor["execution_seconds"] = None
+    job_monitor["estimated_cost_usd"] = None
+    job_monitor["cost_estimate_status"] = "execution_time_unavailable"
 
 
 def _run_comfyui_image_attempt(
@@ -1214,6 +2753,13 @@ def _run_comfyui_image_attempt(
     runpod_api_key: str,
     runpod_gpu_usd_per_second: float,
     attempt: int,
+    controlled_workflow: bool = False,
+    control_strategy: str = "controlled_inpaint",
+    control_image_path: str | None = None,
+    reference_image_path: str | None = None,
+    prop_reference_image_path: str | None = None,
+    semantic_repair_backend_override: str | None = None,
+    qwen_inpaint_denoise_override: float | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
     import base64
     import binascii
@@ -1221,18 +2767,273 @@ def _run_comfyui_image_attempt(
 
     import requests
 
-    run_url = f"https://api.runpod.ai/v2/{runpod_endpoint_id}/run"
-    status_url_template = (
-        f"https://api.runpod.ai/v2/{runpod_endpoint_id}/status/{{job_id}}"
-    )
     headers = {"Authorization": f"Bearer {runpod_api_key}"}
-    workflow = _build_comfyui_workflow(
-        directed_prompt=directed_prompt,
-        checkpoint_name=checkpoint_name,
-        quality_preset=quality_preset,
-        scene_seed=scene_seed,
-        scene_id=scene["scene_id"],
+    model_family = _comfyui_model_family()
+    if control_strategy not in {"controlled_inpaint", "masked_inpaint"}:
+        raise ValueError(f"unsupported_control_strategy:{control_strategy}")
+    flux2_requested = model_family == "flux2_klein"
+    semantic_repair_backend = (
+        semantic_repair_backend_override or _comfyui_semantic_repair_backend()
     )
+    if semantic_repair_backend not in {"sdxl", "qwen_image_edit_2511"}:
+        raise ValueError(
+            f"unsupported_semantic_repair_backend:{semantic_repair_backend}"
+        )
+    qwen_edit_enabled = (
+        flux2_requested
+        and controlled_workflow
+        and semantic_repair_backend == "qwen_image_edit_2511"
+    )
+    # FLUX.2 Klein creates the base frame. Its current ComfyUI graph has no
+    # masked ControlNet path. Qwen-Image-Edit performs native semantic repair;
+    # SDXL remains the explicit fallback until the Qwen canary is promoted.
+    flux2_enabled = flux2_requested and not controlled_workflow
+    controlled_backend_fallback = (
+        flux2_requested and controlled_workflow and not qwen_edit_enabled
+    )
+    execution_model_family = (
+        "qwen_image_edit_2511"
+        if qwen_edit_enabled
+        else (
+            "sdxl_controlnet_inpaint" if controlled_backend_fallback else model_family
+        )
+    )
+    effective_endpoint_id = (
+        os.getenv("COMFYUI_QWEN_EDIT_ENDPOINT_ID", "").strip()
+        if qwen_edit_enabled
+        else ""
+    ) or runpod_endpoint_id
+    effective_gpu_usd_per_second = (
+        _safe_float(
+            os.getenv("RUNPOD_QWEN_GPU_USD_PER_SECOND", ""),
+            runpod_gpu_usd_per_second,
+        )
+        if qwen_edit_enabled
+        else runpod_gpu_usd_per_second
+    )
+    run_url = f"https://api.runpod.ai/v2/{effective_endpoint_id}/run"
+    status_url_template = (
+        f"https://api.runpod.ai/v2/{effective_endpoint_id}/status/{{job_id}}"
+    )
+    effective_checkpoint = (
+        _comfyui_qwen_edit_model_names()[0]
+        if qwen_edit_enabled
+        else (_comfyui_flux2_model_names()[0] if flux2_enabled else checkpoint_name)
+    )
+    effective_controlled_workflow = controlled_workflow
+    controlnet_enabled = (
+        effective_controlled_workflow
+        and not qwen_edit_enabled
+        and (control_strategy == "controlled_inpaint")
+    )
+    qwen_edit_image_name = (
+        f"qwen_edit_scene_{scene['scene_id']}_attempt_{attempt}.png"
+        if qwen_edit_enabled and control_image_path
+        else None
+    )
+    qwen_character_reference_enabled = not (
+        qwen_edit_enabled
+        and control_strategy == "masked_inpaint"
+        and prop_reference_image_path
+    )
+    qwen_reference_image_name = (
+        f"qwen_reference_scene_{scene['scene_id']}_attempt_{attempt}.png"
+        if qwen_edit_enabled
+        and reference_image_path
+        and qwen_character_reference_enabled
+        else None
+    )
+    qwen_inpaint_image_name = (
+        f"qwen_inpaint_scene_{scene['scene_id']}_attempt_{attempt}.png"
+        if qwen_edit_enabled
+        and control_strategy == "masked_inpaint"
+        and control_image_path
+        else None
+    )
+    qwen_prop_reference_image_name = (
+        f"qwen_prop_reference_scene_{scene['scene_id']}_attempt_{attempt}.png"
+        if qwen_edit_enabled and prop_reference_image_path
+        else None
+    )
+    (
+        requested_ipadapter_reference_path,
+        requested_ipadapter_reference_role,
+        ipadapter_weight_type,
+        ipadapter_weight,
+    ) = _resolve_ipadapter_reference(
+        controlled_workflow=effective_controlled_workflow,
+        control_strategy=control_strategy,
+        reference_image_path=reference_image_path,
+        prop_reference_image_path=prop_reference_image_path,
+    )
+    ipadapter_reference_path = (
+        requested_ipadapter_reference_path
+        if (
+            not flux2_enabled and not qwen_edit_enabled and _comfyui_ipadapter_enabled()
+        )
+        else None
+    )
+    control_image_name = (
+        f"control_scene_{scene['scene_id']}_attempt_{attempt}.png"
+        if controlnet_enabled and control_image_path
+        else None
+    )
+    inpaint_image_name = (
+        f"inpaint_scene_{scene['scene_id']}_attempt_{attempt}.png"
+        if effective_controlled_workflow
+        and not qwen_edit_enabled
+        and control_image_path
+        else None
+    )
+    reference_image_name = (
+        f"ipadapter_scene_{scene['scene_id']}_attempt_{attempt}.png"
+        if ipadapter_reference_path
+        else None
+    )
+    refiner_enabled = bool(
+        effective_controlled_workflow
+        and not qwen_edit_enabled
+        and _comfyui_refiner_enabled()
+    )
+    refiner_checkpoint = _comfyui_refiner_checkpoint() if refiner_enabled else ""
+    input_images = []
+    if control_image_name and control_image_path:
+        input_images.append(
+            _encode_comfyui_control_image(
+                control_image_path,
+                image_name=control_image_name,
+                width=quality_preset["width"],
+                height=quality_preset["height"],
+                scene=scene,
+            )
+        )
+    if qwen_edit_image_name and control_image_path:
+        input_images.append(
+            _encode_comfyui_reference_image(
+                control_image_path,
+                image_name=qwen_edit_image_name,
+                target_size=(
+                    quality_preset["width"],
+                    quality_preset["height"],
+                ),
+            )
+        )
+    if qwen_reference_image_name and reference_image_path:
+        input_images.append(
+            _encode_comfyui_reference_image(
+                reference_image_path,
+                image_name=qwen_reference_image_name,
+                target_size=(
+                    quality_preset["width"],
+                    quality_preset["height"],
+                ),
+            )
+        )
+    if qwen_inpaint_image_name and control_image_path:
+        input_images.append(
+            _encode_comfyui_inpaint_image(
+                control_image_path,
+                image_name=qwen_inpaint_image_name,
+                width=quality_preset["width"],
+                height=quality_preset["height"],
+                scene=scene,
+            )
+        )
+    if qwen_prop_reference_image_name and prop_reference_image_path:
+        input_images.append(
+            _encode_comfyui_reference_image(
+                prop_reference_image_path,
+                image_name=qwen_prop_reference_image_name,
+                target_size=(
+                    quality_preset["width"],
+                    quality_preset["height"],
+                ),
+            )
+        )
+    if inpaint_image_name and control_image_path:
+        input_images.append(
+            _encode_comfyui_inpaint_image(
+                control_image_path,
+                image_name=inpaint_image_name,
+                width=quality_preset["width"],
+                height=quality_preset["height"],
+                scene=scene,
+            )
+        )
+    if reference_image_name and ipadapter_reference_path:
+        input_images.append(
+            _encode_comfyui_reference_image(
+                ipadapter_reference_path,
+                image_name=reference_image_name,
+                target_size=(
+                    (1024, 1024)
+                    if requested_ipadapter_reference_role == "hero_prop"
+                    else None
+                ),
+            )
+        )
+
+    if qwen_edit_enabled:
+        if not qwen_edit_image_name:
+            raise ValueError("qwen_image_edit_source_missing")
+        workflow = _build_qwen_image_edit_2511_workflow(
+            edit_prompt=_build_qwen_semantic_edit_prompt(
+                scene,
+                directed_prompt,
+                masked_edit=bool(qwen_inpaint_image_name),
+                prop_reference_slot=(3 if qwen_reference_image_name else 2),
+            ),
+            input_image_name=qwen_edit_image_name,
+            scene_seed=scene_seed,
+            scene_id=scene["scene_id"],
+            negative_prompt=_scene_negative_prompt(scene),
+            reference_image_name=qwen_reference_image_name,
+            prop_reference_image_name=qwen_prop_reference_image_name,
+            inpaint_image_name=qwen_inpaint_image_name,
+            inpaint_denoise=qwen_inpaint_denoise_override,
+        )
+        generation_method = (
+            "comfyui_qwen_masked_image_edit_2511"
+            if qwen_inpaint_image_name
+            else "comfyui_qwen_image_edit_2511"
+        )
+    elif flux2_enabled:
+        workflow = _build_flux2_klein_workflow(
+            directed_prompt=directed_prompt,
+            quality_preset=quality_preset,
+            scene_seed=scene_seed,
+            scene_id=scene["scene_id"],
+        )
+        generation_method = "comfyui_flux2_klein"
+    else:
+        workflow = _build_comfyui_workflow(
+            directed_prompt=directed_prompt,
+            checkpoint_name=checkpoint_name,
+            quality_preset=quality_preset,
+            scene_seed=scene_seed,
+            scene_id=scene["scene_id"],
+            negative_prompt=_scene_negative_prompt(scene),
+            controlled_workflow=controlnet_enabled,
+            control_image_name=control_image_name,
+            inpaint_image_name=inpaint_image_name,
+            refiner_enabled=refiner_enabled,
+            refiner_checkpoint_name=refiner_checkpoint,
+            reference_image_name=reference_image_name,
+            ipadapter_enabled=bool(reference_image_name),
+            ipadapter_weight=ipadapter_weight,
+            ipadapter_weight_type=ipadapter_weight_type,
+            style_lora_name=_comfyui_style_lora_name(image_style),
+        )
+        generation_method = (
+            "comfyui_masked_inpaint"
+            if effective_controlled_workflow and not controlnet_enabled
+            else (
+                "comfyui_controlnet_inpaint_refiner"
+                if controlnet_enabled and refiner_enabled
+                else ("comfyui_controlnet_inpaint" if controlnet_enabled else "comfyui")
+            )
+        )
+    controlnet_model = _comfyui_controlnet_model() if controlnet_enabled else ""
 
     print(
         "📤 Enviando job para o endpoint RunPod Serverless "
@@ -1241,49 +3042,116 @@ def _run_comfyui_image_attempt(
     job_started_at = time.monotonic()
     job_monitor: Dict[str, Any] = {
         "scene_id": scene["scene_id"],
-        "endpoint_id": runpod_endpoint_id,
+        "endpoint_id": effective_endpoint_id,
         "job_id": None,
         "status": "SUBMITTED",
         "attempt": attempt,
         "style": image_style,
         "style_label": style_label,
         "quality_preset": quality_preset_key,
-        "checkpoint": checkpoint_name,
+        "checkpoint": effective_checkpoint,
+        "model_family": model_family,
+        "execution_model_family": execution_model_family,
+        "controlled_backend_fallback": controlled_backend_fallback,
+        "flux2_models": (list(_comfyui_flux2_model_names()) if flux2_enabled else []),
+        "qwen_edit_models": (
+            list(_comfyui_qwen_edit_model_names()) if qwen_edit_enabled else []
+        ),
         "seed": scene_seed,
         "width": quality_preset["width"],
         "height": quality_preset["height"],
+        "output_width": round(
+            quality_preset["width"]
+            * (_comfyui_refiner_scale() if refiner_enabled else 1.0)
+        ),
+        "output_height": round(
+            quality_preset["height"]
+            * (_comfyui_refiner_scale() if refiner_enabled else 1.0)
+        ),
+        "generation_method": generation_method,
+        "controlled_workflow": effective_controlled_workflow,
+        "control_strategy": control_strategy if effective_controlled_workflow else "",
+        "control_deferred_to_native_flux2_edit": False,
+        "controlnet_model": controlnet_model,
+        "control_image": control_image_name or "",
+        "inpaint_image": qwen_inpaint_image_name or inpaint_image_name or "",
+        "ipadapter_enabled": bool(reference_image_name),
+        "ipadapter_reference_image": reference_image_name or "",
+        "ipadapter_reference_role": (
+            requested_ipadapter_reference_role if reference_image_name else ""
+        ),
+        "ipadapter_requested_reference_role": (
+            requested_ipadapter_reference_role
+            if requested_ipadapter_reference_path
+            else ""
+        ),
+        "ipadapter_weight_type": (
+            ipadapter_weight_type if reference_image_name else ""
+        ),
+        "qwen_prop_reference_image": qwen_prop_reference_image_name or "",
+        "ipadapter_weight": (
+            (
+                ipadapter_weight
+                if ipadapter_weight is not None
+                else _comfyui_ipadapter_weight()
+            )
+            if reference_image_name
+            else 0.0
+        ),
+        "style_lora": _comfyui_style_lora_name(image_style),
+        "inpaint_denoise": (
+            (
+                qwen_inpaint_denoise_override
+                if qwen_edit_enabled and qwen_inpaint_denoise_override is not None
+                else (
+                    _comfyui_qwen_inpaint_denoise()
+                    if qwen_edit_enabled
+                    else _comfyui_inpaint_denoise()
+                )
+            )
+            if effective_controlled_workflow
+            else 1.0
+        ),
+        "refiner_enabled": refiner_enabled,
+        "refiner_checkpoint": refiner_checkpoint,
+        "refiner_scale": _comfyui_refiner_scale() if refiner_enabled else 1.0,
+        "refiner_denoise": _comfyui_refiner_denoise() if refiner_enabled else 0.0,
+        "refiner_steps": _comfyui_refiner_steps() if refiner_enabled else 0,
         "elapsed_seconds": 0.0,
+        "queue_seconds": 0.0,
+        "execution_seconds": 0.0,
         "polls": [],
         "error": None,
         "image_path": None,
         "estimated_cost_usd": 0.0,
+        "cost_estimate_status": "not_submitted",
+        "last_remote_status": None,
     }
 
     try:
-        response = requests.post(
-            run_url,
-            json={"input": {"workflow": workflow}},
+        request_payload: Dict[str, Any] = {"input": {"workflow": workflow}}
+        if input_images:
+            request_payload["input"]["images"] = input_images
+        response, submission_attempts = _submit_runpod_job(
+            run_url=run_url,
+            request_payload=request_payload,
             headers=headers,
-            timeout=30,
         )
+        job_monitor["submission_attempts"] = submission_attempts
     except requests.RequestException as exc:
         job_monitor["status"] = "SUBMIT_FAILED"
         job_monitor["error"] = f"{type(exc).__name__}: {exc}"
         job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
-        job_monitor["estimated_cost_usd"] = round(
-            job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
-            6,
-        )
+        job_monitor["estimated_cost_usd"] = 0.0
+        job_monitor["cost_estimate_status"] = "not_submitted"
         return job_monitor, None, None
 
     if response.status_code != 200:
         job_monitor["status"] = "SUBMIT_FAILED"
         job_monitor["error"] = f"HTTP {response.status_code}: {response.text[:300]}"
         job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
-        job_monitor["estimated_cost_usd"] = round(
-            job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
-            6,
-        )
+        job_monitor["estimated_cost_usd"] = 0.0
+        job_monitor["cost_estimate_status"] = "not_submitted"
         return job_monitor, None, None
 
     job_id = response.json().get("id")
@@ -1319,6 +3187,11 @@ def _run_comfyui_image_attempt(
         job_status = status_payload.get("status")
         job_monitor["status"] = job_status
         job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+        _apply_runpod_execution_telemetry(
+            job_monitor,
+            status_payload,
+            effective_gpu_usd_per_second,
+        )
         job_monitor["polls"].append({"status": job_status, "wait_seconds": wait_time})
 
         if job_status == "COMPLETED":
@@ -1346,7 +3219,7 @@ def _run_comfyui_image_attempt(
                 "base_prompt": scene["prompt"],
                 "style": image_style,
                 "quality_preset": quality_preset_key,
-                "checkpoint": checkpoint_name,
+                "checkpoint": effective_checkpoint,
                 "seed": scene_seed,
                 "duration": scene.get("duration", 6),
                 "camera_motion": scene.get(
@@ -1354,10 +3227,23 @@ def _run_comfyui_image_attempt(
                     _motion_plan(scene)["description"],
                 ),
                 "runpod_job_id": job_id,
-                "generation_method": "comfyui",
+                "generation_method": generation_method,
+                "model_family": model_family,
+                "execution_model_family": execution_model_family,
+                "controlled_backend_fallback": controlled_backend_fallback,
+                "controlled_workflow": effective_controlled_workflow,
+                "control_strategy": (
+                    control_strategy if effective_controlled_workflow else ""
+                ),
+                "controlnet_model": controlnet_model,
+                "control_image": control_image_name or "",
+                "inpaint_image": qwen_inpaint_image_name or inpaint_image_name or "",
+                "qwen_prop_reference_image": qwen_prop_reference_image_name or "",
+                "refiner_enabled": refiner_enabled,
+                "refiner_checkpoint": refiner_checkpoint,
             }
             job_monitor["image_path"] = image_path
-            technical_metrics = _probe_image_quality(image_path)
+            technical_metrics = _probe_image_quality(image_path, scene=scene)
             semantic_metrics = _evaluate_image_semantics(
                 image_path,
                 scene,
@@ -1371,12 +3257,25 @@ def _run_comfyui_image_attempt(
             )
             image_metric = {
                 "scene_id": scene["scene_id"],
-                "generation_method": "comfyui",
+                "generation_method": generation_method,
                 "attempt": attempt,
                 "style": image_style,
                 "quality_preset": quality_preset_key,
-                "checkpoint": checkpoint_name,
+                "checkpoint": effective_checkpoint,
+                "model_family": model_family,
+                "execution_model_family": execution_model_family,
+                "controlled_backend_fallback": controlled_backend_fallback,
                 "seed": scene_seed,
+                "controlled_workflow": effective_controlled_workflow,
+                "control_strategy": (
+                    control_strategy if effective_controlled_workflow else ""
+                ),
+                "controlnet_model": controlnet_model,
+                "control_image": control_image_name or "",
+                "inpaint_image": qwen_inpaint_image_name or inpaint_image_name or "",
+                "qwen_prop_reference_image": qwen_prop_reference_image_name or "",
+                "refiner_enabled": refiner_enabled,
+                "refiner_checkpoint": refiner_checkpoint,
                 **combined_metrics,
             }
             job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
@@ -1384,10 +3283,6 @@ def _run_comfyui_image_attempt(
             job_monitor["semantic_accepted"] = combined_metrics.get("semantic_accepted")
             job_monitor["quality_issues"] = combined_metrics.get("issues", [])
             job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
-            job_monitor["estimated_cost_usd"] = round(
-                job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
-                6,
-            )
             return job_monitor, image_record, image_metric
 
         if job_status in ("FAILED", "CANCELLED", "TIMED_OUT"):
@@ -1400,13 +3295,9 @@ def _run_comfyui_image_attempt(
         job_monitor["status"] = "LOCAL_TIMEOUT"
         job_monitor["error"] = f"timeout_after_{max_wait}s"
         if job_id:
-            _cancel_runpod_job(runpod_endpoint_id, runpod_api_key, job_id)
+            _cancel_runpod_job(effective_endpoint_id, runpod_api_key, job_id)
 
     job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
-    job_monitor["estimated_cost_usd"] = round(
-        job_monitor["elapsed_seconds"] * runpod_gpu_usd_per_second,
-        6,
-    )
     return job_monitor, None, None
 
 
@@ -1602,7 +3493,7 @@ def _run_gemini_image_attempt(
         "runpod_job_id": None,
         "generation_method": "gemini_image",
     }
-    technical_metrics = _probe_image_quality(image_path)
+    technical_metrics = _probe_image_quality(image_path, scene=scene)
     semantic_metrics = _evaluate_image_semantics(
         image_path,
         scene,
@@ -1817,7 +3708,10 @@ def _extract_json_object(raw_text: str) -> Dict[str, Any]:
 
 
 def _extract_response_text(response: Any) -> str:
-    text = getattr(response, "text", "")
+    try:
+        text = getattr(response, "text", "")
+    except (AttributeError, ValueError):
+        text = ""
     if text:
         return str(text)
 
@@ -1843,6 +3737,195 @@ def _semantic_qa_enabled() -> bool:
     }
 
 
+SEMANTIC_QA_RESPONSE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "semantic_score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "accepted": {"type": "boolean"},
+        "hero_object_legibility": {"type": "boolean"},
+        "hero_object_notes": {"type": "string"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+        "critical_failures": {"type": "array", "items": {"type": "string"}},
+        "retry_prompt": {"type": "string"},
+    },
+    "required": [
+        "semantic_score",
+        "accepted",
+        "hero_object_legibility",
+        "hero_object_notes",
+        "issues",
+        "critical_failures",
+        "retry_prompt",
+    ],
+    "additionalProperties": False,
+}
+
+
+def _parse_semantic_qa_response(response: Any) -> Dict[str, Any]:
+    try:
+        parsed = getattr(response, "parsed", None)
+    except (AttributeError, TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    return _extract_json_object(_extract_response_text(response))
+
+
+class SemanticQAProviderError(RuntimeError):
+    """Raised when a configured semantic QA provider cannot return valid JSON."""
+
+
+def _evaluate_semantic_qa_with_gemini(
+    *,
+    image_path: Path,
+    prompt: str,
+    compact_prompt: str,
+    model: str,
+    api_key: str,
+) -> Dict[str, Any]:
+    try:
+        from google import genai
+        from google.genai import errors, types
+    except ImportError as exc:
+        raise SemanticQAProviderError("gemini:sdk_unavailable") from exc
+
+    try:
+        client = genai.Client(api_key=api_key)
+        image_part = types.Part.from_bytes(
+            data=image_path.read_bytes(),
+            mime_type="image/png",
+        )
+        response = client.models.generate_content(
+            model=model,
+            contents=[prompt, image_part],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=SEMANTIC_QA_RESPONSE_JSON_SCHEMA,
+                temperature=0,
+                max_output_tokens=1200,
+            ),
+        )
+        try:
+            return _parse_semantic_qa_response(response)
+        except ValueError:
+            parse_error: ValueError | None = None
+            for _format_attempt in range(2):
+                fallback_response = client.models.generate_content(
+                    model=model,
+                    contents=[compact_prompt, image_part],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_json_schema=SEMANTIC_QA_RESPONSE_JSON_SCHEMA,
+                        temperature=0,
+                        max_output_tokens=1200,
+                    ),
+                )
+                try:
+                    return _parse_semantic_qa_response(fallback_response)
+                except ValueError as exc:
+                    parse_error = exc
+            raise parse_error or ValueError(
+                "Semantic QA returned invalid JSON after bounded retries"
+            )
+    except (OSError, ValueError, errors.APIError) as exc:
+        raise SemanticQAProviderError(
+            f"gemini:{type(exc).__name__}:{str(exc)[:300]}"
+        ) from exc
+
+
+def _evaluate_semantic_qa_with_openai(
+    *,
+    image_path: Path,
+    prompt: str,
+    model: str,
+    api_key: str,
+) -> Dict[str, Any]:
+    try:
+        import openai
+        from openai import OpenAI
+    except ImportError as exc:
+        raise SemanticQAProviderError("openai:sdk_unavailable") from exc
+
+    try:
+        encoded_image = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        client = OpenAI(api_key=api_key, timeout=90.0, max_retries=1)
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{encoded_image}",
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "semantic_image_qa",
+                    "strict": True,
+                    "schema": SEMANTIC_QA_RESPONSE_JSON_SCHEMA,
+                }
+            },
+            max_output_tokens=1200,
+            store=False,
+        )
+        return _extract_json_object(str(response.output_text or ""))
+    except (OSError, ValueError, openai.APIError) as exc:
+        raise SemanticQAProviderError(
+            f"openai:{type(exc).__name__}:{str(exc)[:300]}"
+        ) from exc
+
+
+def _apply_semantic_qa_result(
+    metrics: Dict[str, Any],
+    parsed: Dict[str, Any],
+    hero_objects: List[Dict[str, Any]],
+) -> None:
+    score = max(0, min(100, _safe_int(parsed.get("semantic_score"))))
+    issues = parsed.get("issues", [])
+    critical_failures = parsed.get("critical_failures", [])
+    issue_codes = [str(issue) for issue in issues if issue]
+    critical_codes = [str(issue) for issue in critical_failures if issue]
+    hero_object_legibility = parsed.get("hero_object_legibility")
+    hero_object_notes = str(parsed.get("hero_object_notes", ""))[:500]
+    if hero_objects and hero_object_legibility is False:
+        if "hero_object_illegible" not in critical_codes:
+            critical_codes.append("hero_object_illegible")
+        if "hero_object_legibility_failed" not in issue_codes:
+            issue_codes.append("hero_object_legibility_failed")
+    if critical_codes:
+        score = min(score, 79)
+    if hero_objects and any(
+        code in critical_codes
+        for code in ("hero_object_illegible", "hero_object_missing")
+    ):
+        score = min(score, 69)
+    metrics.update(
+        {
+            "semantic_score": score,
+            "accepted": bool(parsed.get("accepted"))
+            and not critical_codes
+            and score >= _image_semantic_min_score(),
+            "issues": [*issue_codes, *critical_codes],
+            "critical_failures": critical_codes,
+            "hero_objects": hero_objects,
+            "hero_object_legibility": (
+                bool(hero_object_legibility)
+                if hero_object_legibility is not None
+                else None
+            ),
+            "hero_object_notes": hero_object_notes,
+            "retry_prompt": str(parsed.get("retry_prompt", ""))[:1000],
+        }
+    )
+
+
 def _evaluate_image_semantics(
     image_path: str,
     scene: Dict[str, Any],
@@ -1856,17 +3939,13 @@ def _evaluate_image_semantics(
         "accepted": False,
         "issues": [],
         "retry_prompt": "",
+        "provider": "gemini",
         "model": os.getenv(
             "GEMINI_VISION_QA_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash")
         ),
     }
     if not metrics["semantic_qa_enabled"]:
         metrics.update({"semantic_score": 100, "accepted": True})
-        return metrics
-
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        metrics["issues"].append("semantic_qa_missing_gemini_key")
         return metrics
 
     path = Path(image_path)
@@ -1883,16 +3962,7 @@ def _evaluate_image_semantics(
         if hero_objects
         else ""
     )
-    try:
-        from google import genai
-        from google.genai import errors, types
-    except ImportError as exc:
-        metrics["issues"].append(f"semantic_qa_failed:{type(exc).__name__}")
-        return metrics
-
-    try:
-        client = genai.Client(api_key=api_key)
-        prompt = f"""
+    prompt = f"""
 Você é o diretor de qualidade visual do pipeline AI Film.
 Avalie se a imagem segue a cena e o prompt. Penalize severamente:
 - qualquer texto visível, letras, legenda falsa, assinatura, marca d'água, borda de página ou moldura ornamental;
@@ -1949,18 +4019,7 @@ Retorne somente JSON válido, sem markdown:
   "retry_prompt": "correção objetiva em inglês para regenerar a imagem"
 }}
 """
-        response = client.models.generate_content(
-            model=str(metrics["model"]),
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=path.read_bytes(), mime_type="image/png"),
-            ],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        try:
-            parsed = _extract_json_object(_extract_response_text(response))
-        except ValueError:
-            compact_prompt = f"""
+    compact_prompt = f"""
 Return only valid JSON.
 Evaluate this image against this scene contract:
 {json.dumps(scene_contract, ensure_ascii=False)}
@@ -1989,67 +4048,62 @@ JSON schema:
   "retry_prompt": "short English regeneration instruction"
 }}
 """
-            fallback_response = client.models.generate_content(
+
+    parsed: Dict[str, Any] | None = None
+    provider_errors: List[str] = []
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if gemini_key:
+        try:
+            parsed = _evaluate_semantic_qa_with_gemini(
+                image_path=path,
+                prompt=prompt,
+                compact_prompt=compact_prompt,
                 model=str(metrics["model"]),
-                contents=[
-                    compact_prompt,
-                    types.Part.from_bytes(
-                        data=path.read_bytes(),
-                        mime_type="image/png",
-                    ),
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                ),
+                api_key=gemini_key,
             )
-            parsed = _extract_json_object(_extract_response_text(fallback_response))
-        score = max(0, min(100, _safe_int(parsed.get("semantic_score"))))
-        issues = parsed.get("issues", [])
-        critical_failures = parsed.get("critical_failures", [])
-        issue_codes = [str(issue) for issue in issues if issue]
-        critical_codes = [str(issue) for issue in critical_failures if issue]
-        hero_object_legibility = parsed.get("hero_object_legibility")
-        hero_object_notes = str(parsed.get("hero_object_notes", ""))[:500]
-        if hero_objects and hero_object_legibility is False:
-            if "hero_object_illegible" not in critical_codes:
-                critical_codes.append("hero_object_illegible")
-            if "hero_object_legibility_failed" not in issue_codes:
-                issue_codes.append("hero_object_legibility_failed")
-        if critical_codes:
-            score = min(score, 79)
-        if hero_objects and any(
-            code in critical_codes
-            for code in ("hero_object_illegible", "hero_object_missing")
-        ):
-            score = min(score, 69)
-        metrics.update(
-            {
-                "semantic_score": score,
-                "accepted": bool(parsed.get("accepted"))
-                and not critical_codes
-                and score >= _image_semantic_min_score(),
-                "issues": [*issue_codes, *critical_codes],
-                "critical_failures": critical_codes,
-                "hero_objects": hero_objects,
-                "hero_object_legibility": (
-                    bool(hero_object_legibility)
-                    if hero_object_legibility is not None
-                    else None
-                ),
-                "hero_object_notes": hero_object_notes,
-                "retry_prompt": str(parsed.get("retry_prompt", ""))[:1000],
-            }
-        )
-    except (
-        OSError,
-        ValueError,
-        json.JSONDecodeError,
-        errors.APIError,
-        errors.ClientError,
-        errors.ServerError,
-        errors.UnknownApiResponseError,
-    ) as exc:
-        metrics["issues"].append(f"semantic_qa_failed:{type(exc).__name__}")
+        except SemanticQAProviderError as exc:
+            provider_errors.append(str(exc))
+    else:
+        provider_errors.append("gemini:missing_key")
+
+    fallback_provider = (
+        os.getenv("IMAGE_SEMANTIC_QA_FALLBACK_PROVIDER", "openai").strip().lower()
+    )
+    if parsed is None and fallback_provider == "openai":
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        openai_model = os.getenv(
+            "OPENAI_VISION_QA_MODEL",
+            os.getenv("OPENAI_TEXT_MODEL", "gpt-5.4-mini"),
+        ).strip()
+        if openai_key:
+            try:
+                parsed = _evaluate_semantic_qa_with_openai(
+                    image_path=path,
+                    prompt=prompt,
+                    model=openai_model,
+                    api_key=openai_key,
+                )
+                metrics.update(
+                    {
+                        "provider": "openai",
+                        "model": openai_model,
+                        "fallback_used": True,
+                    }
+                )
+            except SemanticQAProviderError as exc:
+                provider_errors.append(str(exc))
+        else:
+            provider_errors.append("openai:missing_key")
+
+    if parsed is None:
+        metrics["issues"].append("semantic_qa_failed")
+        metrics["provider_errors"] = provider_errors
+        metrics["error"] = "; ".join(provider_errors)[:500]
+        return metrics
+
+    if provider_errors:
+        metrics["provider_warnings"] = provider_errors
+    _apply_semantic_qa_result(metrics, parsed, hero_objects)
 
     return metrics
 
@@ -2073,20 +4127,145 @@ def _combine_image_quality(
         "accepted"
     ):
         issues.append("semantic_quality_below_threshold")
+    technical_blockers = {
+        "low_resolution",
+        "low_contrast",
+        "blurry_image",
+        "technical_quality_below_threshold",
+    }
+    technical_accepted = not bool(
+        technical_blockers & set(str(issue) for issue in issues)
+    )
+    if semantic_metrics.get("semantic_qa_enabled", True) and not technical_accepted:
+        issues.append("technical_quality_below_threshold")
+    controlled_guidance = _controlled_image_workflow_guidance(semantic_metrics, issues)
+    if controlled_guidance.get("control_workflow_required"):
+        issues.append("control_workflow_required")
 
     return {
         **technical_metrics,
         "technical_score": round(technical_score, 1),
         "semantic_score": round(semantic_score, 1),
-        "semantic_accepted": bool(semantic_metrics.get("accepted")),
+        "technical_accepted": technical_accepted,
+        "semantic_accepted": bool(semantic_metrics.get("accepted"))
+        and technical_accepted,
         "semantic_critical_failures": semantic_metrics.get("critical_failures", []),
         "semantic_retry_prompt": semantic_metrics.get("retry_prompt", ""),
+        "semantic_qa_provider": semantic_metrics.get("provider"),
         "semantic_qa_model": semantic_metrics.get("model"),
+        "semantic_qa_fallback_used": bool(semantic_metrics.get("fallback_used")),
+        "semantic_qa_provider_warnings": semantic_metrics.get("provider_warnings", []),
+        "semantic_qa_error": semantic_metrics.get("error", ""),
         "hero_objects": semantic_metrics.get("hero_objects", []),
         "hero_object_legibility": semantic_metrics.get("hero_object_legibility"),
         "hero_object_notes": semantic_metrics.get("hero_object_notes", ""),
+        **controlled_guidance,
         "quality_score": round(min(100, combined_score), 1),
-        "issues": issues,
+        "issues": sorted(set(issues)),
+    }
+
+
+def _controlled_image_workflow_guidance(
+    semantic_metrics: Dict[str, Any],
+    issues: List[str],
+) -> Dict[str, Any]:
+    issue_codes = {
+        str(issue)
+        for issue in [
+            *issues,
+            *semantic_metrics.get("critical_failures", []),
+        ]
+        if issue
+    }
+    has_hero_object = bool(semantic_metrics.get("hero_objects"))
+    hero_failed = (
+        semantic_metrics.get("hero_object_legibility") is False
+        or "hero_object_missing" in issue_codes
+        or "hero_object_illegible" in issue_codes
+        or "hero_object_legibility_failed" in issue_codes
+    )
+    natural_animal_failed = bool(
+        {
+            "anthropomorphic_mouse",
+            "mouse_wearing_clothes",
+            "anthropomorphic_character",
+            "forbidden_character_present",
+        }
+        & issue_codes
+    )
+    character_replaced = bool(
+        {
+            "missing_character",
+            "missing_ludovico_professor",
+            "missing_ludovico",
+            "missing_character_ludovico",
+            "wrong_character",
+            "duplicate_protagonist",
+            "protagonist_too_old",
+            "protagonist_too_young",
+            "character_age_inconsistency",
+            "wrong_character_age",
+        }
+        & issue_codes
+    )
+    object_geometry_failed = bool(
+        {
+            "bowl_has_handle",
+            "forbidden_handle",
+            "wrong_object_geometry",
+            "wrong_object_type",
+        }
+        & issue_codes
+    )
+    physical_scale_failed = bool(
+        {
+            "mouse_filling_most_of_sugar_bowl",
+            "oversized_mouse",
+            "oversized_props",
+            "oversized_bowl",
+            "prop_scale_error",
+            "wrong_object_scale",
+        }
+        & issue_codes
+    )
+    if character_replaced:
+        return {
+            "control_workflow_required": True,
+            "recommended_generation_strategy": "controlled_inpaint",
+            "operator_next_action": (
+                "Rebuild the character region with the approved character reference "
+                "through IP-Adapter and scene structure through ControlNet before "
+                "repairing isolated props. Do not preserve the rejected identity."
+            ),
+        }
+    if (physical_scale_failed or object_geometry_failed) and has_hero_object:
+        return {
+            "control_workflow_required": True,
+            "recommended_generation_strategy": "masked_inpaint",
+            "operator_next_action": (
+                "Use high-denoise masked inpainting without ControlNet or an "
+                "IP-Adapter reference from the rejected frame. Rebuild only the "
+                "hero-prop region at realistic physical scale."
+            ),
+        }
+    if not (
+        has_hero_object
+        and hero_failed
+        and (natural_animal_failed or character_replaced)
+    ):
+        return {
+            "control_workflow_required": False,
+            "recommended_generation_strategy": "txt2img_retry",
+            "operator_next_action": "",
+        }
+    return {
+        "control_workflow_required": True,
+        "recommended_generation_strategy": "controlled_inpaint",
+        "operator_next_action": (
+            "Use a controlled two-stage workflow: keep the approved base scene, "
+            "then inpaint the small hero object with a mask or ControlNet/IPAdapter. "
+            "Do not spend another plain txt2img retry on this scene."
+        ),
     }
 
 
@@ -2121,6 +4300,17 @@ def _semantic_gate_blocked_metric(
         ),
         "semantic_retry_prompt": (
             best_metric.get("semantic_retry_prompt", "") if best_metric else ""
+        ),
+        "control_workflow_required": (
+            bool(best_metric.get("control_workflow_required")) if best_metric else False
+        ),
+        "recommended_generation_strategy": (
+            best_metric.get("recommended_generation_strategy", "txt2img_retry")
+            if best_metric
+            else "txt2img_retry"
+        ),
+        "operator_next_action": (
+            best_metric.get("operator_next_action", "") if best_metric else ""
         ),
         "quality_score": 0,
         "issues": issues,
@@ -2244,7 +4434,10 @@ Retorne somente JSON válido:
     return metrics
 
 
-def _probe_image_quality(image_path: str) -> Dict[str, Any]:
+def _probe_image_quality(
+    image_path: str,
+    scene: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     path = Path(image_path)
     metrics: Dict[str, Any] = {
         "path": image_path,
@@ -2261,7 +4454,7 @@ def _probe_image_quality(image_path: str) -> Dict[str, Any]:
         return metrics
 
     try:
-        from PIL import Image, ImageStat
+        from PIL import Image, ImageFilter, ImageStat
 
         with Image.open(path) as image:
             image.load()
@@ -2270,19 +4463,48 @@ def _probe_image_quality(image_path: str) -> Dict[str, Any]:
             grayscale = image.convert("L")
             stat = ImageStat.Stat(grayscale)
             contrast = stat.stddev[0] if stat.stddev else 0.0
+            edge_stat = ImageStat.Stat(grayscale.filter(ImageFilter.FIND_EDGES))
+            edge_sharpness = edge_stat.stddev[0] if edge_stat.stddev else 0.0
+            sharpness_for_gate = edge_sharpness
             metrics["contrast"] = round(contrast, 2)
+            metrics["edge_sharpness"] = round(edge_sharpness, 2)
+            metrics["sharpness_gate_scope"] = "global"
+            if scene and _hero_object_requirements(scene):
+                left, top, right, bottom = _hero_object_quality_box(scene)
+                width, height = image.size
+                focus = grayscale.crop(
+                    (
+                        int(width * left),
+                        int(height * top),
+                        int(width * right),
+                        int(height * bottom),
+                    )
+                )
+                focus_edge_stat = ImageStat.Stat(focus.filter(ImageFilter.FIND_EDGES))
+                sharpness_for_gate = (
+                    focus_edge_stat.stddev[0] if focus_edge_stat.stddev else 0.0
+                )
+                metrics["focal_edge_sharpness"] = round(sharpness_for_gate, 2)
+                metrics["sharpness_gate_scope"] = "hero_object"
 
         pixel_count = int(metrics["width"]) * int(metrics["height"])
-        size_score = min(35, metrics["size_bytes"] / 12000)
-        resolution_score = min(35, pixel_count / (512 * 512) * 35)
-        contrast_score = min(30, contrast / 64 * 30)
-        score = round(size_score + resolution_score + contrast_score, 1)
+        min_edge_sharpness = _image_min_edge_sharpness()
+        size_score = min(25, metrics["size_bytes"] / 16000)
+        resolution_score = min(30, pixel_count / (512 * 512) * 30)
+        contrast_score = min(25, contrast / 64 * 25)
+        sharpness_score = min(20, sharpness_for_gate / 42 * 20)
+        score = round(
+            size_score + resolution_score + contrast_score + sharpness_score, 1
+        )
         metrics["quality_score"] = min(100, score)
         metrics["valid"] = metrics["size_bytes"] > 1000 and pixel_count > 0
         if int(metrics["width"]) < 512 or int(metrics["height"]) < 512:
             metrics["issues"].append("low_resolution")
         if contrast < 8:
             metrics["issues"].append("low_contrast")
+        if sharpness_for_gate < min_edge_sharpness:
+            metrics["issues"].append("blurry_image")
+            metrics["quality_score"] = min(_safe_float(metrics["quality_score"]), 76.0)
     except (OSError, ValueError) as exc:
         metrics["issues"].append(f"invalid_image:{type(exc).__name__}")
     return metrics
@@ -3005,7 +5227,10 @@ def _aggregate_quality(
         if "semantic_gate_blocked" in item.get("issues", [])
         or (
             item.get("semantic_accepted") is False
-            and item.get("generation_method") in {"gemini_image", "comfyui", "mock"}
+            and (
+                item.get("generation_method") in {"gemini_image", "mock"}
+                or str(item.get("generation_method", "")).startswith("comfyui")
+            )
         )
     ]
     gate_status = "blocked" if blocked_images else "passed"
@@ -3021,6 +5246,13 @@ def _aggregate_quality(
                 "scene_id": item.get("scene_id"),
                 "generation_method": item.get("generation_method"),
                 "semantic_score": item.get("semantic_score"),
+                "control_workflow_required": item.get(
+                    "control_workflow_required", False
+                ),
+                "recommended_generation_strategy": item.get(
+                    "recommended_generation_strategy", "txt2img_retry"
+                ),
+                "operator_next_action": item.get("operator_next_action", ""),
                 "issues": item.get("issues", []),
             }
             for item in blocked_images
@@ -3348,6 +5580,12 @@ Retorne em formato JSON:
             style_label = _resolve_image_style(image_style)["label"]
             checkpoint_name = _resolve_comfyui_checkpoint(image_style)
             image_provider = _image_generation_provider()
+            model_family = _comfyui_model_family()
+            active_image_model = (
+                _comfyui_flux2_model_names()[0]
+                if image_provider == "comfyui" and model_family == "flux2_klein"
+                else checkpoint_name
+            )
             visual_bible = state.get("visual_bible") or _build_visual_bible(
                 state.get("story_text", ""),
                 image_style,
@@ -3356,13 +5594,23 @@ Retorne em formato JSON:
             print(
                 "🖼️ Gerando imagens... "
                 f"provider={image_provider}, estilo={style_label}, "
-                f"qualidade={quality_preset_key}, checkpoint={checkpoint_name}"
+                f"qualidade={quality_preset_key}, model_family={model_family}, "
+                f"modelo={active_image_model}"
             )
 
             scene_images = []
             runpod_jobs = []
             image_metrics = []
-            reference_image_path: str | None = None
+            configured_reference_path = str(
+                visual_bible.get("character_reference_image_path") or ""
+            ).strip()
+            reference_image_path: str | None = (
+                configured_reference_path
+                if configured_reference_path
+                and os.path.isfile(configured_reference_path)
+                and os.path.getsize(configured_reference_path) > 1000
+                else None
+            )
             runpod_gpu_usd_per_second = _safe_float(
                 os.getenv("RUNPOD_GPU_USD_PER_SECOND", "0.00044")
             )
@@ -3370,6 +5618,7 @@ Retorne em formato JSON:
 
             if (
                 image_provider == "gemini"
+                and reference_image_path is None
                 and _character_reference_enabled()
                 and _story_has_any(state.get("story_text", ""), ["alice"])
             ):
@@ -3417,6 +5666,67 @@ Retorne em formato JSON:
                 else:
                     print(
                         "⚠️ Referência fixa da Alice não passou no QA; usando fallback por cena."
+                    )
+
+            if (
+                image_provider == "comfyui"
+                and reference_image_path is None
+                and runpod_api_key
+                and runpod_endpoint_id
+                and _character_reference_enabled()
+                and _story_has_any(state.get("story_text", ""), ["alice"])
+            ):
+                print("🎭 Gerando referência fixa da Alice no ComfyUI...")
+                os.makedirs("output", exist_ok=True)
+                reference_scene = _build_character_reference_scene(visual_bible)
+                reference_path = "output/alice_character_reference.png"
+                reference_seed = _scene_seed(
+                    session_id,
+                    image_style,
+                    "alice_character_reference_comfyui",
+                )
+                reference_prompt_builder = (
+                    _build_flux2_image_prompt
+                    if model_family == "flux2_klein"
+                    else _build_image_prompt
+                )
+                reference_prompt = reference_prompt_builder(
+                    reference_scene,
+                    image_style,
+                    visual_bible,
+                    "Production character reference only. One ten-year-old Alice, neutral pose, plain backdrop, no props and no other people.",
+                )
+                job_monitor, _image_record, image_metric = _run_comfyui_image_attempt(
+                    scene=reference_scene,
+                    image_path=reference_path,
+                    directed_prompt=reference_prompt,
+                    image_style=image_style,
+                    style_label=style_label,
+                    quality_preset_key=quality_preset_key,
+                    quality_preset=quality_preset,
+                    checkpoint_name=checkpoint_name,
+                    scene_seed=reference_seed,
+                    visual_bible=visual_bible,
+                    runpod_endpoint_id=runpod_endpoint_id,
+                    runpod_api_key=runpod_api_key,
+                    runpod_gpu_usd_per_second=runpod_gpu_usd_per_second,
+                    attempt=0,
+                )
+                runpod_jobs.append(job_monitor)
+                if _character_reference_accepted(image_metric) and os.path.isfile(
+                    reference_path
+                ):
+                    reference_image_path = reference_path
+                    visual_bible["character_reference_image_path"] = reference_path
+                    visual_bible["character_reference_quality"] = {
+                        "quality_score": image_metric.get("quality_score"),
+                        "semantic_score": image_metric.get("semantic_score"),
+                    }
+                    print("✅ Referência ComfyUI da Alice aprovada para IP-Adapter.")
+                else:
+                    print(
+                        "⛔ Referência ComfyUI da Alice reprovada; retries de identidade "
+                        "não usarão uma âncora não aprovada."
                     )
 
             for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
@@ -3560,6 +5870,8 @@ Retorne em formato JSON:
                     # Generate image using ComfyUI via RunPod Serverless
                     if runpod_api_key and runpod_endpoint_id:
                         retry_instruction = ""
+                        repair_source_path: str | None = None
+                        previous_metric: Dict[str, Any] | None = None
                         best_candidate = None
                         selected_scene = False
                         for attempt in range(1, max_attempts + 1):
@@ -3568,11 +5880,27 @@ Retorne em formato JSON:
                                 image_style,
                                 f"{scene['scene_id']}:{attempt}",
                             )
-                            directed_prompt = _build_image_prompt(
-                                scene,
-                                image_style,
-                                visual_bible,
-                                retry_instruction,
+                            (
+                                controlled_retry,
+                                repair_backend,
+                                control_strategy,
+                            ) = _select_comfyui_retry_route(
+                                model_family=model_family,
+                                attempt=attempt,
+                                repair_source_path=repair_source_path,
+                                previous_metric=previous_metric,
+                            )
+                            prompt_builder = (
+                                _build_image_prompt
+                                if repair_backend == "sdxl"
+                                else (
+                                    _build_flux2_image_prompt
+                                    if model_family == "flux2_klein"
+                                    else _build_image_prompt
+                                )
+                            )
+                            directed_prompt = prompt_builder(
+                                scene, image_style, visual_bible, retry_instruction
                             )
                             attempt_path = (
                                 image_path
@@ -3595,10 +5923,23 @@ Retorne em formato JSON:
                                     runpod_api_key=runpod_api_key,
                                     runpod_gpu_usd_per_second=runpod_gpu_usd_per_second,
                                     attempt=attempt,
+                                    controlled_workflow=controlled_retry,
+                                    control_strategy=control_strategy,
+                                    control_image_path=(
+                                        repair_source_path if controlled_retry else None
+                                    ),
+                                    reference_image_path=reference_image_path,
+                                    semantic_repair_backend_override=repair_backend,
                                 )
                             )
                             runpod_jobs.append(job_monitor)
                             if not image_record or not image_metric:
+                                if _non_retryable_comfyui_job_error(job_monitor):
+                                    print(
+                                        "⛔ Workflow ComfyUI incompatível com o endpoint; "
+                                        "interrompendo retries idênticos."
+                                    )
+                                    break
                                 continue
 
                             quality_score = _safe_float(
@@ -3624,6 +5965,8 @@ Retorne em formato JSON:
                                     image_metric["path"] = image_path
                                 scene_images.append(image_record)
                                 image_metrics.append(image_metric)
+                                if reference_image_path is None:
+                                    reference_image_path = image_path
                                 print(
                                     "✅ Imagem ComfyUI REAL "
                                     f"aceita: cena {scene['scene_id']} "
@@ -3632,9 +5975,12 @@ Retorne em formato JSON:
                                 selected_scene = True
                                 break
 
-                            retry_instruction = str(
-                                image_metric.get("semantic_retry_prompt")
-                                or "Remove all visible text, captions, borders, watermarks, duplicated characters and style drift. Keep the same protagonist and selected film style."
+                            if os.path.isfile(attempt_path):
+                                repair_source_path = attempt_path
+                            previous_metric = image_metric
+                            retry_instruction = _semantic_retry_instruction(
+                                scene,
+                                image_metric,
                             )
                             print(
                                 "🔁 QA visual reprovou a cena "
@@ -3666,6 +6012,8 @@ Retorne em formato JSON:
                                     image_metric["path"] = image_path
                                 scene_images.append(image_record)
                                 image_metrics.append(image_metric)
+                                if reference_image_path is None:
+                                    reference_image_path = image_path
                                 print(
                                     "✅ Imagem ComfyUI REAL mantida com melhor score: "
                                     f"cena {scene['scene_id']} "
@@ -3676,7 +6024,7 @@ Retorne em formato JSON:
                     # Verifica se a imagem já foi gerada com sucesso acima; se não, cai no mock
                     if any(
                         img["scene_id"] == scene["scene_id"]
-                        and img["generation_method"] == "comfyui"
+                        and str(img["generation_method"]).startswith("comfyui")
                         for img in scene_images
                     ):
                         continue
@@ -3701,7 +6049,7 @@ Retorne em formato JSON:
                             "generation_method": "mock",
                         }
                     )
-                    technical_metrics = _probe_image_quality(image_path)
+                    technical_metrics = _probe_image_quality(image_path, scene=scene)
                     semantic_metrics = {
                         "semantic_score": 0,
                         "semantic_qa_enabled": _semantic_qa_enabled(),
@@ -3747,9 +6095,13 @@ Retorne em formato JSON:
             )
             if (
                 repair_scene
-                and image_provider == "gemini"
+                and image_provider in {"gemini", "comfyui"}
                 and scene_images
                 and _semantic_qa_enabled()
+                and (
+                    image_provider == "gemini"
+                    or (runpod_api_key and runpod_endpoint_id)
+                )
             ):
                 repair_scene_id = repair_scene.get("scene_id")
                 original_consistency_score = _safe_int(
@@ -3805,7 +6157,7 @@ Retorne em formato JSON:
                     repair_seed = _scene_seed(
                         session_id,
                         image_style,
-                        f"gemini:{repair_scene_id}:consistency_repair:{repair_attempt}",
+                        f"{image_provider}:{repair_scene_id}:consistency_repair:{repair_attempt}",
                     )
                     repair_path = f"output/scene_{repair_scene_id}_consistency_repair_{repair_attempt}.png"
                     directed_prompt = _build_image_prompt(
@@ -3814,18 +6166,41 @@ Retorne em formato JSON:
                         visual_bible,
                         consistency_feedback,
                     )
-                    job_monitor, image_record, image_metric = _run_gemini_image_attempt(
-                        scene=repair_scene,
-                        image_path=repair_path,
-                        directed_prompt=directed_prompt,
-                        image_style=image_style,
-                        style_label=style_label,
-                        quality_preset_key=quality_preset_key,
-                        scene_seed=repair_seed,
-                        visual_bible=visual_bible,
-                        attempt=max_attempts + repair_attempt,
-                        reference_image_path=repair_reference_image_path,
-                    )
+                    if image_provider == "gemini":
+                        job_monitor, image_record, image_metric = (
+                            _run_gemini_image_attempt(
+                                scene=repair_scene,
+                                image_path=repair_path,
+                                directed_prompt=directed_prompt,
+                                image_style=image_style,
+                                style_label=style_label,
+                                quality_preset_key=quality_preset_key,
+                                scene_seed=repair_seed,
+                                visual_bible=visual_bible,
+                                attempt=max_attempts + repair_attempt,
+                                reference_image_path=repair_reference_image_path,
+                            )
+                        )
+                    else:
+                        job_monitor, image_record, image_metric = (
+                            _run_comfyui_image_attempt(
+                                scene=repair_scene,
+                                image_path=repair_path,
+                                directed_prompt=directed_prompt,
+                                image_style=image_style,
+                                style_label=style_label,
+                                quality_preset_key=quality_preset_key,
+                                quality_preset=quality_preset,
+                                checkpoint_name=checkpoint_name,
+                                scene_seed=repair_seed,
+                                visual_bible=visual_bible,
+                                runpod_endpoint_id=runpod_endpoint_id,
+                                runpod_api_key=runpod_api_key,
+                                runpod_gpu_usd_per_second=runpod_gpu_usd_per_second,
+                                attempt=max_attempts + repair_attempt,
+                                reference_image_path=repair_reference_image_path,
+                            )
+                        )
                     runpod_jobs.append(job_monitor)
                     if (
                         not image_record

@@ -20,6 +20,14 @@ Cinematic, technical, premium. The interface should feel like a production cockp
 
 Avoid generic SaaS dashboards, toy demo UIs, uninspected AI output galleries, decorative controls that do not affect generation, and local-only ComfyUI screens as the primary operating surface. Avoid image outputs that look like generic SD 1.5 samples, malformed portraits, inconsistent character identity, or prompts without art direction.
 
+## Visual Quality Target
+
+The current target is storyboard-led original comic/storybook animation:
+consistent characters, readable acting, clear hero objects, painted backgrounds,
+clean linework, no generated text, and still frames composed for real
+image-to-video motion. The working specification lives in
+`docs/visual_quality_target.md`.
+
 ## Design Principles
 
 1. Show the pipeline as a production system, not a demo script.
