@@ -266,6 +266,7 @@ test_*.py
 !tests/conftest.py
 !tests/test_audio.py
 !tests/test_runway.py
+!tests/test_validate_custom_nodes.py
 !tests/test_video.py
 !tests/test_youtube.py
 teste_*.py
