@@ -6863,9 +6863,7 @@ Retorne em formato JSON:
                                         f"✅ Vídeo FFmpeg compilado com áudio: {video_path}"
                                     )
                                 else:
-                                    print(
-                                        f"⚠️ Erro ao adicionar áudio: {result.stderr}"
-                                    )
+                                    print(f"⚠️ Erro ao adicionar áudio: {result.stderr}")
                                     # Use video without audio
                                     os.rename(temp_video, video_path)
                             else:
