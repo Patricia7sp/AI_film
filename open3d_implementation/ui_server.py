@@ -13,11 +13,10 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +27,13 @@ from flask import Flask, Response, jsonify, redirect, request, send_file
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPEN3D_ROOT = Path(__file__).resolve().parent
+load_dotenv(OPEN3D_ROOT / ".env", override=True)
+
 STORY_PATH = REPO_ROOT / "data" / "historia.txt"
-RUNS_ROOT = Path(
-    os.getenv("AI_FILM_RUNS_ROOT", str(Path(tempfile.gettempdir()) / "ai_film_ui_runs"))
+RUNS_ROOT = (
+    Path(os.getenv("AI_FILM_RUNS_ROOT", str(REPO_ROOT / "data" / "runs")))
+    .expanduser()
+    .resolve()
 )
 ALLOWED_IMAGE_STYLES = {
     "comic_storybook",
@@ -61,7 +64,6 @@ CURATION_REASONS = {
 RETRY_SCOPES = {"image", "video", "audio", "image_video", "full_scene"}
 YOUTUBE_PRIVACY_STATUSES = {"private", "unlisted", "public"}
 
-load_dotenv(OPEN3D_ROOT / ".env", override=True)
 if os.getenv("GEMINI_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY", "")
 
@@ -73,6 +75,10 @@ RUNS_ROOT.mkdir(parents=True, exist_ok=True)
 
 RUNS: dict[str, dict[str, Any]] = {}
 RUN_LOCK = threading.Lock()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -481,7 +487,7 @@ function gateTone(status) {
   if (status === 'final_approved') return 'approved';
   if (status === 'published_current') return 'approved';
   if (status === 'ready_to_publish') return 'approved';
-  if (status === 'scene_review_blocked') return 'rejected';
+  if (status === 'scene_review_blocked' || status === 'quality_review_blocked') return 'rejected';
   if (status === 'blocked' || status === 'publish_failed') return 'rejected';
   return 'pending_review';
 }
@@ -671,7 +677,15 @@ function renderRun(run) {
     ${renderCostQuota(run.summary || {})}
     <table>
       <thead><tr><th>Provider job</th><th>Provider</th><th>Status</th><th>Tempo</th><th>Custo</th><th>Erro</th></tr></thead>
-      <tbody>${jobs.map(job => `<tr><td>${escapeHtml(job.job_id || '-')}</td><td>${escapeHtml(job.provider || '-')} · ${escapeHtml(job.model || '-')}</td><td>${escapeHtml(job.status || '-')}</td><td>${job.elapsed_seconds || 0}s</td><td>$${(job.estimated_cost_usd || 0).toFixed(4)}</td><td>${escapeHtml(job.error || '-')}</td></tr>`).join('')}</tbody>
+      <tbody>${jobs.map(job => {
+        const cost = Number.isFinite(Number(job.estimated_cost_usd)) && job.estimated_cost_usd !== null
+          ? `$${Number(job.estimated_cost_usd).toFixed(4)}`
+          : 'n/d';
+        const execution = job.execution_seconds === null || job.execution_seconds === undefined
+          ? 'GPU n/d'
+          : `GPU ${job.execution_seconds}s`;
+        return `<tr><td>${escapeHtml(job.job_id || '-')}</td><td>${escapeHtml(job.provider || '-')} · ${escapeHtml(job.model || '-')}</td><td>${escapeHtml(job.status || '-')}</td><td>${job.elapsed_seconds || 0}s · fila ${job.queue_seconds || 0}s · ${execution}</td><td>${cost}</td><td>${escapeHtml(job.error || '-')}</td></tr>`;
+      }).join('')}</tbody>
     </table>
     <table>
       <thead><tr><th>Mídia</th><th>Score</th><th>Técnico</th><th>Semântico</th><th>Detalhe</th><th>Issues</th></tr></thead>
@@ -909,13 +923,13 @@ def _append_log(run_id: str, message: str) -> None:
         if run is None:
             return
         run.setdefault("log", []).append(message)
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
 
 
 def _set_run(run_id: str, **updates: Any) -> None:
     with RUN_LOCK:
         RUNS[run_id].update(updates)
-        RUNS[run_id]["updated_at"] = datetime.utcnow().isoformat()
+        RUNS[run_id]["updated_at"] = _utc_now_iso()
 
 
 def _safe_file(run: dict[str, Any], requested: str) -> Path:
@@ -1118,11 +1132,18 @@ def _apply_production_status(
     cost_quota = _cost_quota_summary(summary)
     blockers = list(curation_blockers)
     blockers.extend(cost_quota.get("blockers", []))
+    publication_retry_available = bool(
+        publication_status == "failed"
+        and not blockers
+        and final_review.get("status") == "final_approved"
+    )
 
     if publication_status in {"queued", "uploading"}:
         status = publication_status
     elif published_current:
         status = "published_current"
+    elif publication_retry_available:
+        status = "ready_to_publish"
     elif publication_status == "failed":
         status = "publish_failed"
     elif (
@@ -1147,6 +1168,7 @@ def _apply_production_status(
         "current_artifact": current_artifact,
         "published_artifact": published_artifact,
         "publication_status": publication_status,
+        "publication_retry_available": publication_retry_available,
         "curation_status": curation.get("status"),
         "final_review_status": final_review.get("status"),
         "cost_quota_status": cost_quota.get("status"),
@@ -1156,6 +1178,69 @@ def _apply_production_status(
     summary["cost_quota"] = cost_quota
     summary["production_status"] = production_status
     return production_status
+
+
+def _planned_scene_ids(summary: dict[str, Any]) -> list[str]:
+    planned: list[str] = []
+    for scene in summary.get("scenes", []):
+        scene_id = scene.get("scene_id")
+        if scene_id is not None and str(scene_id) not in planned:
+            planned.append(str(scene_id))
+    if not planned:
+        scenes_count = int(_safe_float_value(summary.get("scenes_count")))
+        planned.extend(str(index) for index in range(1, scenes_count + 1))
+    if not planned:
+        for image in summary.get("scene_images", []):
+            scene_id = image.get("scene_id")
+            if scene_id is not None and str(scene_id) not in planned:
+                planned.append(str(scene_id))
+    return planned
+
+
+def _visual_quality_blockers(
+    summary: dict[str, Any], run_dir: Path, scene_ids: list[str]
+) -> list[str]:
+    images = summary.get("scene_images", [])
+    metrics = summary.get("quality_metrics", {}).get("images", [])
+    blockers: list[str] = []
+
+    for scene_id in scene_ids:
+        image = next(
+            (item for item in images if str(item.get("scene_id")) == scene_id),
+            {},
+        )
+        metric = next(
+            (item for item in metrics if str(item.get("scene_id")) == scene_id),
+            {},
+        )
+        image_path = _run_path({"run_dir": str(run_dir)}, image.get("image_path"))
+        if not image_path or not image_path.is_file():
+            blockers.append(f"cena {scene_id} sem imagem final válida")
+        provider = str(
+            image.get("generation_method") or image.get("provider") or ""
+        ).lower()
+        if provider == "mock":
+            blockers.append(f"cena {scene_id} usa imagem mock")
+        if not metric:
+            blockers.append(f"cena {scene_id} sem métricas de qualidade")
+            continue
+        issues = {str(issue) for issue in metric.get("issues", []) if issue}
+        if metric.get("semantic_accepted") is not True:
+            blockers.append(f"cena {scene_id} reprovada pelo gate semântico")
+        if metric.get("technical_accepted") is False:
+            blockers.append(f"cena {scene_id} reprovada pelo gate técnico")
+        if "semantic_gate_blocked" in issues:
+            blockers.append(f"cena {scene_id} bloqueada após retries semânticos")
+
+    expected_count = int(_safe_float_value(summary.get("scenes_count")))
+    if expected_count and len(scene_ids) != expected_count:
+        blockers.append(
+            f"quantidade de cenas inconsistente: {len(scene_ids)}/{expected_count}"
+        )
+    generation_method = str(summary.get("generation_method") or "").lower()
+    if generation_method == "mock":
+        blockers.append("vídeo final usa fallback mock")
+    return list(dict.fromkeys(blockers))
 
 
 def _apply_curation_summary(
@@ -1174,11 +1259,7 @@ def _apply_curation_summary(
     quality_metrics = summary.setdefault("quality_metrics", {})
     image_metrics = quality_metrics.get("images", [])
     audio_metrics = quality_metrics.get("audio", [])
-    scene_ids = [
-        str(item.get("scene_id"))
-        for item in scene_images
-        if item.get("scene_id") is not None
-    ]
+    scene_ids = _planned_scene_ids(summary)
     for scene_id in scene_ids:
         image = next(
             (item for item in scene_images if str(item.get("scene_id")) == scene_id),
@@ -1220,7 +1301,7 @@ def _apply_curation_summary(
                 {
                     "id": attempt_id,
                     "status": "active",
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": _utc_now_iso(),
                     "image_path": image.get("image_path"),
                     "video_path": video.get("video_path"),
                     "audio_path": audio.get("audio_path"),
@@ -1231,6 +1312,7 @@ def _apply_curation_summary(
                     "image_quality_score": image_metric.get("quality_score", 0),
                     "image_semantic_score": image_metric.get("semantic_score"),
                     "image_semantic_accepted": image_metric.get("semantic_accepted"),
+                    "image_job": dict(image_metric),
                     "audio_quality_score": audio_metric.get("quality_score", 0),
                     "prompt": image.get("prompt") or image.get("base_prompt"),
                 }
@@ -1281,7 +1363,9 @@ def _apply_curation_summary(
         for scene_id in scene_ids
         if scenes.get(scene_id, {}).get("status") == "pending_review"
     )
-    blockers = []
+    run_dir = run_dir or Path(".")
+    quality_blockers = _visual_quality_blockers(summary, run_dir, scene_ids)
+    blockers = list(quality_blockers)
     if pending:
         blockers.append(f"{pending} cena(s) pendente(s)")
     if rejected:
@@ -1295,17 +1379,23 @@ def _apply_curation_summary(
     final_review.setdefault("approved_at", None)
     final_review.setdefault("note", "")
     video_ready = bool(summary.get("video_exists"))
-    scene_gate_passed = bool(scene_ids) and approved == len(scene_ids)
+    scene_gate_passed = (
+        bool(scene_ids) and approved == len(scene_ids) and not quality_blockers
+    )
     can_final_approve = (
         scene_gate_passed and video_ready and bool(final_review.get("video_viewed"))
     )
 
     if final_review.get("status") == "final_approved" and not scene_gate_passed:
-        final_review["status"] = "scene_review_blocked"
+        final_review["status"] = (
+            "quality_review_blocked" if quality_blockers else "scene_review_blocked"
+        )
         final_review["approved_at"] = None
 
     if final_review.get("status") == "final_approved":
         status = "final_approved"
+    elif quality_blockers:
+        status = "quality_review_blocked"
     elif blockers:
         status = "scene_review_blocked"
     elif scene_ids and approved == len(scene_ids):
@@ -1326,7 +1416,6 @@ def _apply_curation_summary(
         blockers.append("corte final ainda não aprovado")
 
     curation["status"] = status
-    run_dir = run_dir or Path(".")
     production_status = _apply_production_status(summary, run_dir, blockers)
     curation.update(
         {
@@ -1339,6 +1428,8 @@ def _apply_curation_summary(
             "blockers": blockers,
             "can_final_approve": can_final_approve,
             "can_publish": production_status.get("status") == "ready_to_publish",
+            "quality_gate_status": "blocked" if quality_blockers else "passed",
+            "quality_blockers": quality_blockers,
         }
     )
     return summary
@@ -1471,19 +1562,17 @@ def _find_scene_quality_record(
     return {}
 
 
-def _controlled_image_retry_available() -> bool:
+def _controlled_image_retry_available(strategy: str = "controlled_inpaint") -> bool:
     provider = os.getenv("IMAGE_GENERATION_PROVIDER", "comfyui").strip().lower()
-    model_family = os.getenv("COMFYUI_MODEL_FAMILY", "sdxl").strip().lower()
     controlnet_model = os.getenv(
         "COMFYUI_CONTROLNET_CANNY_MODEL",
         "controlnet-canny-sdxl-1.0.safetensors",
     ).strip()
     return bool(
         provider == "comfyui"
-        and model_family == "sdxl"
         and os.getenv("RUNPOD_API_KEY")
         and os.getenv("RUNPOD_ENDPOINT_ID")
-        and controlnet_model
+        and (strategy == "masked_inpaint" or bool(controlnet_model))
     )
 
 
@@ -1497,7 +1586,10 @@ def _controlled_retry_blocker(
     image_metric = _find_scene_quality_record(summary, scene_id)
     if not bool(image_metric.get("control_workflow_required")):
         return None
-    if _controlled_image_retry_available():
+    strategy = str(
+        image_metric.get("recommended_generation_strategy", "controlled_inpaint")
+    )
+    if _controlled_image_retry_available(strategy):
         return None
     return {
         "error": "controlled_workflow_unavailable",
@@ -1671,14 +1763,14 @@ def _apply_attempt_to_summary(
             "active_attempt_id": attempt_id,
             "approved_attempt_id": attempt_id if approve else None,
             "retry_status": None,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": _utc_now_iso(),
         }
     )
     _reset_final_gate(summary, "stale_after_attempt_change")
     run["summary"] = summary
     _recompile_final_video_from_attempts(run)
     run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
-    run["updated_at"] = datetime.utcnow().isoformat()
+    run["updated_at"] = _utc_now_iso()
     _persist_summary(run)
     return run
 
@@ -1941,9 +2033,9 @@ def _run_selective_visual_retry(
         scene_review["retry_scope"] = scope
         scene_review["note"] = note
         scene_review["reason"] = reason
-        scene_review["updated_at"] = datetime.utcnow().isoformat()
+        scene_review["updated_at"] = _utc_now_iso()
         run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
 
     _append_log(
@@ -1981,15 +2073,23 @@ def _run_selective_visual_retry(
         quality_preset = _resolve_quality_preset(quality_preset_key)
         checkpoint_name = _resolve_comfyui_checkpoint(image_style)
         style_label = _resolve_image_style(image_style)["label"]
+        control_strategy = str(
+            source_image_metric.get(
+                "recommended_generation_strategy", "controlled_inpaint"
+            )
+        )
+        control_backend_available = bool(
+            control_strategy == "masked_inpaint" or _comfyui_controlnet_available()
+        )
         controlled_workflow = bool(
             image_provider == "comfyui"
             and source_image_metric.get("control_workflow_required")
-            and _comfyui_controlnet_available()
+            and control_backend_available
         )
         if (
             source_image_metric.get("control_workflow_required")
             and image_provider == "comfyui"
-            and _comfyui_controlnet_available()
+            and control_backend_available
             and (not base_image_path or not base_image_path.exists())
         ):
             raise RuntimeError("controlled_retry_reference_image_missing")
@@ -1997,13 +2097,18 @@ def _run_selective_visual_retry(
         if scope in {"image", "image_video", "full_scene"}:
             image_path = curation_dir / f"scene_{scene_id}_{attempt_id}_image.png"
             if controlled_workflow:
-                instruction = (
-                    f"{instruction} Use the controlled ControlNet retry path: "
-                    "make the required hero object large, sharp, natural and readable "
-                    "while preserving approved character identity and global style. "
-                    "Use the control image as composition guidance only; do not render "
-                    "visible construction outlines, black strokes, labels or guide lines."
-                ).strip()
+                if control_strategy == "masked_inpaint":
+                    instruction = (
+                        f"{instruction} Use masked inpainting without ControlNet. "
+                        "Rebuild only the hero-prop region at believable physical scale; "
+                        "preserve everything outside the mask."
+                    ).strip()
+                else:
+                    instruction = (
+                        f"{instruction} Use the controlled ControlNet retry path: "
+                        "make the required hero object sharp, natural and readable while "
+                        "preserving approved character identity and global style."
+                    ).strip()
             directed_prompt = _build_image_prompt(
                 scene,
                 image_style,
@@ -2034,11 +2139,14 @@ def _run_selective_visual_retry(
                     ),
                     attempt=int(attempt_id.split("_")[-1]),
                     controlled_workflow=controlled_workflow,
+                    control_strategy=control_strategy,
                     control_image_path=(
                         str(base_image_path) if controlled_workflow else None
                     ),
                     reference_image_path=(
-                        str(base_image_path) if base_image_path else None
+                        str(base_image_path)
+                        if base_image_path and control_strategy != "masked_inpaint"
+                        else None
                     ),
                 )
             else:
@@ -2108,7 +2216,7 @@ def _run_selective_visual_retry(
                 {
                     "id": attempt_id,
                     "status": "active",
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": _utc_now_iso(),
                     "image_path": str(image_path),
                     "video_path": str(video_path),
                     "audio_path": active_attempt.get("audio_path"),
@@ -2156,7 +2264,7 @@ def _run_selective_visual_retry(
                     "retry_status": "succeeded",
                     "active_attempt_id": attempt_id,
                     "approved_attempt_id": None,
-                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_at": _utc_now_iso(),
                 }
             )
             if image_record:
@@ -2237,7 +2345,7 @@ def _run_selective_visual_retry(
                 run.get("summary", {}), Path(run["run_dir"])
             )
             run["summary"] = summary
-            run["updated_at"] = datetime.utcnow().isoformat()
+            run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
         _append_log(
             run_id,
@@ -2266,7 +2374,7 @@ def _run_selective_visual_retry(
                 {
                     "id": attempt_id,
                     "status": "failed",
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": _utc_now_iso(),
                     "retry_scope": scope,
                     "reason": reason,
                     "note": note,
@@ -2278,7 +2386,7 @@ def _run_selective_visual_retry(
             run["summary"] = _apply_curation_summary(
                 run["summary"], Path(run["run_dir"])
             )
-            run["updated_at"] = datetime.utcnow().isoformat()
+            run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
         _append_log(
             run_id,
@@ -2331,11 +2439,11 @@ def _run_selective_audio_retry(
                 "retry_scope": scope,
                 "note": note,
                 "reason": reason,
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": _utc_now_iso(),
             }
         )
         run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
 
     _append_log(run_id, f"retry ElevenLabs iniciado: cena {scene_id}")
@@ -2427,7 +2535,7 @@ def _run_selective_audio_retry(
                 {
                     "id": attempt_id,
                     "status": "active",
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": _utc_now_iso(),
                     "image_path": previous_active.get("image_path"),
                     "video_path": previous_active.get("video_path"),
                     "audio_path": str(audio_path),
@@ -2479,7 +2587,7 @@ def _run_selective_audio_retry(
                     "retry_status": "succeeded",
                     "active_attempt_id": attempt_id,
                     "approved_attempt_id": None,
-                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_at": _utc_now_iso(),
                 }
             )
             summary["audio_files"] = _replace_scene_record(
@@ -2539,7 +2647,7 @@ def _run_selective_audio_retry(
             run["summary"] = _apply_curation_summary(
                 run.get("summary", {}), Path(run["run_dir"])
             )
-            run["updated_at"] = datetime.utcnow().isoformat()
+            run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
         _append_log(
             run_id,
@@ -2568,7 +2676,7 @@ def _run_selective_audio_retry(
                 {
                     "id": attempt_id,
                     "status": "failed",
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": _utc_now_iso(),
                     "retry_scope": scope,
                     "reason": reason,
                     "note": note,
@@ -2581,7 +2689,7 @@ def _run_selective_audio_retry(
             run["summary"] = _apply_curation_summary(
                 run["summary"], Path(run["run_dir"])
             )
-            run["updated_at"] = datetime.utcnow().isoformat()
+            run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
         _append_log(
             run_id,
@@ -2814,14 +2922,14 @@ def _run_youtube_upload(run_id: str) -> None:
         summary.setdefault("publication", {}).update(
             {
                 "status": "uploading",
-                "started_at": datetime.utcnow().isoformat(),
+                "started_at": _utc_now_iso(),
                 "error": None,
                 "failed_at": None,
                 "metadata": metadata,
             }
         )
         run["summary"] = summary
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
     _append_log(run_id, "upload real para YouTube iniciado")
 
@@ -2838,7 +2946,7 @@ def _run_youtube_upload(run_id: str) -> None:
             summary.setdefault("publication", {}).update(
                 {
                     "status": "published",
-                    "completed_at": datetime.utcnow().isoformat(),
+                    "completed_at": _utc_now_iso(),
                     "error": None,
                     "failed_at": None,
                     "artifact": artifact,
@@ -2847,7 +2955,7 @@ def _run_youtube_upload(run_id: str) -> None:
             )
             summary = _apply_curation_summary(summary, Path(run["run_dir"]))
             run["summary"] = summary
-            run["updated_at"] = datetime.utcnow().isoformat()
+            run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
         _append_log(run_id, f"YouTube publicado: {result['url']}")
     except (
@@ -2865,11 +2973,11 @@ def _run_youtube_upload(run_id: str) -> None:
                 {
                     "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
-                    "failed_at": datetime.utcnow().isoformat(),
+                    "failed_at": _utc_now_iso(),
                 }
             )
             run["summary"] = summary
-            run["updated_at"] = datetime.utcnow().isoformat()
+            run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
         _append_log(run_id, f"falha no upload YouTube: {type(exc).__name__}: {exc}")
 
@@ -2888,8 +2996,8 @@ def _start_pipeline_run(
             "id": run_id,
             "status": "running",
             "run_dir": str(run_dir),
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
+            "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
             "retry_of": retry_of,
             "target_scene_id": target_scene_id,
             "image_style": image_style,
@@ -2918,7 +3026,7 @@ def _hydrate_run_from_summary(summary_path: Path) -> dict[str, Any]:
         "status": summary.get("status") or "completed",
         "run_dir": str(run_dir),
         "created_at": datetime.fromtimestamp(run_dir.stat().st_mtime).isoformat(),
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": _utc_now_iso(),
         "retry_of": None,
         "target_scene_id": None,
         "image_style": summary.get("image_style", "comic_storybook"),
@@ -3192,10 +3300,10 @@ def set_run_curation(run_id: str) -> Response:
             "active_attempt_id": attempt_id,
             "approved_attempt_id": approved_attempt_id,
             "attempts": attempts,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": _utc_now_iso(),
         }
         run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
         return jsonify(run)
 
@@ -3259,9 +3367,9 @@ def mark_final_video_viewed(run_id: str) -> Response:
             return jsonify({"error": "run summary is not ready"}), 409
         final_review = summary.setdefault("curation", {}).setdefault("final_review", {})
         final_review["video_viewed"] = True
-        final_review["viewed_at"] = datetime.utcnow().isoformat()
+        final_review["viewed_at"] = _utc_now_iso()
         run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
         return jsonify(run)
 
@@ -3293,12 +3401,12 @@ def approve_final_cut(run_id: str) -> Response:
         final_review.update(
             {
                 "status": "final_approved",
-                "approved_at": datetime.utcnow().isoformat(),
+                "approved_at": _utc_now_iso(),
                 "note": note,
             }
         )
         run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
         return jsonify(run)
 
@@ -3317,7 +3425,7 @@ def publish_gate(run_id: str) -> Response:
         publication = summary.setdefault("publication", {})
         production = summary.get("production_status", {})
         run["summary"] = summary
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
         if not curation.get("can_publish"):
             return jsonify(
@@ -3338,7 +3446,7 @@ def publish_gate(run_id: str) -> Response:
         if production.get("status") == "published_current":
             publication.update({"error": None, "failed_at": None})
             run["summary"] = summary
-            run["updated_at"] = datetime.utcnow().isoformat()
+            run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
             return jsonify(
                 {
@@ -3351,7 +3459,7 @@ def publish_gate(run_id: str) -> Response:
         publication.update(
             {
                 "status": "queued",
-                "queued_at": datetime.utcnow().isoformat(),
+                "queued_at": _utc_now_iso(),
                 "error": None,
                 "failed_at": None,
             }
@@ -3423,10 +3531,10 @@ def retry_scene(run_id: str) -> Response:
             "note": note,
             "reason": reason,
             "retry_scope": scope,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": _utc_now_iso(),
         }
         run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
-        run["updated_at"] = datetime.utcnow().isoformat()
+        run["updated_at"] = _utc_now_iso()
         _persist_summary(run)
 
     retry_target = (

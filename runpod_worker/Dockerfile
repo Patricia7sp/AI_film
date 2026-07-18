@@ -9,6 +9,9 @@ RUN git clone https://github.com/comfyorg/comfyui-ipadapter.git \
     cd custom_nodes/comfyui-ipadapter && \
     git checkout "${COMFYUI_IPADAPTER_COMMIT}"
 
+COPY validate_custom_nodes.py /validate_custom_nodes.py
+RUN python /validate_custom_nodes.py
+
 ARG AI_FILM_CHECKPOINT_NAME=ai-film-comic-storybook-xl.safetensors
 ARG AI_FILM_CHECKPOINT_URL=https://huggingface.co/cagliostrolab/animagine-xl-4.0/resolve/main/animagine-xl-4.0-opt.safetensors
 ARG AI_FILM_EMBED_CHECKPOINT=false

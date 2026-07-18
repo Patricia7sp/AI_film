@@ -16,6 +16,7 @@ from typing import Dict, List, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / "open3d_implementation" / ".env"
 DOCKERFILE_PATH = ROOT / "runpod_worker" / "Dockerfile"
+CUSTOM_NODE_VALIDATOR_PATH = ROOT / "runpod_worker" / "validate_custom_nodes.py"
 START_SCRIPT_PATH = ROOT / "runpod_worker" / "start_ai_film.sh"
 MODEL_DOWNLOAD_SCRIPT_PATH = ROOT / "scripts" / "runpod_download_hf_model.sh"
 CONTROLNET_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_controlnet_volume.sh"
@@ -89,6 +90,7 @@ def validate_dockerfile() -> List[str]:
         "ai-film-comic-storybook-xl.safetensors",
         "start_ai_film.sh",
         "comfyorg/comfyui-ipadapter.git",
+        "validate_custom_nodes.py",
         "COMFYUI_IPADAPTER_COMMIT=",
         'CMD ["/start_ai_film.sh"]',
         "v1-5-pruned-emaonly.safetensors",
@@ -97,6 +99,33 @@ def validate_dockerfile() -> List[str]:
         if item not in text:
             failures.append(f"Dockerfile missing: {item}")
     return failures
+
+
+def validate_file_markers(
+    path: Path,
+    label: str,
+    required_markers: tuple[str, ...],
+) -> List[str]:
+    if not path.exists():
+        return [f"{label} is missing"]
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return [
+        f"{label} missing: {marker}"
+        for marker in required_markers
+        if marker not in text
+    ]
+
+
+def validate_custom_node_validator() -> List[str]:
+    return validate_file_markers(
+        CUSTOM_NODE_VALIDATOR_PATH,
+        "runpod_worker/validate_custom_nodes.py",
+        (
+            "IPAdapterUnifiedLoader",
+            "IPAdapterAdvanced",
+            "NODE_CLASS_MAPPINGS",
+        ),
+    )
 
 
 def validate_shell_script(path: Path, label: str) -> List[str]:
@@ -347,6 +376,13 @@ def main() -> int:
     dockerfile_failures = validate_dockerfile()
     failures.extend(dockerfile_failures)
     print(f"- Dockerfile: {'ok' if not dockerfile_failures else 'failed'}")
+
+    custom_node_validator_failures = validate_custom_node_validator()
+    failures.extend(custom_node_validator_failures)
+    print(
+        "- Custom node build gate: "
+        f"{'ok' if not custom_node_validator_failures else 'failed'}"
+    )
 
     wrapper_failures = validate_worker_wrapper()
     failures.extend(wrapper_failures)

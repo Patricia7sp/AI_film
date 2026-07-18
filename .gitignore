@@ -37,6 +37,8 @@ config/local/
 # IDEs e editores
 .idea/
 .vscode/
+.impeccable/
+.serena/
 *.swp
 *.swo
 .DS_Store
@@ -261,6 +263,11 @@ Thumbs.db
 test_*.py
 *_test.py
 !tests/hero_object_gate_test.py
+!tests/conftest.py
+!tests/test_audio.py
+!tests/test_runway.py
+!tests/test_video.py
+!tests/test_youtube.py
 teste_*.py
 *_teste.py
 debug_*.py
@@ -326,7 +333,6 @@ google-cloud-sdk/
 .venv_*/
 venv_*/
 
-# Lock files
-uv.lock
+# Lock files from package managers not used by this project.
 poetry.lock
 Pipfile.lock

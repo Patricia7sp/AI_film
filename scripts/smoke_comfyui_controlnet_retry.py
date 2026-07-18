@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
 import json
@@ -74,19 +75,48 @@ def _submit_workflow(
 def _poll_job(endpoint_id: str, api_key: str, job_id: str) -> dict[str, Any]:
     max_wait = int(os.getenv("COMFYUI_CONTROLNET_SMOKE_MAX_WAIT_SECONDS", "420"))
     waited = 0
+    consecutive_errors = 0
+    last_status = ""
     while waited < max_wait:
         time.sleep(3)
         waited += 3
-        response = requests.get(
-            f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
-        )
+        try:
+            response = requests.get(
+                f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            consecutive_errors += 1
+            if consecutive_errors in {1, 5, 10}:
+                print(
+                    json.dumps(
+                        {
+                            "job_id": job_id,
+                            "status": "POLL_RETRY",
+                            "waited": waited,
+                            "error": type(exc).__name__,
+                            "consecutive_errors": consecutive_errors,
+                        }
+                    ),
+                    flush=True,
+                )
+            if consecutive_errors >= 10:
+                raise RuntimeError(
+                    f"job_poll_failed:{type(exc).__name__}:{consecutive_errors}"
+                ) from exc
+            continue
+        consecutive_errors = 0
         if response.status_code != 200:
             continue
         payload = response.json()
         status = payload.get("status")
-        print(json.dumps({"job_id": job_id, "status": status, "waited": waited}))
+        if status != last_status or waited % 30 == 0:
+            print(
+                json.dumps({"job_id": job_id, "status": status, "waited": waited}),
+                flush=True,
+            )
+            last_status = str(status or "")
         if status == "COMPLETED":
             return payload
         if status in {"FAILED", "CANCELLED", "TIMED_OUT"}:
@@ -145,7 +175,9 @@ def _save_workflow_images(
     return result
 
 
-def _build_smoke_workflow() -> tuple[dict[str, Any], dict[str, Any]]:
+def _build_smoke_workflow(
+    *, ipadapter_enabled: bool = True, controlnet_enabled: bool = True
+) -> tuple[dict[str, Any], dict[str, Any]]:
     preset_key = os.getenv("COMFYUI_CONTROLNET_SMOKE_PRESET", "high")
     preset = _resolve_quality_preset(preset_key)
     smoke_scene = {
@@ -187,62 +219,103 @@ def _build_smoke_workflow() -> tuple[dict[str, Any], dict[str, Any]]:
         scene_seed=20260708,
         scene_id="controlnet_retry_smoke",
         negative_prompt=_scene_negative_prompt(smoke_scene),
-        controlled_workflow=True,
-        control_image_name=CONTROL_IMAGE_NAME,
+        controlled_workflow=controlnet_enabled,
+        control_image_name=CONTROL_IMAGE_NAME if controlnet_enabled else None,
         inpaint_image_name=INPAINT_IMAGE_NAME,
         refiner_enabled=False,
-        reference_image_name=IPADAPTER_REFERENCE_IMAGE_NAME,
-        ipadapter_enabled=True,
+        reference_image_name=(
+            IPADAPTER_REFERENCE_IMAGE_NAME if ipadapter_enabled else None
+        ),
+        ipadapter_enabled=ipadapter_enabled,
     )
     return workflow, smoke_scene
 
 
 def main() -> int:
-    load_dotenv(OPEN3D_ROOT / ".env", override=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--control-source",
+        type=Path,
+        default=CONTROL_SOURCE_PATH,
+        help="Approved or rejected base frame to repair with masked control.",
+    )
+    parser.add_argument(
+        "--without-ipadapter",
+        action="store_true",
+        help="Do not reuse the rejected frame as an IP-Adapter identity reference.",
+    )
+    parser.add_argument(
+        "--inpaint-only",
+        action="store_true",
+        help="Use masked inpainting without structural ControlNet guidance.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=OUTPUT_PATH,
+        help="Destination for the repaired image.",
+    )
+    args = parser.parse_args()
+    control_source = args.control_source.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+
+    load_dotenv(OPEN3D_ROOT / ".env", override=False)
     endpoint_id = os.getenv("COMFYUI_SMOKE_ENDPOINT_ID", "").strip() or _required_env(
         "RUNPOD_ENDPOINT_ID"
     )
     api_key = _required_env("RUNPOD_API_KEY")
     preset_key = os.getenv("COMFYUI_CONTROLNET_SMOKE_PRESET", "high")
     preset = _resolve_quality_preset(preset_key)
-    if not CONTROL_SOURCE_PATH.exists():
-        raise RuntimeError(f"missing_control_source:{CONTROL_SOURCE_PATH}")
-    workflow, smoke_scene = _build_smoke_workflow()
-    control_image = _encode_comfyui_control_image(
-        str(CONTROL_SOURCE_PATH),
-        image_name=CONTROL_IMAGE_NAME,
-        width=preset["width"],
-        height=preset["height"],
-        scene=smoke_scene,
+    if not control_source.is_file():
+        raise RuntimeError(f"missing_control_source:{control_source}")
+    ipadapter_enabled = not args.without_ipadapter
+    workflow, smoke_scene = _build_smoke_workflow(
+        ipadapter_enabled=ipadapter_enabled,
+        controlnet_enabled=not args.inpaint_only,
     )
     inpaint_image = _encode_comfyui_inpaint_image(
-        str(CONTROL_SOURCE_PATH),
+        str(control_source),
         image_name=INPAINT_IMAGE_NAME,
         width=preset["width"],
         height=preset["height"],
         scene=smoke_scene,
     )
-    reference_image = _encode_comfyui_reference_image(
-        str(CONTROL_SOURCE_PATH),
-        image_name=IPADAPTER_REFERENCE_IMAGE_NAME,
-    )
+    images = [inpaint_image]
+    if not args.inpaint_only:
+        images.insert(
+            0,
+            _encode_comfyui_control_image(
+                str(control_source),
+                image_name=CONTROL_IMAGE_NAME,
+                width=preset["width"],
+                height=preset["height"],
+                scene=smoke_scene,
+            ),
+        )
+    if ipadapter_enabled:
+        images.append(
+            _encode_comfyui_reference_image(
+                str(control_source),
+                image_name=IPADAPTER_REFERENCE_IMAGE_NAME,
+            )
+        )
     job_id = _submit_workflow(
         endpoint_id,
         api_key,
         workflow,
-        [control_image, inpaint_image, reference_image],
+        images,
     )
     payload = _poll_job(endpoint_id, api_key, job_id)
-    saved_images = _save_workflow_images(payload, OUTPUT_PATH)
+    saved_images = _save_workflow_images(payload, output_path)
     size_bytes = saved_images["size_bytes"]
-    technical_quality = _probe_image_quality(str(OUTPUT_PATH), scene=smoke_scene)
+    technical_quality = _probe_image_quality(str(output_path), scene=smoke_scene)
     quality_issues = technical_quality.get("issues", [])
     print(
         json.dumps(
             {
                 "status": "ok",
                 "job_id": job_id,
-                "output_path": str(OUTPUT_PATH),
+                "output_path": str(output_path),
                 "size_bytes": size_bytes,
                 "intermediate_path": saved_images["intermediate_path"],
                 "intermediate_size_bytes": saved_images["intermediate_size_bytes"],

@@ -17,6 +17,39 @@ ENV_PATH = ROOT / "open3d_implementation" / ".env"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 HEALTH_URL_TEMPLATE = "https://api.runpod.ai/v2/{endpoint_id}/health"
 CANCEL_URL_TEMPLATE = "https://api.runpod.ai/v2/{endpoint_id}/cancel/{job_id}"
+STATUS_URL_TEMPLATE = "https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
+DETAILS_URL_TEMPLATE = (
+    "https://rest.runpod.io/v1/endpoints/{endpoint_id}"
+    "?includeTemplate=true&includeWorkers=true"
+)
+UPDATE_URL_TEMPLATE = "https://rest.runpod.io/v1/endpoints/{endpoint_id}"
+TEMPLATE_URL_TEMPLATE = (
+    "https://rest.runpod.io/v1/templates/{template_id}"
+    "?includeEndpointBoundTemplates=true"
+)
+TEMPLATE_UPDATE_URL_TEMPLATE = (
+    "https://rest.runpod.io/v1/templates/{template_id}/update"
+)
+SENSITIVE_KEY_FRAGMENTS = ("api_key", "authorization", "secret", "token")
+QWEN_SAFE_GPU_TYPE_IDS = {
+    "NVIDIA A100 80GB PCIe",
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 PCIe",
+    "NVIDIA H100 NVL",
+    "NVIDIA H200",
+    "NVIDIA H200 NVL",
+}
+LEGACY_VOLUME_LINK_COMMAND = (
+    "set -euo pipefail; shopt -s nullglob; "
+    "for model_dir in checkpoints controlnet diffusion_models loras text_encoders "
+    "vae clip_vision ipadapter upscale_models; do "
+    "target=/comfyui/models/${model_dir}; mkdir -p ${target}; "
+    "for source in /runpod-volume/models/${model_dir} /workspace/models/${model_dir}; do "
+    "if [[ -d ${source} ]]; then files=(${source}/*); "
+    "if (( ${#files[@]} > 0 )); then ln -sf ${files[@]} ${target}/; fi; fi; done; done; "
+    "exec /start.sh"
+)
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -37,6 +70,7 @@ def request_json(
     *,
     api_key: str,
     payload: Dict[str, Any] | None = None,
+    method: str | None = None,
     timeout: int = 30,
 ) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -48,7 +82,7 @@ def request_json(
             "Content-Type": "application/json",
             "User-Agent": "ai-film-runpod-control/1.0",
         },
-        method="POST" if payload is not None else "GET",
+        method=method or ("POST" if payload is not None else "GET"),
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:  # nosec B310
@@ -123,6 +157,163 @@ def cancel_job(*, api_key: str, endpoint_id: str, job_id: str) -> Dict[str, Any]
     )
 
 
+def job_status(*, api_key: str, endpoint_id: str, job_id: str) -> Dict[str, Any]:
+    return request_json(
+        STATUS_URL_TEMPLATE.format(endpoint_id=endpoint_id, job_id=job_id),
+        api_key=api_key,
+    )
+
+
+def endpoint_details(*, api_key: str, endpoint_id: str) -> Dict[str, Any]:
+    return redact_sensitive_values(
+        request_json(
+            DETAILS_URL_TEMPLATE.format(endpoint_id=endpoint_id),
+            api_key=api_key,
+        )
+    )
+
+
+def endpoint_template_details(*, api_key: str, endpoint_id: str) -> Dict[str, Any]:
+    endpoint = request_json(
+        DETAILS_URL_TEMPLATE.format(endpoint_id=endpoint_id),
+        api_key=api_key,
+    )
+    template_id = str(endpoint.get("templateId") or "").strip()
+    if not template_id:
+        raise RuntimeError("RunPod endpoint did not return a templateId")
+    template = request_json(
+        TEMPLATE_URL_TEMPLATE.format(template_id=template_id),
+        api_key=api_key,
+    )
+    return redact_sensitive_values(template)
+
+
+def update_endpoint_template_runtime(
+    *,
+    api_key: str,
+    endpoint_id: str,
+    image_name: str,
+    start_command: str,
+) -> Dict[str, Any]:
+    endpoint = request_json(
+        DETAILS_URL_TEMPLATE.format(endpoint_id=endpoint_id),
+        api_key=api_key,
+    )
+    template_id = str(endpoint.get("templateId") or "").strip()
+    if not template_id:
+        raise RuntimeError("RunPod endpoint did not return a templateId")
+    docker_start_cmd = (
+        ["bash", "-lc", LEGACY_VOLUME_LINK_COMMAND]
+        if start_command == "legacy-volume-links"
+        else [start_command]
+    )
+    updated = request_json(
+        TEMPLATE_UPDATE_URL_TEMPLATE.format(template_id=template_id),
+        api_key=api_key,
+        payload={
+            "imageName": image_name,
+            "dockerEntrypoint": [],
+            "dockerStartCmd": docker_start_cmd,
+            "env": {
+                "COMFY_LOG_LEVEL": "INFO",
+                "RUNPOD_INIT_TIMEOUT": "800",
+            },
+            "volumeMountPath": "/runpod-volume",
+        },
+    )
+    return redact_sensitive_values(updated)
+
+
+def redact_sensitive_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key).lower()
+            if any(fragment in normalized_key for fragment in SENSITIVE_KEY_FRAGMENTS):
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = redact_sensitive_values(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_sensitive_values(item) for item in value]
+    return value
+
+
+def update_endpoint(
+    *, api_key: str, endpoint_id: str, changes: Dict[str, Any]
+) -> Dict[str, Any]:
+    return request_json(
+        UPDATE_URL_TEMPLATE.format(endpoint_id=endpoint_id),
+        api_key=api_key,
+        payload=changes,
+        method="PATCH",
+    )
+
+
+def update_stopped_endpoint_gpu_types(
+    *, api_key: str, endpoint_id: str, gpu_type_ids: list[str]
+) -> Dict[str, Any]:
+    unique_ids = list(
+        dict.fromkeys(item.strip() for item in gpu_type_ids if item.strip())
+    )
+    if not unique_ids:
+        raise ValueError("At least one GPU type is required.")
+    unsupported = [item for item in unique_ids if item not in QWEN_SAFE_GPU_TYPE_IDS]
+    if unsupported:
+        raise ValueError(
+            "Qwen endpoint requires an approved GPU with at least 80 GB VRAM: "
+            + ", ".join(unsupported)
+        )
+
+    current = request_json(
+        DETAILS_URL_TEMPLATE.format(endpoint_id=endpoint_id),
+        api_key=api_key,
+    )
+    if (
+        int(current.get("workersMin") or 0) != 0
+        or int(current.get("workersMax") or 0) != 0
+    ):
+        raise RuntimeError("Stop the endpoint before changing GPU types.")
+    return update_endpoint(
+        api_key=api_key,
+        endpoint_id=endpoint_id,
+        changes={"gpuTypeIds": unique_ids},
+    )
+
+
+def wait_for_stable_worker(
+    *,
+    api_key: str,
+    endpoint_id: str,
+    timeout_seconds: int,
+    stable_samples: int,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    consecutive_ready = 0
+    latest: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        latest = endpoint_health(api_key=api_key, endpoint_id=endpoint_id)
+        workers = latest.get("workers", {})
+        ready = workers.get("ready", 0)
+        unhealthy = workers.get("unhealthy", 0)
+        initializing = workers.get("initializing", 0)
+        if ready >= 1 and unhealthy == 0 and initializing == 0:
+            consecutive_ready += 1
+            if consecutive_ready >= stable_samples:
+                return latest
+        else:
+            consecutive_ready = 0
+            if unhealthy:
+                raise RuntimeError(
+                    "RunPod worker became unhealthy before the stability gate passed."
+                )
+        time.sleep(10)
+    raise TimeoutError(
+        f"RunPod worker did not remain ready for {stable_samples} samples "
+        f"within {timeout_seconds}s. Last health: {json.dumps(latest)}"
+    )
+
+
 def print_json(data: Dict[str, Any]) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -133,7 +324,20 @@ def main() -> int:
     )
     parser.add_argument(
         "command",
-        choices=("health", "stop", "test-capacity", "set-workers", "cancel-job"),
+        choices=(
+            "health",
+            "details",
+            "template-details",
+            "set-template-runtime",
+            "stop",
+            "test-capacity",
+            "set-workers",
+            "set-flashboot",
+            "wait-ready",
+            "cancel-job",
+            "job-status",
+            "set-gpu-types",
+        ),
         help=(
             "health prints queue/worker state; stop sets min/max to 0; "
             "test-capacity sets min 0/max 1; set-workers uses explicit values; "
@@ -141,8 +345,33 @@ def main() -> int:
         ),
     )
     parser.add_argument("--job-id", default=None)
+    parser.add_argument(
+        "--gpu-type-id",
+        action="append",
+        default=[],
+        help="Repeat for each prioritized 80 GB+ GPU type used by set-gpu-types.",
+    )
+    parser.add_argument("--image-name", default=None)
+    parser.add_argument("--start-command", default="/start_ai_film.sh")
+    parser.add_argument(
+        "--endpoint-id",
+        default=None,
+        help="Override RUNPOD_ENDPOINT_ID for isolated canary operations.",
+    )
     parser.add_argument("--workers-min", type=int, default=None)
     parser.add_argument("--workers-max", type=int, default=None)
+    parser.add_argument(
+        "--enabled",
+        choices=("true", "false"),
+        default=None,
+        help="Enable or disable FlashBoot for set-flashboot.",
+    )
+    parser.add_argument(
+        "--stable-samples",
+        type=int,
+        default=3,
+        help="Consecutive healthy samples required by wait-ready.",
+    )
     parser.add_argument("--name", default="ai-film-comfyui")
     parser.add_argument(
         "--locations",
@@ -156,13 +385,102 @@ def main() -> int:
 
     env = load_env(ENV_PATH)
     api_key = env.get("RUNPOD_API_KEY", "")
-    endpoint_id = env.get("RUNPOD_ENDPOINT_ID", "")
+    endpoint_id = args.endpoint_id or env.get("RUNPOD_ENDPOINT_ID", "")
     if not api_key or not endpoint_id:
         print("RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID are required.", file=sys.stderr)
         return 2
 
     if args.command == "health":
         print_json(endpoint_health(api_key=api_key, endpoint_id=endpoint_id))
+        return 0
+
+    if args.command == "job-status":
+        if not args.job_id:
+            print("job-status requires --job-id.", file=sys.stderr)
+            return 2
+        print_json(
+            job_status(
+                api_key=api_key,
+                endpoint_id=endpoint_id,
+                job_id=args.job_id,
+            )
+        )
+        return 0
+
+    if args.command == "details":
+        print_json(endpoint_details(api_key=api_key, endpoint_id=endpoint_id))
+        return 0
+
+    if args.command == "template-details":
+        print_json(endpoint_template_details(api_key=api_key, endpoint_id=endpoint_id))
+        return 0
+
+    if args.command == "set-template-runtime":
+        image_name = str(args.image_name or "").strip()
+        start_command = str(args.start_command or "").strip()
+        if not image_name or not start_command:
+            print(
+                "set-template-runtime requires --image-name and --start-command.",
+                file=sys.stderr,
+            )
+            return 2
+        print_json(
+            {
+                "template": update_endpoint_template_runtime(
+                    api_key=api_key,
+                    endpoint_id=endpoint_id,
+                    image_name=image_name,
+                    start_command=start_command,
+                )
+            }
+        )
+        return 0
+
+    if args.command == "set-flashboot":
+        if args.enabled is None:
+            print("set-flashboot requires --enabled true|false.", file=sys.stderr)
+            return 2
+        print_json(
+            {
+                "endpoint": update_endpoint(
+                    api_key=api_key,
+                    endpoint_id=endpoint_id,
+                    changes={"flashboot": args.enabled == "true"},
+                )
+            }
+        )
+        return 0
+
+    if args.command == "set-gpu-types":
+        try:
+            endpoint = update_stopped_endpoint_gpu_types(
+                api_key=api_key,
+                endpoint_id=endpoint_id,
+                gpu_type_ids=args.gpu_type_id,
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print_json({"endpoint": redact_sensitive_values(endpoint)})
+        return 0
+
+    if args.command == "wait-ready":
+        if args.wait <= 0 or args.stable_samples <= 0:
+            print(
+                "wait-ready requires --wait > 0 and --stable-samples > 0.",
+                file=sys.stderr,
+            )
+            return 2
+        print_json(
+            {
+                "health": wait_for_stable_worker(
+                    api_key=api_key,
+                    endpoint_id=endpoint_id,
+                    timeout_seconds=args.wait,
+                    stable_samples=args.stable_samples,
+                )
+            }
+        )
         return 0
 
     if args.command == "cancel-job":

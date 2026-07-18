@@ -172,6 +172,142 @@ python3 scripts/runpod_controlnet_pod.py list
 python3 scripts/runpod_controlnet_pod.py terminate --pod-id POD_ID
 ```
 
+Para auditar a ocupação antes de adicionar modelos grandes, use o mesmo
+controlador em modo somente leitura:
+
+```bash
+python3 scripts/runpod_controlnet_pod.py create --mode audit --gpu-type-id "NVIDIA L4"
+```
+
+O reparo semântico recomendado mantém FLUX.2 Klein como gerador base e usa
+`Qwen-Image-Edit-2511` somente quando o gate visual rejeita uma cena. Os três
+assets oficiais compactados ocupam aproximadamente 30,17 GB e são baixados com
+SHA256 verificado e promoção atômica do arquivo `.partial`:
+
+```bash
+python3 scripts/runpod_controlnet_pod.py create --mode qwen2511 --gpu-type-id "NVIDIA L4"
+```
+
+O inventário deve ser conferido antes do download. Para o volume AI Film que
+já contém FLUX.2, SDXL, ControlNet e IP-Adapter, use no mínimo 100 GB; 125 GB
+mantém margem operacional para arquivos temporários e novos testes. O volume
+só pode crescer, nunca diminuir.
+
+Depois de criar um endpoint canário exclusivo para o editor, configure:
+
+```text
+COMFYUI_SEMANTIC_REPAIR_BACKEND=qwen_image_edit_2511
+COMFYUI_QWEN_EDIT_ENDPOINT_ID=ENDPOINT_CANARIO
+```
+
+Valide antes de promover:
+
+```bash
+python3 scripts/smoke_comfyui_qwen_edit_2511.py
+```
+
+O smoke test só passa quando o frame reparado vence os gates técnico e
+semântico; o score combinado, isoladamente, não libera a imagem.
+
+O canário sintético remoto atingiu score técnico `100/100`, semântico `89/100`
+e combinado `93,4/100`. Isso valida o runtime, mas não comprova aderência a uma
+cena narrativa complexa. Em 2026-07-18, o contrato real de Alice, Ludovico,
+açucareiro sem alça e rato pequeno obteve `35` no FLUX.2, `42` após a primeira
+edição Qwen e `58` após a correção contratual. As três imagens foram rejeitadas
+pelo gate; portanto, não promova o Qwen como solução única de produção.
+
+O adapter usa no máximo quatro operações encadeadas e muda de técnica quando
+uma abordagem falha:
+
+1. FLUX.2 cria o frame base.
+2. Qwen recebe uma única tentativa de correção semântica ampla.
+3. Falha de identidade/idade migra para SDXL ControlNet + IP-Adapter usando uma
+   referência de personagem previamente aprovada.
+4. Falha isolada de escala ou geometria do hero object migra para inpainting
+   mascarado de alta denoising somente na região do objeto.
+
+Validação controlada de 2026-07-18:
+
+- A ficha ComfyUI da Alice passou com score técnico `92,8` e semântico `98`.
+- O FLUX.2 base da cena crítica atingiu semântico `58` e foi bloqueado.
+- O Qwen com a ficha aprovada como segunda referência preservou melhor Alice e
+  criou Ludovico, mas ainda gerou um recipiente grande e o rato totalmente
+  exposto.
+- A imagem atualmente publicada no endpoint não contém os nodes do IP-Adapter;
+  portanto, `COMFYUI_IPADAPTER_ENABLED=false` continua obrigatório até publicar
+  e validar a nova imagem. O Dockerfile agora fixa o commit do
+  `comfyorg/comfyui-ipadapter` e falha durante o build se
+  `IPAdapterUnifiedLoader` ou `IPAdapterAdvanced` não puderem ser importados.
+- SDXL + ControlNet executa sem o IP-Adapter, mas o primeiro teste revelou uma
+  máscara excessivamente ampla e artefatos de colagem. A máscara foi reduzida
+  à região inferior da mesa; a imagem não pode ser promovida sem novo gate.
+- Os endpoints devem voltar para `workersMin=0` e `workersMax=0` ao final de
+  cada canário, inclusive quando o gate bloquear.
+
+Revalidação semântica estrita de 2026-07-18:
+
+- O QA agora tenta Gemini primeiro e usa OpenAI Vision com JSON Schema estrito
+  somente quando o Gemini não devolve JSON válido. Falha dos dois provedores
+  bloqueia a imagem; nunca existe aprovação por ausência de avaliador.
+- Scores confirmados das tentativas existentes: FLUX base `22`, primeira edição
+  Qwen `12`, SDXL controlado `35` e SDXL mascarado `45`. Nenhuma atingiu `88`.
+- O encoder Qwen recortava a cena vertical para `1024x1024`. A entrada agora
+  preserva `832x1216`; o novo canário manteve o retrato e atingiu técnico `100`,
+  mas apenas semântico `35`, ainda com bowl e rato grandes.
+- O primeiro inpaint Qwen usava `VAEEncodeForInpaint` e gerou uma caixa moderna.
+  Essa rota foi retirada. O grafo passou a seguir a topologia de máscara com
+  `VAEEncode` + `SetLatentNoiseMask`.
+- `TextEncodeQwenImageEditPlus` aceita uma terceira referência. O adapter usa a
+  ficha do prop somente quando seu relatório tem `accepted=true`; isso evita
+  contaminar novas cenas com uma referência ainda reprovada.
+- A geração isolada do prop expôs contaminação no contrato: `teaspoon` acionava
+  a regra de `tea`, e qualquer sugar bowl injetava Alice e Ludovico. As duas
+  regras foram separadas por `scene_role=prop_reference` e cobertas por teste.
+- A ficha curada do prop foi aprovada com score técnico `85,5` e semântico `90`.
+  Ela representa um açucareiro compacto sem alça, tampa, colher e ratinho branco
+  e está registrada em `hero_prop_reference.png`.
+- A tentativa 8 alinhou o workflow à topologia oficial do Qwen, preservou o
+  frame e atingiu técnico `100`, mas semântico `12`: copiou o açucareiro e
+  omitiu totalmente o rato. O job executou por `274,741 s`, ficou `20,552 s` na
+  fila e custou aproximadamente `US$ 0,106050`.
+- Uma submissão anterior da tentativa 8 expirou ainda em `IN_QUEUE`. A telemetria
+  agora separa fila de execução e registra custo `US$ 0` quando a GPU nunca
+  iniciou, em vez de cobrar o tempo de espera como inferência.
+- A tentativa 9 posicionou a ficha aprovada deterministicamente e executou Qwen
+  mascarado com denoise `0,35`. O resultado atingiu técnico `100`, mas semântico
+  `37`, manteve um retângulo de colagem visível e custou aproximadamente
+  `US$ 0,107307`. Custo executado das tentativas 8 e 9: `US$ 0,213357`.
+- A rota Qwen está encerrada para inserção de hero props pequenos. O próximo
+  canário usa SDXL masked inpaint, uma máscara normalizada restrita à mesa e a
+  ficha aprovada como referência IP-Adapter `composition precise`. Não execute
+  novo canário antes de o build validado do worker estar publicado.
+
+Os passes isolados podem ser reproduzidos pelo smoke:
+
+```bash
+python3 scripts/smoke_comfyui_qwen_edit_2511.py --topology-repair --source REJEITADA.png
+python3 scripts/smoke_comfyui_qwen_edit_2511.py --scale-repair --source REJEITADA.png
+python3 scripts/smoke_comfyui_qwen_edit_2511.py --character-age-repair --source REJEITADA.png
+```
+
+Depois de publicar a imagem com o gate do IP-Adapter e ativar
+`COMFYUI_IPADAPTER_ENABLED=true`, execute somente o canário controlado:
+
+```bash
+python3 scripts/smoke_comfyui_staged_repair.py --sdxl-ipadapter-canary
+```
+
+O canário grava `sdxl_ipadapter_canary_report.json` e só pode ser promovido se
+os gates técnico e semântico passarem. Score semântico abaixo de `88`, ausência
+do rato ou artefato fora da máscara bloqueia a promoção.
+
+Em produção, `IMAGE_GENERATION_MAX_ATTEMPTS=4` limita custo e latência. A
+avaliação semântica fornece o próximo prompt; se o avaliador retornar score
+baixo sem instrução, o adapter deriva uma correção determinística do contrato
+da cena. O endpoint Qwen deve permanecer com `workersMin=0` e ser separado do
+endpoint público até a configuração local apontar explicitamente
+`COMFYUI_QWEN_EDIT_ENDPOINT_ID` para o canário aprovado.
+
 Não baixe checkpoints grandes no `dockerArgs` do endpoint Serverless. O
 download bloqueia o bootstrap do handler e pode deixar o worker `unhealthy`.
 Use um Pod temporário com terminal web ou outro processo separado para popular
@@ -195,6 +331,11 @@ Valide o setup local antes do build:
 ```bash
 python3 scripts/validate_runpod_setup.py
 ```
+
+Além dos scripts e modelos, essa validação exige o gate
+`runpod_worker/validate_custom_nodes.py`. O mesmo gate roda durante o Docker
+build; uma imagem sem os dois nodes IP-Adapter necessários não pode ser
+publicada pelo CI.
 
 Build e push para um registry que o RunPod consiga puxar (Docker Hub, GHCR, etc.):
 
@@ -275,8 +416,11 @@ Na imagem customizada deste repositório, esse comportamento fica fixado em
 `runpod_worker/start_ai_film.sh`, chamado pelo `CMD` do Dockerfile. Isso evita
 depender de override manual no console.
 
-No endpoint `1ivgumnpf8tevg`, o template `vx6kp41lv5` foi atualizado para
-usar essa imagem customizada e `dockerArgs=/start_ai_film.sh`.
+No endpoint `1ivgumnpf8tevg`, a imagem GHCR customizada ficou `unhealthy` no
+bootstrap e foi revertida. O runtime operacional usa a imagem estável
+`151113/comfyui-ai-film-pipeline:storybook-volume-20260707` com start command
+que cria links de todos os subdiretórios de `/runpod-volume/models` para
+`/comfyui/models` antes de executar `/start.sh`.
 
 8. Criar e copiar o **Endpoint ID** exibido no painel
 
