@@ -34,6 +34,7 @@ from open3d_implementation.core.langgraph_adapter import (  # noqa: E402
     _encode_comfyui_control_image,
     _encode_comfyui_reference_image,
     _evaluate_image_semantics,
+    _evaluate_semantic_qa_with_local_vlm,
     _evaluate_semantic_qa_with_openai,
     _extract_response_text,
     _hero_object_focus_boxes,
@@ -956,6 +957,7 @@ def test_semantic_qa_uses_openai_when_gemini_fails(monkeypatch, tmp_path):
 
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key")
+    monkeypatch.setenv("IMAGE_SEMANTIC_QA_PROVIDER", "gemini")
     monkeypatch.setenv("IMAGE_SEMANTIC_QA_FALLBACK_PROVIDER", "openai")
     monkeypatch.setenv("OPENAI_VISION_QA_MODEL", "gpt-5.4-mini")
     monkeypatch.setattr(
@@ -979,6 +981,222 @@ def test_semantic_qa_uses_openai_when_gemini_fails(monkeypatch, tmp_path):
     assert result["provider"] == "openai"
     assert result["fallback_used"] is True
     assert result["provider_warnings"] == ["gemini:invalid_json"]
+
+
+def test_semantic_qa_defaults_to_local_provider_and_models(monkeypatch):
+    monkeypatch.delenv("IMAGE_SEMANTIC_QA_PROVIDER", raising=False)
+    monkeypatch.setenv("LOCAL_VISION_QA_MODEL", "")
+    monkeypatch.setenv("LOCAL_AGE_QA_MODEL", "")
+
+    assert langgraph_adapter._semantic_qa_primary_provider() == "local"
+    assert (
+        langgraph_adapter._semantic_qa_model("local")
+        == "HuggingFaceTB/SmolVLM-500M-Instruct"
+    )
+
+
+def test_semantic_qa_rejects_unknown_provider_to_local(monkeypatch):
+    monkeypatch.setenv("IMAGE_SEMANTIC_QA_PROVIDER", "unknown-provider")
+
+    assert langgraph_adapter._semantic_qa_primary_provider() == "local"
+
+
+def test_local_visual_qa_requires_revision_for_custom_model(monkeypatch):
+    from open3d_implementation.core import local_visual_qa
+
+    monkeypatch.delenv("LOCAL_VISION_QA_REVISION", raising=False)
+
+    with pytest.raises(
+        local_visual_qa.LocalVisualQAError,
+        match="LOCAL_VISION_QA_REVISION",
+    ):
+        local_visual_qa._model_revision(
+            model_name="owner/custom-vision-model",
+            env_name="LOCAL_VISION_QA_REVISION",
+            default_model=local_visual_qa.DEFAULT_LOCAL_VISION_QA_MODEL,
+            default_revision=local_visual_qa.DEFAULT_LOCAL_VISION_QA_REVISION,
+        )
+
+
+def test_semantic_qa_can_run_locally_without_external_provider(monkeypatch, tmp_path):
+    def pass_local(**_kwargs):
+        return {
+            "semantic_score": 92,
+            "accepted": True,
+            "hero_object_legibility": True,
+            "hero_object_notes": "The mouse and sugar bowl are clear.",
+            "issues": [],
+            "critical_failures": [],
+            "retry_prompt": "",
+        }
+
+    def reject_external(**_kwargs):
+        raise AssertionError("local QA must not call an external provider")
+
+    monkeypatch.setenv("IMAGE_SEMANTIC_QA_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_VISION_QA_MODEL", "local-test-model")
+    monkeypatch.setenv("IMAGE_SEMANTIC_QA_FALLBACK_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    monkeypatch.delenv("IMAGE_SEMANTIC_QA_ALLOW_EXTERNAL_FALLBACK", raising=False)
+    monkeypatch.setattr(
+        langgraph_adapter, "_evaluate_semantic_qa_with_local_vlm", pass_local
+    )
+    monkeypatch.setattr(
+        langgraph_adapter, "_evaluate_semantic_qa_with_openai", reject_external
+    )
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"local-test-image")
+
+    result = _evaluate_image_semantics(
+        str(image_path),
+        {"description": "Alice and Ludovico observe a mouse in a sugar bowl."},
+        "Alice and Ludovico observe a mouse in a sugar bowl.",
+        DEFAULT_IMAGE_STYLE,
+    )
+
+    assert result["accepted"] is True
+    assert result["semantic_score"] == 92
+    assert result["provider"] == "local"
+    assert result["model"] == "local-test-model"
+    assert "fallback_used" not in result
+
+
+def test_local_semantic_qa_does_not_fallback_externally_by_default(
+    monkeypatch, tmp_path
+):
+    def fail_local(**_kwargs):
+        raise langgraph_adapter.SemanticQAProviderError("local_vlm:invalid_json")
+
+    def reject_external(**_kwargs):
+        raise AssertionError("external fallback requires explicit opt-in")
+
+    monkeypatch.setenv("IMAGE_SEMANTIC_QA_PROVIDER", "local")
+    monkeypatch.setenv("IMAGE_SEMANTIC_QA_FALLBACK_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
+    monkeypatch.delenv("IMAGE_SEMANTIC_QA_ALLOW_EXTERNAL_FALLBACK", raising=False)
+    monkeypatch.setattr(
+        langgraph_adapter, "_evaluate_semantic_qa_with_local_vlm", fail_local
+    )
+    monkeypatch.setattr(
+        langgraph_adapter, "_evaluate_semantic_qa_with_openai", reject_external
+    )
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"local-test-image")
+
+    result = _evaluate_image_semantics(
+        str(image_path),
+        {"description": "Alice reads beside a tree."},
+        "Alice reads beside a tree.",
+        DEFAULT_IMAGE_STYLE,
+    )
+
+    assert result["accepted"] is False
+    assert result["provider"] == "local"
+    assert result["issues"] == ["semantic_qa_failed"]
+    assert result["provider_errors"] == ["local_vlm:invalid_json"]
+
+
+def test_local_semantic_qa_scores_atomic_evidence(monkeypatch, tmp_path):
+    from open3d_implementation.core import local_visual_qa
+
+    def evaluate_checklist(**kwargs):
+        answers = []
+        for criterion in kwargs["criteria"]:
+            answer = (
+                "no"
+                if "approximately 45 to 60 years old" in criterion.question
+                else criterion.expected
+            )
+            answers.append(
+                local_visual_qa.LocalVisualAnswer(
+                    criterion=criterion,
+                    answer=answer,
+                    raw_response=f"{answer}.",
+                )
+            )
+        return answers
+
+    monkeypatch.setattr(
+        local_visual_qa, "evaluate_local_visual_checklist", evaluate_checklist
+    )
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"local-test-image")
+
+    result = _evaluate_semantic_qa_with_local_vlm(
+        image_path=image_path,
+        scene={
+            "description": "Alice and Ludovico observe a mouse.",
+            "must_include": [
+                "one ten-year-old child Alice",
+                "one adult male professor around 50 years old",
+                "one tiny white mouse in a sugar bowl",
+            ],
+            "must_not_include": ["visible text"],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+    )
+
+    assert result["accepted"] is False
+    assert result["semantic_score"] < 88
+    assert result["critical_failures"] == ["wrong_ludovico_age"]
+    assert result["hero_object_legibility"] is True
+    assert result["evidence"][1]["answer"] == "no"
+    assert result["evidence"][2]["question"].startswith("Is one tiny natural")
+
+
+def test_local_semantic_qa_requires_specialized_age_evidence(monkeypatch, tmp_path):
+    from open3d_implementation.core import local_visual_qa
+
+    def evaluate_checklist(**kwargs):
+        return [
+            local_visual_qa.LocalVisualAnswer(
+                criterion=criterion,
+                answer=criterion.expected,
+                raw_response=f"{criterion.expected}.",
+            )
+            for criterion in kwargs["criteria"]
+        ]
+
+    def evaluate_age(**kwargs):
+        return local_visual_qa.LocalAgeEstimate(
+            predicted_label="30-39",
+            probabilities={"30-39": 0.72, "40-49": 0.18, "50-59": 0.04},
+            crop_box=kwargs["crop_box"],
+            model_name=kwargs["model_name"],
+        )
+
+    monkeypatch.setattr(
+        local_visual_qa, "evaluate_local_visual_checklist", evaluate_checklist
+    )
+    monkeypatch.setattr(
+        local_visual_qa, "evaluate_local_age_classification", evaluate_age
+    )
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"local-test-image")
+
+    result = _evaluate_semantic_qa_with_local_vlm(
+        image_path=image_path,
+        scene={
+            "must_include": ["one adult male professor around 50 years old"],
+            "local_age_checks": [
+                {
+                    "code": "wrong_ludovico_age",
+                    "crop_box": [0.51, 0.03, 0.92, 0.39],
+                    "accepted_labels": ["40-49", "50-59"],
+                    "min_probability": 0.35,
+                }
+            ],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+    )
+
+    assert result["accepted"] is False
+    assert result["critical_failures"] == ["wrong_ludovico_age"]
+    assert result["issues"] == ["wrong_ludovico_age_age_classifier"]
+    assert result["evidence"][-1]["provider"] == "local_age_classifier"
+    assert result["evidence"][-1]["accepted_probability"] == 0.22
 
 
 def test_missing_custom_node_is_not_retried():

@@ -3762,6 +3762,43 @@ def _semantic_qa_enabled() -> bool:
     }
 
 
+def _semantic_qa_primary_provider() -> str:
+    provider = os.getenv("IMAGE_SEMANTIC_QA_PROVIDER", "local").strip().lower()
+    return provider if provider in {"gemini", "openai", "local"} else "local"
+
+
+def _semantic_qa_external_fallback_allowed() -> bool:
+    return os.getenv(
+        "IMAGE_SEMANTIC_QA_ALLOW_EXTERNAL_FALLBACK", "false"
+    ).strip().lower() in {"1", "true", "yes"}
+
+
+def _semantic_qa_model(provider: str) -> str:
+    if provider == "local":
+        return (
+            os.getenv(
+                "LOCAL_VISION_QA_MODEL",
+                "HuggingFaceTB/SmolVLM-500M-Instruct",
+            ).strip()
+            or "HuggingFaceTB/SmolVLM-500M-Instruct"
+        )
+    if provider == "openai":
+        return (
+            os.getenv(
+                "OPENAI_VISION_QA_MODEL",
+                os.getenv("OPENAI_TEXT_MODEL", "gpt-5.4-mini"),
+            ).strip()
+            or "gpt-5.4-mini"
+        )
+    return (
+        os.getenv(
+            "GEMINI_VISION_QA_MODEL",
+            os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash"),
+        ).strip()
+        or "gemini-3.5-flash"
+    )
+
+
 SEMANTIC_QA_RESPONSE_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -3798,6 +3835,278 @@ def _parse_semantic_qa_response(response: Any) -> Dict[str, Any]:
 
 class SemanticQAProviderError(RuntimeError):
     """Raised when a configured semantic QA provider cannot return valid JSON."""
+
+
+def _local_required_visual_question(requirement: str) -> str:
+    normalized = requirement.lower()
+    if any(term in normalized for term in ("teaspoon", "colher")):
+        return "Is exactly one metal spoon clearly visible anywhere on the table?"
+    if any(term in normalized for term in ("separate sugar bowl lid", "tampa")):
+        return "Is one separate matching lid clearly visible lying beside the bowl?"
+    if any(term in normalized for term in ("white mouse", "ratinho")):
+        return (
+            "Is one tiny natural white mouse clearly visible with only its head "
+            "and front paws above the sugar bowl rim?"
+        )
+    if any(term in normalized for term in ("sugar bowl", "açucareiro", "acucareiro")):
+        return (
+            "Is one compact porcelain sugar bowl clearly visible without "
+            "protruding side handles?"
+        )
+    if any(term in normalized for term in ("professor", "ludovico")):
+        return (
+            "Does the adult man on the right clearly look middle-aged, "
+            "approximately 45 to 60 years old?"
+        )
+    if "alice" in normalized:
+        return (
+            "Is exactly one clearly preteen child Alice visible, looking about "
+            "ten years old rather than teenage or adult?"
+        )
+    return f"Is this requirement clearly satisfied in the image: {requirement[:260]}?"
+
+
+def _local_required_visual_code(requirement: str, index: int) -> str:
+    normalized = requirement.lower()
+    if any(term in normalized for term in ("teaspoon", "colher")):
+        return "hero_teaspoon_missing"
+    if any(term in normalized for term in ("separate sugar bowl lid", "tampa")):
+        return "hero_lid_missing"
+    if any(term in normalized for term in ("white mouse", "ratinho")):
+        return "hero_mouse_missing_or_wrong"
+    if any(term in normalized for term in ("sugar bowl", "açucareiro", "acucareiro")):
+        return "hero_sugar_bowl_missing_or_wrong"
+    if any(term in normalized for term in ("professor", "ludovico")):
+        return "wrong_ludovico_age"
+    if "alice" in normalized:
+        return "wrong_alice_age"
+    return f"required_{index}"
+
+
+def _evaluate_semantic_qa_with_local_vlm(
+    *,
+    image_path: Path,
+    scene: Dict[str, Any],
+    style_key: str,
+    model: str,
+) -> Dict[str, Any]:
+    try:
+        from open3d_implementation.core.local_visual_qa import (
+            LocalVisualCriterion,
+            LocalVisualQAError,
+            evaluate_local_age_classification,
+            evaluate_local_visual_checklist,
+        )
+    except ImportError as exc:
+        raise SemanticQAProviderError("local_vlm:module_unavailable") from exc
+
+    required = [
+        str(item).strip() for item in scene.get("must_include", []) if str(item).strip()
+    ][:8]
+    if not required:
+        description = str(scene.get("description") or scene.get("prompt") or "").strip()
+        if description:
+            required = [description[:300]]
+    forbidden = [
+        str(item).strip()
+        for item in scene.get("must_not_include", [])
+        if str(item).strip()
+    ][:6]
+    hero_terms = {
+        "mouse",
+        "ratinho",
+        "sugar bowl",
+        "açucareiro",
+        "acucareiro",
+        "lid",
+        "tampa",
+        "teaspoon",
+        "colher",
+    }
+    criteria = []
+    for index, requirement in enumerate(required, start=1):
+        normalized = requirement.lower()
+        criteria.append(
+            LocalVisualCriterion(
+                code=_local_required_visual_code(requirement, index),
+                question=_local_required_visual_question(requirement),
+                expected="yes",
+                weight=3.0,
+                critical=True,
+                hero_object=any(term in normalized for term in hero_terms),
+            )
+        )
+    for index, exclusion in enumerate(forbidden, start=1):
+        criteria.append(
+            LocalVisualCriterion(
+                code=f"forbidden_{index}",
+                question=(
+                    "Is this forbidden element visible in the image: "
+                    f"{exclusion[:260]}?"
+                ),
+                expected="no",
+                weight=1.5,
+                critical=True,
+            )
+        )
+    criteria.append(
+        LocalVisualCriterion(
+            code="style_match",
+            question=(
+                "Does the image consistently use this visual style: "
+                f"{_resolve_image_style(style_key)['label']}?"
+            ),
+            expected="yes",
+            weight=1.5,
+        )
+    )
+
+    try:
+        answers = evaluate_local_visual_checklist(
+            image_path=image_path,
+            criteria=criteria,
+            model_name=model,
+        )
+    except LocalVisualQAError as exc:
+        raise SemanticQAProviderError(
+            f"local_vlm:{type(exc).__name__}:{str(exc)[:300]}"
+        ) from exc
+
+    total_weight = sum(answer.criterion.weight for answer in answers)
+    earned_weight = sum(
+        (
+            answer.criterion.weight
+            if answer.matched
+            else answer.criterion.weight * 0.5 if answer.answer == "uncertain" else 0.0
+        )
+        for answer in answers
+    )
+    failed = [answer for answer in answers if not answer.matched]
+    critical_failures = [
+        answer.criterion.code for answer in failed if answer.criterion.critical
+    ]
+    hero_answers = [answer for answer in answers if answer.criterion.hero_object]
+    hero_legible = bool(hero_answers) and all(answer.matched for answer in hero_answers)
+    evidence = [
+        {
+            "code": answer.criterion.code,
+            "answer": answer.answer,
+            "expected": answer.criterion.expected,
+            "matched": answer.matched,
+            "raw_response": answer.raw_response,
+            "question": answer.criterion.question,
+        }
+        for answer in answers
+    ]
+    failed_questions = [answer.criterion.question for answer in failed]
+    configured_age_checks = scene.get("local_age_checks", [])
+    if configured_age_checks:
+        if not isinstance(configured_age_checks, list):
+            raise SemanticQAProviderError("local_age:invalid_checks")
+        for raw_check in configured_age_checks[:4]:
+            if not isinstance(raw_check, dict):
+                raise SemanticQAProviderError("local_age:invalid_check")
+            code = str(raw_check.get("code") or "").strip()
+            raw_crop_box = raw_check.get("crop_box")
+            raw_labels = raw_check.get("accepted_labels")
+            if (
+                not code
+                or not isinstance(raw_crop_box, (list, tuple))
+                or len(raw_crop_box) != 4
+                or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    for value in raw_crop_box
+                )
+                or not isinstance(raw_labels, list)
+                or not raw_labels
+                or any(not isinstance(label, str) or not label for label in raw_labels)
+            ):
+                raise SemanticQAProviderError("local_age:invalid_check")
+            crop_box = tuple(float(value) for value in raw_crop_box)
+            accepted_labels = [str(label) for label in raw_labels]
+            min_probability = max(
+                0.1,
+                min(
+                    0.95,
+                    _safe_float(raw_check.get("min_probability"), 0.35),
+                ),
+            )
+            age_model = (
+                os.getenv(
+                    "LOCAL_AGE_QA_MODEL",
+                    "dima806/fairface_age_image_detection",
+                ).strip()
+                or "dima806/fairface_age_image_detection"
+            )
+            try:
+                estimate = evaluate_local_age_classification(
+                    image_path=image_path,
+                    crop_box=(
+                        crop_box[0],
+                        crop_box[1],
+                        crop_box[2],
+                        crop_box[3],
+                    ),
+                    model_name=age_model,
+                )
+            except LocalVisualQAError as exc:
+                raise SemanticQAProviderError(
+                    f"local_age:{type(exc).__name__}:{str(exc)[:300]}"
+                ) from exc
+            accepted_probability = round(
+                sum(
+                    float(estimate.probabilities.get(label, 0.0))
+                    for label in accepted_labels
+                ),
+                6,
+            )
+            matched = accepted_probability >= min_probability
+            total_weight += 3.0
+            if matched:
+                earned_weight += 3.0
+            else:
+                critical_failures.append(code)
+                failed_questions.append(
+                    f"Character age must classify as one of: {', '.join(accepted_labels)}."
+                )
+            evidence.append(
+                {
+                    "code": code,
+                    "answer": estimate.predicted_label,
+                    "expected": accepted_labels,
+                    "matched": matched,
+                    "accepted_probability": accepted_probability,
+                    "minimum_probability": min_probability,
+                    "probabilities": dict(estimate.probabilities),
+                    "crop_box": list(estimate.crop_box),
+                    "provider": "local_age_classifier",
+                    "model": estimate.model_name,
+                }
+            )
+    critical_failures = list(dict.fromkeys(critical_failures))
+    score = round((earned_weight / total_weight) * 100) if total_weight else 0
+    issues = [f"{answer.criterion.code}_{answer.answer}" for answer in failed]
+    issues.extend(
+        f"{code}_age_classifier"
+        for code in critical_failures
+        if code not in {answer.criterion.code for answer in failed}
+    )
+    return {
+        "semantic_score": score,
+        "accepted": score >= _image_semantic_min_score() and not critical_failures,
+        "hero_object_legibility": hero_legible,
+        "hero_object_notes": (
+            "All locally checked hero-object requirements passed."
+            if hero_legible
+            else "One or more locally checked hero-object requirements failed."
+        ),
+        "issues": issues,
+        "critical_failures": critical_failures,
+        "retry_prompt": (
+            "Correct these failed visual checks: " + " | ".join(failed_questions)
+        )[:1000],
+        "evidence": evidence,
+    }
 
 
 def _evaluate_semantic_qa_with_gemini(
@@ -3947,6 +4256,7 @@ def _apply_semantic_qa_result(
             ),
             "hero_object_notes": hero_object_notes,
             "retry_prompt": str(parsed.get("retry_prompt", ""))[:1000],
+            "evidence": parsed.get("evidence", []),
         }
     )
 
@@ -3958,16 +4268,15 @@ def _evaluate_image_semantics(
     style_key: str,
     visual_bible: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    primary_provider = _semantic_qa_primary_provider()
     metrics: Dict[str, Any] = {
         "semantic_score": 0,
         "semantic_qa_enabled": _semantic_qa_enabled(),
         "accepted": False,
         "issues": [],
         "retry_prompt": "",
-        "provider": "gemini",
-        "model": os.getenv(
-            "GEMINI_VISION_QA_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash")
-        ),
+        "provider": primary_provider,
+        "model": _semantic_qa_model(primary_provider),
     }
     if not metrics["semantic_qa_enabled"]:
         metrics.update({"semantic_score": 100, "accepted": True})
@@ -4076,25 +4385,58 @@ JSON schema:
 
     parsed: Dict[str, Any] | None = None
     provider_errors: List[str] = []
-    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if gemini_key:
+    if primary_provider == "local":
         try:
-            parsed = _evaluate_semantic_qa_with_gemini(
+            parsed = _evaluate_semantic_qa_with_local_vlm(
                 image_path=path,
-                prompt=prompt,
-                compact_prompt=compact_prompt,
+                scene=scene,
+                style_key=style_key,
                 model=str(metrics["model"]),
-                api_key=gemini_key,
             )
         except SemanticQAProviderError as exc:
             provider_errors.append(str(exc))
+    elif primary_provider == "openai":
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if openai_key:
+            try:
+                parsed = _evaluate_semantic_qa_with_openai(
+                    image_path=path,
+                    prompt=prompt,
+                    model=str(metrics["model"]),
+                    api_key=openai_key,
+                )
+            except SemanticQAProviderError as exc:
+                provider_errors.append(str(exc))
+        else:
+            provider_errors.append("openai:missing_key")
     else:
-        provider_errors.append("gemini:missing_key")
+        gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if gemini_key:
+            try:
+                parsed = _evaluate_semantic_qa_with_gemini(
+                    image_path=path,
+                    prompt=prompt,
+                    compact_prompt=compact_prompt,
+                    model=str(metrics["model"]),
+                    api_key=gemini_key,
+                )
+            except SemanticQAProviderError as exc:
+                provider_errors.append(str(exc))
+        else:
+            provider_errors.append("gemini:missing_key")
 
     fallback_provider = (
         os.getenv("IMAGE_SEMANTIC_QA_FALLBACK_PROVIDER", "openai").strip().lower()
     )
-    if parsed is None and fallback_provider == "openai":
+    external_fallback_allowed = (
+        primary_provider != "local" or _semantic_qa_external_fallback_allowed()
+    )
+    if (
+        parsed is None
+        and fallback_provider == "openai"
+        and primary_provider != "openai"
+        and external_fallback_allowed
+    ):
         openai_key = os.getenv("OPENAI_API_KEY", "").strip()
         openai_model = os.getenv(
             "OPENAI_VISION_QA_MODEL",
@@ -4119,6 +4461,26 @@ JSON schema:
                 provider_errors.append(str(exc))
         else:
             provider_errors.append("openai:missing_key")
+    elif (
+        parsed is None and fallback_provider == "local" and primary_provider != "local"
+    ):
+        local_model = _semantic_qa_model("local")
+        try:
+            parsed = _evaluate_semantic_qa_with_local_vlm(
+                image_path=path,
+                scene=scene,
+                style_key=style_key,
+                model=local_model,
+            )
+            metrics.update(
+                {
+                    "provider": "local",
+                    "model": local_model,
+                    "fallback_used": True,
+                }
+            )
+        except SemanticQAProviderError as exc:
+            provider_errors.append(str(exc))
 
     if parsed is None:
         metrics["issues"].append("semantic_qa_failed")
@@ -4181,6 +4543,7 @@ def _combine_image_quality(
         "semantic_qa_fallback_used": bool(semantic_metrics.get("fallback_used")),
         "semantic_qa_provider_warnings": semantic_metrics.get("provider_warnings", []),
         "semantic_qa_error": semantic_metrics.get("error", ""),
+        "semantic_qa_evidence": semantic_metrics.get("evidence", []),
         "hero_objects": semantic_metrics.get("hero_objects", []),
         "hero_object_legibility": semantic_metrics.get("hero_object_legibility"),
         "hero_object_notes": semantic_metrics.get("hero_object_notes", ""),
@@ -4230,6 +4593,8 @@ def _controlled_image_workflow_guidance(
             "protagonist_too_young",
             "character_age_inconsistency",
             "wrong_character_age",
+            "wrong_alice_age",
+            "wrong_ludovico_age",
         }
         & issue_codes
     )
