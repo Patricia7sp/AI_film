@@ -256,7 +256,8 @@ def _run_local_visual_prompt(
                     do_sample=False,
                 ),
             )
-        response_tokens = generated_ids[:, input_ids.shape[-1] :]
+        response_start = input_ids.shape[-1]
+        response_tokens = generated_ids[:, response_start:]
         responses = processor.batch_decode(
             response_tokens,
             skip_special_tokens=True,
