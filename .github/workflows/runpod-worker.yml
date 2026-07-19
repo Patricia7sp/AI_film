@@ -36,14 +36,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute immutable worker tags
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/patricia7sp/ai-film-comfyui-worker
+          tags: |
+            type=raw,value=flux2-klein-${{ github.sha }}
+            type=raw,value=flux2-klein-latest,enable=${{ github.ref == 'refs/heads/main' }}
+
       - name: Build and push RunPod worker
         uses: docker/build-push-action@v6
         with:
           context: ./runpod_worker
           push: true
-          tags: |
-            ghcr.io/patricia7sp/ai-film-comfyui-worker:flux2-klein-latest
-            ghcr.io/patricia7sp/ai-film-comfyui-worker:flux2-klein-${{ github.sha }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=runpod-worker
           cache-to: type=gha,mode=max,scope=runpod-worker
           provenance: mode=max

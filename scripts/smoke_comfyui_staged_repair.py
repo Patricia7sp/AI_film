@@ -21,6 +21,9 @@ QWEN_CANARY_REPORT_PATH = OUTPUT_ROOT / "qwen_canary_report.json"
 QWEN_INPAINT_CANARY_REPORT_PATH = OUTPUT_ROOT / "qwen_inpaint_canary_report.json"
 QWEN_STAGED_CANARY_REPORT_PATH = OUTPUT_ROOT / "qwen_staged_canary_report.json"
 SDXL_IPADAPTER_CANARY_REPORT_PATH = OUTPUT_ROOT / "sdxl_ipadapter_canary_report.json"
+DETERMINISTIC_COMPOSITE_REPORT_PATH = (
+    OUTPUT_ROOT / "deterministic_mouse_composite_report.json"
+)
 PROP_REFERENCE_REPORT_PATH = OUTPUT_ROOT / "prop_reference_report.json"
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -207,8 +210,8 @@ def _stage_approved_prop_on_scene(
     prop_reference_path: Path,
     output_path: Path,
 ) -> dict[str, Any]:
-    """Place an approved prop deterministically before low-denoise harmonization."""
-    from PIL import Image, ImageDraw, ImageFilter, ImageOps
+    """Composite the approved mouse and bowl rim without a rectangular backdrop."""
+    from PIL import Image, ImageChops, ImageFilter, ImageOps
 
     with Image.open(scene_path) as scene_image:
         scene = scene_image.convert("RGB")
@@ -216,17 +219,17 @@ def _stage_approved_prop_on_scene(
         prop = prop_image.convert("RGB")
 
     prop_crop_box = (
-        int(prop.width * 0.17),
-        int(prop.height * 0.38),
-        int(prop.width * 0.555),
-        int(prop.height * 0.70),
+        int(prop.width * 0.25),
+        int(prop.height * 0.39),
+        int(prop.width * 0.64),
+        int(prop.height * 0.58),
     )
     crop = prop.crop(prop_crop_box)
     target_box = (
-        int(scene.width * 0.59),
-        int(scene.height * 0.70),
-        int(scene.width * 0.92),
-        int(scene.height * 0.90),
+        int(scene.width * 0.63),
+        int(scene.height * 0.64),
+        int(scene.width * 0.87),
+        int(scene.height * 0.79),
     )
     target_size = (
         target_box[2] - target_box[0],
@@ -242,34 +245,48 @@ def _stage_approved_prop_on_scene(
         sum(color[channel] for color in corner_colors) // len(corner_colors)
         for channel in range(3)
     )
-    staged_prop = Image.new("RGB", target_size, background_color)
+    background = Image.new("RGB", crop.size, background_color)
+    difference = ImageChops.difference(crop, background)
+    red, green, blue = difference.split()
+    foreground_distance = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    foreground_alpha = foreground_distance.point(
+        lambda value: max(0, min(255, (value - 17) * 18))
+    ).filter(ImageFilter.GaussianBlur(radius=0.7))
+    fade_start = int(crop.height * 0.78)
+    fade_end = max(fade_start + 1, int(crop.height * 0.96))
+    vertical_fade = Image.new("L", (1, crop.height), 255)
+    vertical_fade.putdata(
+        [
+            (
+                255
+                if y <= fade_start
+                else (
+                    0
+                    if y >= fade_end
+                    else round(255 * (fade_end - y) / (fade_end - fade_start))
+                )
+            )
+            for y in range(crop.height)
+        ]
+    )
+    vertical_fade = vertical_fade.resize(crop.size)
+    foreground_alpha = ImageChops.multiply(foreground_alpha, vertical_fade)
+    foreground = crop.convert("RGBA")
+    foreground.putalpha(foreground_alpha)
     contained_prop = ImageOps.contain(
-        crop,
-        (
-            int(target_size[0] * 0.58),
-            int(target_size[1] * 0.78),
-        ),
+        foreground,
+        target_size,
         method=Image.Resampling.LANCZOS,
     )
-    staged_prop.paste(
+    paste_position = (
+        target_box[0] + (target_size[0] - contained_prop.width) // 2,
+        target_box[1] + (target_size[1] - contained_prop.height) // 2,
+    )
+    scene.paste(
         contained_prop,
-        (
-            (target_size[0] - contained_prop.width) // 2,
-            (target_size[1] - contained_prop.height) // 2,
-        ),
+        paste_position,
+        contained_prop,
     )
-    edge_mask = Image.new("L", target_size, 0)
-    edge_draw = ImageDraw.Draw(edge_mask)
-    inset = max(3, min(target_size) // 35)
-    edge_draw.rounded_rectangle(
-        (inset, inset, target_size[0] - inset, target_size[1] - inset),
-        radius=max(12, min(target_size) // 12),
-        fill=255,
-    )
-    edge_mask = edge_mask.filter(
-        ImageFilter.GaussianBlur(radius=max(3, min(target_size) // 45))
-    )
-    scene.paste(staged_prop, target_box[:2], edge_mask)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     scene.save(output_path, format="PNG", optimize=True)
     return {
@@ -278,6 +295,8 @@ def _stage_approved_prop_on_scene(
         "output_path": str(output_path),
         "prop_crop_box": prop_crop_box,
         "target_box": target_box,
+        "paste_position": paste_position,
+        "background_color": background_color,
     }
 
 
@@ -346,6 +365,19 @@ def main() -> int:
         "--evaluate-prop-reference",
         action="store_true",
         help="Gate the existing prop reference without starting a RunPod worker.",
+    )
+    parser.add_argument(
+        "--evaluate-deterministic-composite",
+        action="store_true",
+        help=(
+            "Composite the approved mouse locally and gate the result without "
+            "starting a RunPod worker."
+        ),
+    )
+    parser.add_argument(
+        "--compose-deterministic-only",
+        action="store_true",
+        help="Create the local mouse composite without calling any QA provider.",
     )
     args = parser.parse_args()
     load_dotenv(OPEN3D_ROOT / ".env", override=False)
@@ -443,6 +475,71 @@ def main() -> int:
             "total_estimated_cost_usd": 0.0,
         }
         _write_report(report, PROP_REFERENCE_REPORT_PATH)
+        return 0 if accepted else 1
+
+    if args.evaluate_deterministic_composite or args.compose_deterministic_only:
+        scene = _semantic_scene()
+        source_path = OUTPUT_ROOT / "scene_2_attempt_8.png"
+        prop_reference_path = OUTPUT_ROOT / "hero_prop_reference.png"
+        output_path = OUTPUT_ROOT / "scene_2_attempt_11_composite.png"
+        if not source_path.is_file() or source_path.stat().st_size <= 1000:
+            raise RuntimeError("deterministic_composite_source_missing")
+        if (
+            not prop_reference_path.is_file()
+            or prop_reference_path.stat().st_size <= 1000
+        ):
+            raise RuntimeError("deterministic_composite_prop_reference_missing")
+        placement = _stage_approved_prop_on_scene(
+            scene_path=source_path,
+            prop_reference_path=prop_reference_path,
+            output_path=output_path,
+        )
+        if args.compose_deterministic_only:
+            print(
+                json.dumps(
+                    {
+                        "status": "composed_local_only",
+                        "path": str(output_path),
+                        "placement": placement,
+                        "external_qa_called": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        technical = _probe_image_quality(str(output_path), scene=scene)
+        semantic = _evaluate_image_semantics(
+            str(output_path),
+            scene,
+            str(scene["prompt"]),
+            STYLE_KEY,
+            visual_bible,
+        )
+        metric = _combine_image_quality(technical, semantic)
+        stage = _stage_payload(
+            name="scene_attempt_11_deterministic_mouse_composite",
+            monitor={
+                "status": "COMPLETED_LOCAL",
+                "elapsed_seconds": 0.0,
+                "estimated_cost_usd": 0.0,
+                "generation_method": "deterministic_mouse_composite",
+            },
+            metric=metric,
+            path=output_path,
+        )
+        stage["placement"] = placement
+        accepted = bool(metric.get("semantic_accepted"))
+        report = {
+            "status": _stage_report_status(accepted, stage),
+            "accepted": accepted,
+            "semantic_threshold": int(os.getenv("IMAGE_SEMANTIC_MIN_SCORE", "88")),
+            "source_path": str(source_path),
+            "prop_reference_path": str(prop_reference_path),
+            "stages": [stage],
+            "total_estimated_cost_usd": 0.0,
+        }
+        _write_report(report, DETERMINISTIC_COMPOSITE_REPORT_PATH)
         return 0 if accepted else 1
 
     endpoint_id = _required_env("RUNPOD_ENDPOINT_ID")
@@ -781,13 +878,17 @@ def main() -> int:
         if not bool(prop_report.get("accepted")):
             raise RuntimeError("sdxl_ipadapter_canary_prop_reference_not_approved")
 
+        scene["inpaint_focus_boxes"] = [[0.60, 0.67, 0.91, 0.81]]
+
         correction = (
-            "Inside only the masked tabletop area, insert the approved compact "
-            "handleless porcelain sugar bowl, its separate lid, one teaspoon and "
-            "a tiny natural white mouse with only its head and front paws above "
-            "the rim. Match the exact object geometry and scale from the approved "
-            "prop reference. Preserve Alice, Ludovico, the room, camera, lighting "
-            "and every unmasked pixel."
+            "Modify only the masked opening of the existing porcelain sugar bowl. "
+            "Keep the existing bowl body, floral pattern, separate lid and teaspoon "
+            "exactly where they are. Add one tiny natural white mouse: only its "
+            "white head, two ears and two front paws peek above the bowl rim; its "
+            "body stays hidden inside. The mouse head is no wider than one third of "
+            "the bowl opening. Do not generate a full animal, hamster, guinea pig, "
+            "brown animal or oversized mouse. Preserve Alice, Ludovico, the room, "
+            "camera, lighting and every unmasked pixel."
         )
         prompt = _build_image_prompt(
             scene,
@@ -816,6 +917,7 @@ def main() -> int:
             reference_image_path=None,
             prop_reference_image_path=str(prop_reference_path),
             semantic_repair_backend_override="sdxl",
+            sdxl_inpaint_denoise_override=0.68,
         )
         stage = _stage_payload(
             name="scene_attempt_10_sdxl_ipadapter_precise_prop_inpaint",
