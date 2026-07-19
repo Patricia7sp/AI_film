@@ -20,6 +20,7 @@ QA_REPORT_PATH = OUTPUT_ROOT / "qa_report.json"
 QWEN_CANARY_REPORT_PATH = OUTPUT_ROOT / "qwen_canary_report.json"
 QWEN_INPAINT_CANARY_REPORT_PATH = OUTPUT_ROOT / "qwen_inpaint_canary_report.json"
 QWEN_STAGED_CANARY_REPORT_PATH = OUTPUT_ROOT / "qwen_staged_canary_report.json"
+LUDOVICO_AGE_CANARY_REPORT_PATH = OUTPUT_ROOT / "ludovico_age_canary_report.json"
 SDXL_IPADAPTER_CANARY_REPORT_PATH = OUTPUT_ROOT / "sdxl_ipadapter_canary_report.json"
 DETERMINISTIC_COMPOSITE_REPORT_PATH = (
     OUTPUT_ROOT / "deterministic_mouse_composite_report.json"
@@ -108,6 +109,14 @@ def _semantic_scene() -> dict[str, Any]:
             "watermark",
         ],
         "inpaint_focus_boxes": [[0.57, 0.68, 0.94, 0.92]],
+        "local_age_checks": [
+            {
+                "code": "wrong_ludovico_age",
+                "crop_box": [0.51, 0.03, 0.92, 0.39],
+                "accepted_labels": ["40-49", "50-59"],
+                "min_probability": 0.35,
+            }
+        ],
     }
 
 
@@ -184,6 +193,7 @@ def _stage_payload(
         "semantic_qa_model": (metric or {}).get("semantic_qa_model"),
         "semantic_qa_error": (metric or {}).get("semantic_qa_error")
         or (metric or {}).get("error"),
+        "semantic_qa_evidence": (metric or {}).get("semantic_qa_evidence", []),
         "issues": (metric or {}).get("issues", []),
         "recommended_generation_strategy": (metric or {}).get(
             "recommended_generation_strategy"
@@ -346,6 +356,14 @@ def main() -> int:
         help=(
             "Stage the approved prop deterministically, then run one low-denoise "
             "masked Qwen harmonization."
+        ),
+    )
+    parser.add_argument(
+        "--ludovico-age-canary",
+        action="store_true",
+        help=(
+            "Run one low-denoise masked Qwen edit over Ludovico's head, then "
+            "validate the complete scene locally."
         ),
     )
     parser.add_argument(
@@ -548,6 +566,73 @@ def main() -> int:
     checkpoint = _resolve_comfyui_checkpoint(STYLE_KEY)
     gpu_rate = float(os.getenv("RUNPOD_GPU_USD_PER_SECOND", "0.000553"))
     stages: list[dict[str, Any]] = []
+
+    if args.ludovico_age_canary:
+        scene = _semantic_scene()
+        source_path = OUTPUT_ROOT / "scene_2_attempt_11_composite.png"
+        output_path = OUTPUT_ROOT / "scene_2_attempt_12.png"
+        if not source_path.is_file() or source_path.stat().st_size <= 1000:
+            raise RuntimeError("ludovico_age_canary_source_missing")
+
+        scene["inpaint_focus_boxes"] = [[0.51, 0.03, 0.92, 0.38]]
+        correction = (
+            "Edit only the masked adult male professor. Make Ludovico "
+            "unmistakably around fifty years old while preserving his identity, "
+            "expression and pose: add subtle gray at the temples, restrained "
+            "forehead and eye lines, and mature facial proportions. He is a "
+            "healthy dignified fifty-year-old, not elderly. Preserve his hair "
+            "style, suit and every unmasked pixel exactly. Do not alter Alice, "
+            "their hands, the white mouse, sugar bowl, separate lid, teaspoon, "
+            "library, camera, lighting or comic-storybook rendering. Add no text, "
+            "new person, beard, moustache or extra object."
+        )
+        prompt = _build_flux2_image_prompt(
+            scene,
+            STYLE_KEY,
+            visual_bible,
+            correction,
+        )
+        monitor, _record, metric = _run_comfyui_image_attempt(
+            scene=scene,
+            image_path=str(output_path),
+            directed_prompt=prompt,
+            image_style=STYLE_KEY,
+            style_label=STYLE_LABEL,
+            quality_preset_key="high",
+            quality_preset=quality,
+            checkpoint_name=checkpoint,
+            scene_seed=2026071822,
+            visual_bible=visual_bible,
+            runpod_endpoint_id=endpoint_id,
+            runpod_api_key=api_key,
+            runpod_gpu_usd_per_second=gpu_rate,
+            attempt=12,
+            controlled_workflow=True,
+            control_strategy="masked_inpaint",
+            control_image_path=str(source_path),
+            reference_image_path=None,
+            prop_reference_image_path=None,
+            semantic_repair_backend_override="qwen_image_edit_2511",
+            qwen_inpaint_denoise_override=0.30,
+        )
+        stage = _stage_payload(
+            name="scene_attempt_12_qwen_ludovico_age_inpaint",
+            monitor=monitor,
+            metric=metric,
+            path=output_path,
+        )
+        accepted = bool(metric and metric.get("semantic_accepted"))
+        report = {
+            "status": _stage_report_status(accepted, stage),
+            "accepted": accepted,
+            "semantic_threshold": int(os.getenv("IMAGE_SEMANTIC_MIN_SCORE", "88")),
+            "source_path": str(source_path),
+            "mask_boxes": scene["inpaint_focus_boxes"],
+            "stages": [stage],
+            "total_estimated_cost_usd": float(stage.get("estimated_cost_usd") or 0),
+        }
+        _write_report(report, LUDOVICO_AGE_CANARY_REPORT_PATH)
+        return 0 if accepted else 1
 
     if args.qwen_canary:
         scene = _semantic_scene()
