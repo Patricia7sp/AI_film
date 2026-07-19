@@ -11,7 +11,6 @@ from typing import Literal, Mapping, Protocol, Sequence, cast
 
 from PIL import Image, UnidentifiedImageError
 
-
 DEFAULT_LOCAL_VISION_QA_MODEL = "HuggingFaceTB/SmolVLM-500M-Instruct"
 DEFAULT_LOCAL_AGE_QA_MODEL = "dima806/fairface_age_image_detection"
 
