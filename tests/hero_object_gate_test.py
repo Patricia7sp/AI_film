@@ -1001,6 +1001,23 @@ def test_semantic_qa_rejects_unknown_provider_to_local(monkeypatch):
     assert langgraph_adapter._semantic_qa_primary_provider() == "local"
 
 
+def test_local_visual_qa_requires_revision_for_custom_model(monkeypatch):
+    from open3d_implementation.core import local_visual_qa
+
+    monkeypatch.delenv("LOCAL_VISION_QA_REVISION", raising=False)
+
+    with pytest.raises(
+        local_visual_qa.LocalVisualQAError,
+        match="LOCAL_VISION_QA_REVISION",
+    ):
+        local_visual_qa._model_revision(
+            model_name="owner/custom-vision-model",
+            env_name="LOCAL_VISION_QA_REVISION",
+            default_model=local_visual_qa.DEFAULT_LOCAL_VISION_QA_MODEL,
+            default_revision=local_visual_qa.DEFAULT_LOCAL_VISION_QA_REVISION,
+        )
+
+
 def test_semantic_qa_can_run_locally_without_external_provider(monkeypatch, tmp_path):
     def pass_local(**_kwargs):
         return {

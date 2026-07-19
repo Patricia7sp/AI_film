@@ -13,6 +13,8 @@ from PIL import Image, UnidentifiedImageError
 
 DEFAULT_LOCAL_VISION_QA_MODEL = "HuggingFaceTB/SmolVLM-500M-Instruct"
 DEFAULT_LOCAL_AGE_QA_MODEL = "dima806/fairface_age_image_detection"
+DEFAULT_LOCAL_VISION_QA_REVISION = "a7da5b986cb59b408707209984f360a5f4ad7e47"
+DEFAULT_LOCAL_AGE_QA_REVISION = "4e02ab8057ea7fd74b1670940995c5dfda3e6ec0"
 
 
 class LocalVisualQAError(RuntimeError):
@@ -143,9 +145,25 @@ def _local_longest_edge() -> int:
     return max(512, min(1536, value))
 
 
+def _model_revision(
+    *,
+    model_name: str,
+    env_name: str,
+    default_model: str,
+    default_revision: str,
+) -> str:
+    configured_revision = os.getenv(env_name, "").strip()
+    if configured_revision:
+        return configured_revision
+    if model_name == default_model:
+        return default_revision
+    raise LocalVisualQAError(f"local_model:revision_required:{env_name}")
+
+
 @lru_cache(maxsize=2)
 def _load_local_vision_model(
     model_name: str,
+    revision: str,
     longest_edge: int,
 ) -> tuple[_Processor, _Model]:
     try:
@@ -157,11 +175,13 @@ def _load_local_vision_model(
     try:
         processor = AutoProcessor.from_pretrained(
             model_name,
+            revision=revision,
             size={"longest_edge": longest_edge},
             local_files_only=_local_files_only(),
         )
         model = AutoModelForVision2Seq.from_pretrained(
             model_name,
+            revision=revision,
             torch_dtype=torch.float32,
             _attn_implementation="eager",
             low_cpu_mem_usage=True,
@@ -178,6 +198,7 @@ def _load_local_vision_model(
 @lru_cache(maxsize=2)
 def _load_local_age_model(
     model_name: str,
+    revision: str,
 ) -> tuple[_ImageProcessor, _ImageClassifierModel]:
     try:
         from transformers import ViTForImageClassification, ViTImageProcessor
@@ -187,10 +208,12 @@ def _load_local_age_model(
     try:
         processor = ViTImageProcessor.from_pretrained(
             model_name,
+            revision=revision,
             local_files_only=_local_files_only(),
         )
         model = ViTForImageClassification.from_pretrained(
             model_name,
+            revision=revision,
             local_files_only=_local_files_only(),
         )
         model.eval()
@@ -290,7 +313,17 @@ def evaluate_local_visual_qa(
 
     bounded_tokens = max(96, min(800, int(max_new_tokens)))
     image = _load_rgb_image(image_path)
-    processor, model = _load_local_vision_model(model_name, _local_longest_edge())
+    revision = _model_revision(
+        model_name=model_name,
+        env_name="LOCAL_VISION_QA_REVISION",
+        default_model=DEFAULT_LOCAL_VISION_QA_MODEL,
+        default_revision=DEFAULT_LOCAL_VISION_QA_REVISION,
+    )
+    processor, model = _load_local_vision_model(
+        model_name,
+        revision,
+        _local_longest_edge(),
+    )
     return _run_local_visual_prompt(
         processor=processor,
         model=model,
@@ -312,7 +345,17 @@ def evaluate_local_visual_checklist(
     if not bounded_criteria:
         raise LocalVisualQAError("local_vlm:empty_criteria")
     image = _load_rgb_image(image_path)
-    processor, model = _load_local_vision_model(model_name, _local_longest_edge())
+    revision = _model_revision(
+        model_name=model_name,
+        env_name="LOCAL_VISION_QA_REVISION",
+        default_model=DEFAULT_LOCAL_VISION_QA_MODEL,
+        default_revision=DEFAULT_LOCAL_VISION_QA_REVISION,
+    )
+    processor, model = _load_local_vision_model(
+        model_name,
+        revision,
+        _local_longest_edge(),
+    )
     answers: list[LocalVisualAnswer] = []
     for criterion in bounded_criteria:
         response = _run_local_visual_prompt(
@@ -355,7 +398,13 @@ def evaluate_local_age_classification(
             round(image.height * bottom),
         )
     )
-    processor, model = _load_local_age_model(model_name)
+    revision = _model_revision(
+        model_name=model_name,
+        env_name="LOCAL_AGE_QA_REVISION",
+        default_model=DEFAULT_LOCAL_AGE_QA_MODEL,
+        default_revision=DEFAULT_LOCAL_AGE_QA_REVISION,
+    )
+    processor, model = _load_local_age_model(model_name, revision)
     try:
         import torch
     except ImportError as exc:
