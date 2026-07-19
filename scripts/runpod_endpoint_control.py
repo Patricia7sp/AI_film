@@ -199,9 +199,19 @@ def update_endpoint_template_runtime(
         DETAILS_URL_TEMPLATE.format(endpoint_id=endpoint_id),
         api_key=api_key,
     )
+    if (
+        int(endpoint.get("workersMin") or 0) != 0
+        or int(endpoint.get("workersMax") or 0) != 0
+    ):
+        raise RuntimeError("Stop the endpoint before changing its runtime image.")
     template_id = str(endpoint.get("templateId") or "").strip()
     if not template_id:
         raise RuntimeError("RunPod endpoint did not return a templateId")
+    flashboot_disabled = update_endpoint(
+        api_key=api_key,
+        endpoint_id=endpoint_id,
+        changes={"flashboot": False},
+    )
     docker_start_cmd = (
         ["bash", "-lc", LEGACY_VOLUME_LINK_COMMAND]
         if start_command == "legacy-volume-links"
@@ -221,7 +231,12 @@ def update_endpoint_template_runtime(
             "volumeMountPath": "/runpod-volume",
         },
     )
-    return redact_sensitive_values(updated)
+    return redact_sensitive_values(
+        {
+            "template": updated,
+            "endpoint": flashboot_disabled,
+        }
+    )
 
 
 def redact_sensitive_values(value: Any) -> Any:
@@ -424,16 +439,17 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        print_json(
-            {
-                "template": update_endpoint_template_runtime(
-                    api_key=api_key,
-                    endpoint_id=endpoint_id,
-                    image_name=image_name,
-                    start_command=start_command,
-                )
-            }
-        )
+        try:
+            updated_runtime = update_endpoint_template_runtime(
+                api_key=api_key,
+                endpoint_id=endpoint_id,
+                image_name=image_name,
+                start_command=start_command,
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print_json(updated_runtime)
         return 0
 
     if args.command == "set-flashboot":

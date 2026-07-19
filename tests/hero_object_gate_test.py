@@ -62,6 +62,7 @@ from scripts import smoke_comfyui_ipadapter_sequence as ipadapter_smoke  # noqa:
 from scripts import smoke_comfyui_staged_repair as staged_smoke  # noqa: E402
 from scripts.runpod_endpoint_control import (  # noqa: E402
     redact_sensitive_values,
+    update_endpoint_template_runtime,
     update_stopped_endpoint_gpu_types,
 )
 
@@ -786,7 +787,12 @@ def test_deterministic_prop_stage_preserves_canvas_and_limits_edit(tmp_path):
         assert staged.size == (200, 300)
         assert staged.getpixel((5, 5)) == (0, 0, 128)
         assert staged.getpixel((150, 225)) != (0, 0, 128)
-    assert placement["target_box"] == (118, 210, 184, 270)
+        corner = staged.getpixel((127, 193))
+        assert (
+            sum(abs(value - expected) for value, expected in zip(corner, (0, 0, 128)))
+            <= 50
+        )
+    assert placement["target_box"] == (126, 192, 174, 237)
 
 
 def test_gpu_fallback_update_requires_stopped_endpoint(monkeypatch):
@@ -801,6 +807,59 @@ def test_gpu_fallback_update_requires_stopped_endpoint(monkeypatch):
             endpoint_id="endpoint",
             gpu_type_ids=["NVIDIA A100 80GB PCIe", "NVIDIA H100 80GB HBM3"],
         )
+
+
+def test_runtime_image_update_requires_stopped_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        "scripts.runpod_endpoint_control.request_json",
+        lambda *args, **kwargs: {
+            "templateId": "template",
+            "workersMin": 0,
+            "workersMax": 1,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="Stop the endpoint"):
+        update_endpoint_template_runtime(
+            api_key="test",
+            endpoint_id="endpoint",
+            image_name="registry.example/worker:immutable",
+            start_command="/start_ai_film.sh",
+        )
+
+
+def test_runtime_image_update_disables_flashboot(monkeypatch):
+    calls = []
+
+    def fake_request(url, **kwargs):
+        calls.append((url, kwargs))
+        if kwargs.get("method") == "PATCH":
+            return {"id": "endpoint", "flashboot": False}
+        if "/templates/" in url:
+            return {"id": "template", "imageName": kwargs["payload"]["imageName"]}
+        return {
+            "templateId": "template",
+            "workersMin": 0,
+            "workersMax": 0,
+        }
+
+    monkeypatch.setattr(
+        "scripts.runpod_endpoint_control.request_json",
+        fake_request,
+    )
+
+    result = update_endpoint_template_runtime(
+        api_key="test",
+        endpoint_id="endpoint",
+        image_name="registry.example/worker:immutable",
+        start_command="/start_ai_film.sh",
+    )
+
+    assert result["template"]["imageName"] == "registry.example/worker:immutable"
+    assert result["endpoint"]["flashboot"] is False
+    assert calls[1][1]["method"] == "PATCH"
+    assert calls[1][1]["payload"] == {"flashboot": False}
+    assert "/templates/" in calls[2][0]
 
 
 def test_gpu_fallback_update_rejects_low_memory_gpu():
@@ -1047,6 +1106,42 @@ def test_ipadapter_reference_conditions_model_without_replacing_scene_prompt():
     assert workflow["1"]["inputs"]["text"] == ("Alice examines a small sugar bowl")
 
 
+def test_reference_crop_removes_empty_canvas_before_ipadapter(tmp_path):
+    from PIL import Image, ImageDraw
+
+    source_path = tmp_path / "prop.png"
+    source = Image.new("RGB", (100, 200), "white")
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((20, 70, 80, 150), fill="red")
+    source.save(source_path)
+
+    encoded = _encode_comfyui_reference_image(
+        str(source_path),
+        image_name="prop.png",
+        target_size=(64, 64),
+        crop_box=(0.20, 0.35, 0.81, 0.76),
+    )
+    image_bytes = base64.b64decode(encoded["image"].split(",", 1)[1])
+
+    with Image.open(BytesIO(image_bytes)) as cropped:
+        assert cropped.size == (64, 64)
+        assert cropped.convert("RGB").getpixel((32, 32)) == (255, 0, 0)
+
+
+def test_masked_inpaint_accepts_bounded_denoise_override():
+    workflow = _build_comfyui_workflow(
+        directed_prompt="Add only a tiny white mouse inside the existing bowl",
+        checkpoint_name="ai-film-semantic-juggernaut-xl.safetensors",
+        quality_preset=_resolve_quality_preset("high"),
+        scene_seed=125,
+        scene_id=2,
+        inpaint_image_name="precise_mask.png",
+        inpaint_denoise=0.68,
+    )
+
+    assert workflow["3"]["inputs"]["denoise"] == 0.68
+
+
 def test_ipadapter_prop_reference_uses_precise_composition_conditioning():
     workflow = _build_comfyui_workflow(
         directed_prompt="Insert one compact sugar bowl and tiny mouse",
@@ -1056,13 +1151,13 @@ def test_ipadapter_prop_reference_uses_precise_composition_conditioning():
         scene_id=2,
         reference_image_name="approved_prop_reference.png",
         ipadapter_enabled=True,
-        ipadapter_weight=0.82,
-        ipadapter_weight_type="composition precise",
+        ipadapter_weight=0.90,
+        ipadapter_weight_type="linear",
     )
 
     assert workflow["20"]["inputs"]["image"] == "approved_prop_reference.png"
-    assert workflow["22"]["inputs"]["weight"] == 0.82
-    assert workflow["22"]["inputs"]["weight_type"] == "composition precise"
+    assert workflow["22"]["inputs"]["weight"] == 0.90
+    assert workflow["22"]["inputs"]["weight_type"] == "linear"
 
 
 def test_masked_repair_routes_ipadapter_to_prop_instead_of_character():
@@ -1082,8 +1177,8 @@ def test_masked_repair_routes_ipadapter_to_prop_instead_of_character():
     assert prop_route == (
         "approved_prop.png",
         "hero_prop",
-        "composition precise",
-        0.82,
+        "linear",
+        0.90,
     )
     assert character_route == ("approved_alice.png", "character", "linear", None)
 

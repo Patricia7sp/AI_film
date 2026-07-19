@@ -1962,6 +1962,7 @@ def _encode_comfyui_reference_image(
     *,
     image_name: str,
     target_size: tuple[int, int] | None = None,
+    crop_box: tuple[float, float, float, float] | None = None,
 ) -> Dict[str, str]:
     from io import BytesIO
 
@@ -1972,6 +1973,18 @@ def _encode_comfyui_reference_image(
         raise RuntimeError("ipadapter_reference_image_missing")
     with Image.open(source_path) as source_image:
         reference = source_image.convert("RGB")
+        if crop_box is not None:
+            left, top, right, bottom = crop_box
+            if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+                raise ValueError("invalid_reference_crop_box")
+            reference = reference.crop(
+                (
+                    round(reference.width * left),
+                    round(reference.height * top),
+                    round(reference.width * right),
+                    round(reference.height * bottom),
+                )
+            )
         if target_size:
             contained = ImageOps.contain(
                 reference,
@@ -2374,6 +2387,7 @@ def _build_comfyui_workflow(
     ipadapter_weight_type: str = "linear",
     style_lora_name: str | None = None,
     style_lora_strength: float | None = None,
+    inpaint_denoise: float | None = None,
 ) -> Dict[str, Any]:
     positive_node: List[Any] = ["1", 0]
     base_model_node: List[Any] = ["4", 0]
@@ -2550,7 +2564,11 @@ def _build_comfyui_workflow(
             "class_type": "VAEEncodeForInpaint",
         }
         workflow["3"]["inputs"]["latent_image"] = ["12", 0]
-        workflow["3"]["inputs"]["denoise"] = _comfyui_inpaint_denoise()
+        workflow["3"]["inputs"]["denoise"] = (
+            _comfyui_inpaint_denoise()
+            if inpaint_denoise is None
+            else max(0.20, min(0.95, inpaint_denoise))
+        )
 
     should_refine = (
         _comfyui_refiner_enabled() if refiner_enabled is None else refiner_enabled
@@ -2639,8 +2657,8 @@ def _resolve_ipadapter_reference(
         return (
             prop_reference_image_path,
             "hero_prop",
-            "composition precise",
-            0.82,
+            "linear",
+            0.90,
         )
     if reference_image_path:
         return reference_image_path, "character", "linear", None
@@ -2760,6 +2778,7 @@ def _run_comfyui_image_attempt(
     prop_reference_image_path: str | None = None,
     semantic_repair_backend_override: str | None = None,
     qwen_inpaint_denoise_override: float | None = None,
+    sdxl_inpaint_denoise_override: float | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
     import base64
     import binascii
@@ -2970,6 +2989,11 @@ def _run_comfyui_image_attempt(
                     if requested_ipadapter_reference_role == "hero_prop"
                     else None
                 ),
+                crop_box=(
+                    (0.15, 0.36, 0.88, 0.78)
+                    if requested_ipadapter_reference_role == "hero_prop"
+                    else None
+                ),
             )
         )
 
@@ -3023,6 +3047,7 @@ def _run_comfyui_image_attempt(
             ipadapter_weight=ipadapter_weight,
             ipadapter_weight_type=ipadapter_weight_type,
             style_lora_name=_comfyui_style_lora_name(image_style),
+            inpaint_denoise=sdxl_inpaint_denoise_override,
         )
         generation_method = (
             "comfyui_masked_inpaint"
