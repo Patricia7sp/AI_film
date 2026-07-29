@@ -22,6 +22,7 @@ MODEL_DOWNLOAD_SCRIPT_PATH = ROOT / "scripts" / "runpod_download_hf_model.sh"
 CONTROLNET_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_controlnet_volume.sh"
 IPADAPTER_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_ipadapter_volume.sh"
 FLUX2_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_flux2_volume.sh"
+LORA_PREP_SCRIPT_PATH = ROOT / "scripts" / "runpod_prepare_lora_volume.sh"
 CONTROLNET_COMMAND_PRINTER_PATH = (
     ROOT / "scripts" / "print_runpod_controlnet_install_command.py"
 )
@@ -191,6 +192,9 @@ def validate_model_downloader() -> List[str]:
         "flux2-vae",
         "models/controlnet",
         "HF_TOKEN",
+        "huggingface.co",
+        "MIN_SIZE_GB",
+        "models directory",
         "curl -fL",
     )
     for item in required:
@@ -257,6 +261,28 @@ def validate_flux2_preparer() -> List[str]:
     for item in required:
         if item not in text:
             failures.append(f"runpod_prepare_flux2_volume.sh missing: {item}")
+    return failures
+
+
+def validate_lora_preparer() -> List[str]:
+    failures = validate_shell_script(
+        LORA_PREP_SCRIPT_PATH, "scripts/runpod_prepare_lora_volume.sh"
+    )
+    if failures:
+        return failures
+    text = LORA_PREP_SCRIPT_PATH.read_text(encoding="utf-8", errors="replace")
+    required = (
+        "runpod_download_hf_model.sh",
+        "AI_FILM_STYLE_LORA_URL",
+        "AI_FILM_ALICE_LORA_URL",
+        "AI_FILM_LUDOVICO_LORA_URL",
+        "models/loras",
+        "data_offsets",
+        "AI_FILM_LORA_VOLUME_READY",
+    )
+    for item in required:
+        if item not in text:
+            failures.append(f"runpod_prepare_lora_volume.sh missing: {item}")
     return failures
 
 
@@ -403,6 +429,10 @@ def main() -> int:
     flux2_failures = validate_flux2_preparer()
     failures.extend(flux2_failures)
     print(f"- FLUX.2 preparer: {'ok' if not flux2_failures else 'failed'}")
+
+    lora_failures = validate_lora_preparer()
+    failures.extend(lora_failures)
+    print(f"- LoRA preparer: {'ok' if not lora_failures else 'failed'}")
 
     command_printer_failures = validate_controlnet_command_printer()
     failures.extend(command_printer_failures)

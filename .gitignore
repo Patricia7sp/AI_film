@@ -265,6 +265,8 @@ test_*.py
 !tests/hero_object_gate_test.py
 !tests/conftest.py
 !tests/test_audio.py
+!tests/test_fal_pipeline_integration.py
+!tests/test_fal_provider.py
 !tests/test_runway.py
 !tests/test_validate_custom_nodes.py
 !tests/test_video.py
@@ -305,6 +307,7 @@ transforms.json
 
 # Open3D Implementation outputs
 open3d_implementation/output/
+data/cast_bible_registry.json
 open3d_implementation/video/assets/
 open3d_implementation/audio/
 open3d_implementation/images/

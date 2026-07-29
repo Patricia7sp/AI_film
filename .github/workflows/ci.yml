@@ -48,7 +48,7 @@ jobs:
         pip install flake8
         if [ -n "${{ steps.changed-python.outputs.files }}" ]; then
           flake8 ${{ steps.changed-python.outputs.files }} --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 ${{ steps.changed-python.outputs.files }} --count --max-complexity=10 --max-line-length=120 --extend-ignore=C901 --statistics
+          flake8 ${{ steps.changed-python.outputs.files }} --count --max-complexity=10 --max-line-length=120 --extend-ignore=C901,E203,W503 --statistics
         else
           echo "No Python files changed."
         fi

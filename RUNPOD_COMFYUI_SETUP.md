@@ -110,6 +110,81 @@ COMFYUI_MODEL_FAMILY=flux2_klein
 ControlNet e IP-Adapter. O controle nativo multi-referência do FLUX.2 deve ser
 ativado em uma etapa separada depois que o text-to-image passar o gate.
 
+### PASSO 2A.2: LoRAs de estilo e personagens no Network Volume
+
+Mantenha estilo e identidade separados: um LoRA define a linguagem visual do
+filme e cada personagem recorrente usa seu próprio LoRA. No terminal de um Pod
+temporário com o mesmo Network Volume anexado, configure apenas os URLs de
+download do Hugging Face e execute o preparador:
+
+```bash
+export HF_TOKEN=seu_token_huggingface_se_o_repositorio_exigir
+export AI_FILM_STYLE_LORA_URL=https://huggingface.co/ORG/REPO/resolve/main/style_storybook_v1.safetensors
+export AI_FILM_ALICE_LORA_URL=https://huggingface.co/ORG/REPO/resolve/main/char_alice_v1.safetensors
+export AI_FILM_LUDOVICO_LORA_URL=https://huggingface.co/ORG/REPO/resolve/main/char_ludovico_v1.safetensors
+
+bash scripts/runpod_prepare_lora_volume.sh
+```
+
+O script recusa destinos fora de `models/loras`, exige HTTPS direto de
+`huggingface.co` e valida o cabeçalho `safetensors` antes de liberar os
+arquivos. Nenhum token é gravado no repositório ou exibido no log.
+
+No `.env` local, informe somente os nomes dos arquivos já presentes no volume:
+
+```bash
+COMFYUI_FLUX2_STYLE_LORA=style_storybook_v1.safetensors
+COMFYUI_FLUX2_STYLE_LORA_STRENGTH=0.75
+COMFYUI_CHARACTER_LORA_ALICE=char_alice_v1.safetensors
+COMFYUI_CHARACTER_LORA_ALICE_STRENGTH=0.85
+COMFYUI_CHARACTER_LORA_LUDOVICO=char_ludovico_v1.safetensors
+COMFYUI_CHARACTER_LORA_LUDOVICO_STRENGTH=0.85
+COMFYUI_REQUIRE_STYLE_LORA=true
+COMFYUI_REQUIRE_CHARACTER_LORAS=true
+```
+
+O workflow FLUX.2 aplica no máximo três LoRAs por cena: estilo mais até dois
+personagens detectados no contrato da cena. O Cast Bible continua sendo a
+fonte de identidade, e a imagem só é aceita depois da comparação local com a
+referência canônica aprovada de cada personagem.
+
+Datasets privados de treino não devem ser enviados por um agente intermediário.
+O upload para o repositório privado do Hugging Face ou o treino dentro do Pod
+deve ocorrer em uma sessão controlada pelo proprietário; depois, este fluxo
+faz o download direto Hugging Face -> RunPod sem Docker Desktop.
+
+Antes do treino, exporte os pacotes versionados diretamente do resumo do run. O
+exportador recusa Cast Bible antiga, view pendente, caminho fora do run ou
+checksum divergente:
+
+```bash
+python scripts/export_cast_bible_lora_manifest.py \
+  data/runs/SEU_RUN/pipeline_summary.json \
+  data/runs/SEU_RUN/lora_training
+```
+
+Cada diretório gerado contém as sete views, captions, `manifest.jsonl` e
+`training_spec.json`. O adaptador final deve usar exatamente o nome e trigger do
+spec (`char_<personagem>_v<versao>.safetensors`). Alterar a referência canônica
+incrementa a versão, marca a LoRA anterior como obsoleta e bloqueia as cenas até
+novo treino.
+
+Na Sala de Curadoria, o fluxo equivalente é bloqueante e dividido em estados:
+
+1. `awaiting_cast_reference_approval`: revise as sete views e aprove cada
+   personagem. O clique valida QA automático, tamanho e checksum antes de gravar
+   `data/cast_bible_registry.json`.
+2. `awaiting_character_lora_training`: use **Exportar packs LoRA**. Exportar o
+   dataset não declara o adaptador como treinado.
+3. Depois do treino e da validação no Network Volume, configure no `.env` o nome
+   exato de cada `.safetensors`. Uma versão diferente permanece `stale`.
+4. `ready_to_generate_scenes`: **Continuar geração** cria um novo run, copia as
+   referências canônicas para ele e só então libera as cenas narrativas.
+
+Reprovar ou substituir uma referência invalida aprovações antigas, clips, corte
+final e publicação. Nenhum arquivo anterior é apagado; ele permanece disponível
+para auditoria e comparação.
+
 **Modelo inicial recomendado:** `Juggernaut XL v9`, salvo no volume como
 `ai-film-semantic-juggernaut-xl.safetensors`. Ele é um checkpoint SDXL em arquivo
 único (`.safetensors`) e entra como baseline semantic-first: primeiro a cena
@@ -495,6 +570,12 @@ demais na experiência.
 
 ## Troubleshooting
 
+- **`HTTP 402 Insufficient Balance`:** adicione créditos no RunPod antes de
+  iniciar outro job. A UI faz preflight dos endpoints principal e Qwen e
+  bloqueia o run antes de consumir Gemini ou criar trabalho parcial. Depois da
+  recarga, carregue o run anterior e use **Retry**: somente PNGs válidos da Cast
+  Bible são copiados, reavaliados localmente com custo de GPU zero e as views
+  ausentes/reprovadas voltam ao RunPod.
 - **Erro de autenticação:** confira `RUNPOD_API_KEY` e se o endpoint não
   foi pausado/deletado.
 - **Job fica em `IN_QUEUE` por muito tempo:** workers Max pode estar

@@ -70,8 +70,32 @@ case "$MODEL_REF" in
     ;;
 esac
 
+if [[ -n "${4:-}" ]]; then
+  MIN_SIZE_GB="$4"
+fi
+
 if [[ -z "$MODEL_URL" ]]; then
   echo "Usage: $0 [semantic-sdxl|animation-sdxl|comic-sdxl|comic-sdxl-full|controlnet-sdxl-canny|controlnet-sdxl-depth|huggingface-model-url] [filename] [relative-path]" >&2
+  exit 2
+fi
+
+if [[ "$MODEL_URL" != https://huggingface.co/* ]]; then
+  echo "Only direct HTTPS downloads from huggingface.co are allowed." >&2
+  exit 2
+fi
+
+if [[ ! "$RELATIVE_PATH" =~ ^models(/[A-Za-z0-9._-]+)*$ ]] || [[ "$RELATIVE_PATH" == *".."* ]]; then
+  echo "Relative path must remain inside the Network Volume models directory." >&2
+  exit 2
+fi
+
+if [[ "$MODEL_FILENAME" == */* ]] || [[ "$MODEL_FILENAME" == *".."* ]] || [[ "$MODEL_FILENAME" != *.safetensors ]]; then
+  echo "Model filename must be a .safetensors basename." >&2
+  exit 2
+fi
+
+if [[ ! "$MIN_SIZE_GB" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "Minimum size must be a non-negative number in GB." >&2
   exit 2
 fi
 

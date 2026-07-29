@@ -3,8 +3,8 @@ LangGraph Adapter for Open3D Implementation
 Integrates LangGraph workflows with Open3D visualization
 """
 
-import ast
 import base64
+import concurrent.futures
 import hashlib
 import importlib
 import json
@@ -14,12 +14,34 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, TypedDict
+from typing import Any, Dict, List, Literal, Mapping, Sequence, TypedDict
 
 import requests
+
+from open3d_implementation.core.fal_provider import (
+    FalProviderError,
+    FalQueueClient,
+    extract_image_url,
+    extract_video_url,
+    file_to_data_uri,
+    flux_cost_estimate_usd,
+    flux_pulid_cost_estimate_usd,
+    instant_character_cost_estimate_usd,
+    kling_lipsync_cost_estimate_usd,
+    kling_video_cost_estimate_usd,
+    nano_banana_edit_cost_estimate_usd,
+    validate_external_url,
+)
+from open3d_implementation.core.runpod_cost_guard import (
+    RunPodCostGuardError,
+    reserve_runpod_job_budget,
+    settle_runpod_job_budget,
+)
 
 
 class Open3DAgentState(TypedDict, total=False):
@@ -36,6 +58,7 @@ class Open3DAgentState(TypedDict, total=False):
     max_scenes: int
     image_style: str
     image_quality_preset: str
+    cast_resume_local_only: bool
     visual_bible: Dict[str, Any]
     enhanced_multimodal_input_asset: Dict[str, Any]
     cinematic_prompt: str
@@ -105,6 +128,43 @@ IMAGE_STYLE_PRESETS: Dict[str, Dict[str, str]] = {
 }
 
 DEFAULT_IMAGE_STYLE = "comic_storybook"
+CAST_BIBLE_SCHEMA_VERSION = "2.0"
+CAST_REFERENCE_VIEWS: Dict[str, str] = {
+    "front": (
+        "front-facing close identity portrait from top of head to mid-torso only, "
+        "eyes toward camera, face occupies at least one third of image height, feet, "
+        "shoes, knees and full skirt outside the frame, never a full-body view"
+    ),
+    "three_quarter": (
+        "chest-up three-quarter identity portrait, torso and face turned only 20 to 30 "
+        "degrees from camera, both eyes fully visible, far cheek and far eyebrow visible, "
+        "nose contained inside the far-cheek silhouette, never a side profile, half-body, "
+        "or full-body view"
+    ),
+    "profile": (
+        "chest-up strict left-side profile identity portrait, exactly one eye visible, "
+        "never frontal or full-body"
+    ),
+    "full_body": (
+        "front-facing full-body turnaround pose from head to both feet, natural anatomy, "
+        "both feet fully visible with clear background margin below"
+    ),
+    "expression_neutral": (
+        "tight front close-up from top of head to upper chest only with a calm neutral "
+        "expression, face occupies at least 40 percent of image height, no full body"
+    ),
+    "expression_warm": (
+        "tight front close-up from top of head to upper chest only with a subtle warm "
+        "expression, face occupies at least 40 percent of image height, no full body"
+    ),
+    "expression_concerned": (
+        "tight front close-up from top of head to upper chest only with a restrained "
+        "concerned expression, face occupies at least 40 percent of image height, no full body"
+    ),
+}
+CAST_REFERENCE_POSE_VIEWS = frozenset({"three_quarter", "profile", "full_body"})
+
+_LOCAL_SEMANTIC_QA_LOCK = threading.Lock()
 
 IMAGE_QUALITY_PRESETS: Dict[str, Dict[str, Any]] = {
     "balanced": {
@@ -398,6 +458,12 @@ def _canonical_story_scenes(
                     "duplicate Alice",
                 ],
                 "camera_motion": "slow cinematic push-in toward Alice and the anthill",
+                "canonical_anchor_terms": [
+                    "formigueiro",
+                    "formigas",
+                    "anthill",
+                    "ants",
+                ],
             }
         )
 
@@ -467,6 +533,13 @@ def _canonical_story_scenes(
                     "modern elements",
                 ],
                 "camera_motion": "gentle push-in toward the sugar bowl and white mouse",
+                "canonical_anchor_terms": [
+                    "açucareiro",
+                    "acucareiro",
+                    "sugar bowl",
+                    "ratinho",
+                    "white mouse",
+                ],
             }
         )
 
@@ -517,6 +590,12 @@ def _canonical_story_scenes(
                     "modern elements",
                 ],
                 "camera_motion": "slow push-in toward Alice and the rabbit hole",
+                "canonical_anchor_terms": [
+                    "toca",
+                    "rabbit hole",
+                    "coelho",
+                    "rabbit",
+                ],
             }
         )
 
@@ -541,10 +620,14 @@ def _merge_canonical_scenes(
         prompt = str(scene.get("prompt") or "")
         candidate_text = f"{description} {prompt}".lower()
         if any(
-            _text_has_any(candidate_text, [str(item).lower()])
+            _text_has_any_phrase(
+                candidate_text,
+                [
+                    str(item).lower()
+                    for item in canonical_scene.get("canonical_anchor_terms", [])
+                ],
+            )
             for canonical_scene in canonical
-            for item in canonical_scene.get("must_include", [])
-            if item
         ):
             continue
         merged.append({**scene, "scene_id": len(merged) + 1})
@@ -558,6 +641,63 @@ def _merge_canonical_scenes(
         }
         for index, scene in enumerate(merged[:max_scenes], 1)
     ]
+
+
+def _scene_response_json_schema(max_scenes: int) -> Dict[str, Any]:
+    scene_schema: Dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "scene_id": {"type": "integer", "minimum": 1},
+            "description": {"type": "string", "minLength": 20},
+            "prompt": {"type": "string", "minLength": 40},
+            "duration": {"type": "integer", "minimum": 5, "maximum": 10},
+            "must_include": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 2},
+                "minItems": 1,
+                "maxItems": 12,
+            },
+            "must_not_include": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 2},
+                "minItems": 1,
+                "maxItems": 16,
+            },
+            "source_excerpt": {"type": "string", "minLength": 8},
+            "camera_motion": {"type": "string", "minLength": 8},
+        },
+        "required": [
+            "scene_id",
+            "description",
+            "prompt",
+            "duration",
+            "must_include",
+            "must_not_include",
+            "source_excerpt",
+            "camera_motion",
+        ],
+    }
+    return {
+        "type": "array",
+        "items": scene_schema,
+        "minItems": max_scenes,
+        "maxItems": max_scenes,
+    }
+
+
+def _validate_structured_scenes(
+    payload: object, max_scenes: int
+) -> List[Dict[str, Any]]:
+    if not isinstance(payload, list) or len(payload) != max_scenes:
+        raise ValueError("structured_scenes_count_mismatch")
+    required_keys = set(_scene_response_json_schema(max_scenes)["items"]["required"])
+    scenes: List[Dict[str, Any]] = []
+    for index, item in enumerate(payload, 1):
+        if not isinstance(item, dict) or not required_keys.issubset(item):
+            raise ValueError(f"structured_scene_invalid:{index}")
+        scenes.append({**item, "scene_id": index})
+    return scenes
 
 
 def _scene_text(scene: Dict[str, Any]) -> str:
@@ -951,6 +1091,7 @@ def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
         )
         else "only animals explicitly named by the story"
     )
+    cast_bible = _build_cast_bible(story_text, style_key)
     return {
         "style_key": style_key,
         "style_label": style["label"],
@@ -965,6 +1106,7 @@ def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
         ],
         "protagonist": protagonist,
         "protagonist_identity": protagonist_identity,
+        "cast_bible": cast_bible,
         "animals": animals,
         "palette": palette,
         "lens": lens,
@@ -981,13 +1123,548 @@ def _build_visual_bible(story_text: str, style_key: str) -> Dict[str, Any]:
     }
 
 
+def _cast_profile_registry() -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": "alice",
+            "name": "Alice",
+            "aliases": ["alice", "menina liddle"],
+            "kind": "human",
+            "role": "protagonist",
+            "identity_prompt": (
+                "same Alice in every scene: one approximately 10-year-old Victorian child, "
+                "chestnut-brown shoulder-length hair parted softly near the center, oval fair "
+                "child face, large curious brown eyes, modest ivory-white long-sleeved day dress, "
+                "flat child torso and natural preteen proportions"
+            ),
+            "must_include": [
+                "exactly one Alice approximately 10 years old",
+                "chestnut-brown shoulder-length hair",
+                "modest ivory-white long-sleeved Victorian day dress",
+                "natural preteen proportions",
+                "plain neutral backdrop",
+            ],
+            "must_not_include": [
+                "second Alice",
+                "adult or teenage Alice",
+                "toddler Alice",
+                "princess gown",
+                "makeup or adult body proportions",
+                "props or story action",
+                "text",
+            ],
+            "lora_env_key": "COMFYUI_CHARACTER_LORA_ALICE",
+        },
+        {
+            "id": "ludovico",
+            "name": "Professor Ludovico",
+            "aliases": [
+                "ludovico",
+                "dodgson",
+                "professor de matemática",
+                "professor de matematica",
+                "professor-clérigo",
+                "professor-clerigo",
+            ],
+            "kind": "human",
+            "role": "lead_supporting",
+            "identity_prompt": (
+                "same Professor Ludovico in every scene: one tall slender middle-aged Victorian "
+                "man approximately 45 to 55 years old, long narrow face, short dark brown hair "
+                "with restrained gray at the temples, deep blue eyes, clean-shaven, shy kind "
+                "expression, dark charcoal frock coat, waistcoat, white shirt and narrow black tie"
+            ),
+            "must_include": [
+                "exactly one tall slender male Professor Ludovico",
+                "middle-aged face approximately 45 to 55",
+                "deep blue eyes and short dark hair with gray temples",
+                "dark charcoal Victorian frock coat and waistcoat",
+                "plain neutral backdrop",
+            ],
+            "must_not_include": [
+                "young man in his twenties",
+                "woman or second Alice",
+                "beard or moustache",
+                "modern suit",
+                "props or magic trick",
+                "text",
+            ],
+            "lora_env_key": "COMFYUI_CHARACTER_LORA_LUDOVICO",
+        },
+        {
+            "id": "lori",
+            "name": "Lóri",
+            "aliases": ["lóri", "lori"],
+            "kind": "human",
+            "role": "supporting",
+            "identity_prompt": (
+                "same Lóri in every scene: Alice's older adolescent sister, taller than Alice, "
+                "dark chestnut hair pinned back, composed oval face, muted sage Victorian day dress"
+            ),
+            "must_include": [
+                "exactly one adolescent Lóri",
+                "older and taller than Alice",
+                "dark chestnut hair pinned back",
+                "muted sage Victorian day dress",
+                "plain neutral backdrop",
+            ],
+            "must_not_include": [
+                "second Lóri",
+                "same face or age as Alice",
+                "adult mother",
+                "modern clothing",
+                "props or story action",
+                "text",
+            ],
+            "lora_env_key": "COMFYUI_CHARACTER_LORA_LORI",
+        },
+        {
+            "id": "edith",
+            "name": "Edith",
+            "aliases": ["edith"],
+            "kind": "human",
+            "role": "supporting",
+            "identity_prompt": (
+                "same Edith in every scene: Alice's younger sister, approximately 7 years old, "
+                "small round child face, light brown curled hair, dusty rose Victorian child dress"
+            ),
+            "must_include": [
+                "exactly one Edith approximately 7 years old",
+                "younger and shorter than Alice",
+                "light brown curled hair",
+                "dusty rose Victorian child dress",
+                "plain neutral backdrop",
+            ],
+            "must_not_include": [
+                "second Edith",
+                "teenage or adult Edith",
+                "same face or age as Alice",
+                "modern clothing",
+                "props or story action",
+                "text",
+            ],
+            "lora_env_key": "COMFYUI_CHARACTER_LORA_EDITH",
+        },
+        {
+            "id": "mia",
+            "name": "Mia",
+            "aliases": ["mia"],
+            "kind": "animal",
+            "role": "supporting",
+            "identity_prompt": (
+                "same Mia in every scene: one adult female short-haired brown tabby cat, "
+                "white chin and chest patch, amber eyes, slim face, no collar"
+            ),
+            "must_include": [
+                "exactly one adult female brown tabby cat Mia",
+                "white chin and chest patch",
+                "amber eyes",
+                "no collar",
+                "plain neutral backdrop",
+            ],
+            "must_not_include": [
+                "kitten replacing Mia",
+                "different coat color",
+                "dog or rabbit",
+                "clothes or accessories",
+                "props or story action",
+                "text",
+            ],
+            "lora_env_key": "COMFYUI_CHARACTER_LORA_MIA",
+        },
+    ]
+
+
+def _story_phrase_count(story_text: str, phrases: List[str]) -> int:
+    lowered = story_text.lower()
+    return sum(
+        len(re.findall(rf"(?<!\w){re.escape(phrase.lower())}(?!\w)", lowered))
+        for phrase in phrases
+    )
+
+
+def _cast_bible_registry_path() -> Path:
+    configured = os.getenv("AI_FILM_CAST_BIBLE_REGISTRY", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parents[2] / "data" / "cast_bible_registry.json"
+
+
+def _load_cast_bible_registry(style_key: str) -> Dict[str, Dict[str, Any]]:
+    path = _cast_bible_registry_path()
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if (
+        payload.get("schema_version") != CAST_BIBLE_SCHEMA_VERSION
+        or payload.get("style_key") != style_key
+    ):
+        return {}
+    return {
+        str(character.get("id")): character
+        for character in payload.get("characters", [])
+        if isinstance(character, dict) and character.get("id")
+    }
+
+
+def _registry_reference_is_valid(reference: Dict[str, Any]) -> bool:
+    required_views = list(reference.get("required_views") or [])
+    views = reference.get("views") or {}
+    return bool(
+        reference.get("approved") is True
+        and reference.get("human_approved") is True
+        and reference.get("checksum")
+        and required_views
+        and all(
+            (view := views.get(view_id) or {}).get("approved") is True
+            and view.get("human_approved") is True
+            and view.get("checksum")
+            and os.path.isfile(str(view.get("path") or ""))
+            and os.path.getsize(str(view.get("path") or "")) > 1000
+            for view_id in required_views
+        )
+    )
+
+
+def _materialize_registry_reference(
+    character_id: str,
+    reference: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Copy an approved registry pack into the active run workspace."""
+    materialized = json.loads(json.dumps(reference))
+    version = max(1, int(materialized.get("version") or 1))
+    required_views = list(materialized.get("required_views") or [])
+    views = materialized.get("views") or {}
+    target_dir = Path("output") / "cast_bible" / character_id / f"v{version}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for view_id in required_views:
+        view = views.get(view_id) or {}
+        source = Path(str(view.get("path") or "")).expanduser().resolve()
+        if (
+            not source.is_file()
+            or source.stat().st_size <= 1000
+            or _file_sha256(str(source)) != view.get("checksum")
+        ):
+            raise ValueError(f"cast_registry_view_invalid:{character_id}:{view_id}")
+        suffix = source.suffix.lower() or ".png"
+        destination = target_dir / f"{view_id}{suffix}"
+        if source != destination.resolve():
+            shutil.copy2(source, destination)
+        view["path"] = str(destination)
+    primary = views.get("three_quarter") or {}
+    if not primary.get("path"):
+        raise ValueError(f"cast_registry_primary_view_missing:{character_id}")
+    materialized["path"] = str(primary["path"])
+    return materialized
+
+
+def _build_cast_bible(story_text: str, style_key: str) -> Dict[str, Any]:
+    characters: List[Dict[str, Any]] = []
+    registry = _load_cast_bible_registry(style_key)
+    for profile in _cast_profile_registry():
+        aliases = [str(alias) for alias in profile["aliases"]]
+        mentions = _story_phrase_count(story_text, aliases)
+        if mentions <= 0:
+            continue
+        identity_fingerprint = hashlib.sha256(
+            str(profile["identity_prompt"]).encode("utf-8")
+        ).hexdigest()
+        character = {
+            **profile,
+            "story_mentions": mentions,
+            "identity_fingerprint": identity_fingerprint,
+            "reference": {
+                "status": "pending",
+                "approved": False,
+                "automatic_approved": False,
+                "human_approved": False,
+                "path": "",
+                "version": 1,
+                "checksum": "",
+                "required_views": list(CAST_REFERENCE_VIEWS),
+                "views": {
+                    view_id: {
+                        "status": "pending",
+                        "approved": False,
+                        "automatic_approved": False,
+                        "human_approved": False,
+                        "path": "",
+                        "checksum": "",
+                        "quality": {},
+                    }
+                    for view_id in CAST_REFERENCE_VIEWS
+                },
+                "quality": {},
+            },
+            "lora": {
+                "status": (
+                    "configured"
+                    if os.getenv(str(profile["lora_env_key"]), "").strip()
+                    else "unconfigured"
+                ),
+                "env_key": profile["lora_env_key"],
+                "name": os.getenv(str(profile["lora_env_key"]), "").strip(),
+                "expected_name": f"char_{profile['id']}_v1.safetensors",
+                "trigger_token": f"char_{profile['id']}_v1",
+                "strength": 0.85,
+            },
+        }
+        registry_character = registry.get(str(profile["id"])) or {}
+        registry_reference = registry_character.get("reference") or {}
+        if registry_character.get(
+            "identity_fingerprint"
+        ) == identity_fingerprint and _registry_reference_is_valid(registry_reference):
+            character["reference"] = _materialize_registry_reference(
+                str(profile["id"]),
+                registry_reference,
+            )
+            version = max(1, int(registry_reference.get("version") or 1))
+            expected_name = f"char_{profile['id']}_v{version}.safetensors"
+            configured_name = os.getenv(str(profile["lora_env_key"]), "").strip()
+            character["lora"].update(
+                {
+                    "status": (
+                        "configured"
+                        if Path(configured_name).name == expected_name
+                        else "stale" if configured_name else "unconfigured"
+                    ),
+                    "name": configured_name,
+                    "expected_name": expected_name,
+                    "trigger_token": f"char_{profile['id']}_v{version}",
+                }
+            )
+        characters.append(character)
+    identity_payload = [
+        {
+            "id": character["id"],
+            "identity_prompt": character["identity_prompt"],
+        }
+        for character in characters
+    ]
+    revision_source = json.dumps(
+        {
+            "schema_version": CAST_BIBLE_SCHEMA_VERSION,
+            "style_key": style_key,
+            "characters": identity_payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    revision = hashlib.sha256(revision_source.encode("utf-8")).hexdigest()[:12]
+    return {
+        "schema_version": CAST_BIBLE_SCHEMA_VERSION,
+        "revision": f"cast-{CAST_BIBLE_SCHEMA_VERSION}-{revision}",
+        "style_key": style_key,
+        "status": "references_pending" if characters else "empty",
+        "characters": characters,
+    }
+
+
+def _cast_character(
+    visual_bible: Dict[str, Any], character_id: str
+) -> Dict[str, Any] | None:
+    characters = visual_bible.get("cast_bible", {}).get("characters", [])
+    return next(
+        (
+            character
+            for character in characters
+            if str(character.get("id")) == character_id
+        ),
+        None,
+    )
+
+
+def _scene_cast_characters(
+    scene: Dict[str, Any], visual_bible: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    scene_text = _scene_positive_text(scene)
+    characters = visual_bible.get("cast_bible", {}).get("characters", [])
+    return [
+        character
+        for character in characters
+        if _text_has_any_phrase(
+            scene_text,
+            [str(alias) for alias in character.get("aliases", [])],
+        )
+    ]
+
+
+def _scene_cast_identity_text(
+    scene: Dict[str, Any], visual_bible: Dict[str, Any]
+) -> str:
+    characters = _scene_cast_characters(scene, visual_bible)
+    if not characters:
+        return str(
+            visual_bible.get("protagonist_identity")
+            or visual_bible.get("protagonist")
+            or "keep every named character consistent with the film"
+        )
+    return " | ".join(
+        f"{character['name']}: {character['identity_prompt']}"
+        for character in characters
+    )
+
+
+def _validated_lora_name(name: str) -> str:
+    normalized = name.strip()
+    path = Path(normalized)
+    if (
+        not normalized
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.suffix.lower() != ".safetensors"
+    ):
+        raise ValueError("invalid_comfyui_lora_name")
+    return normalized
+
+
+def _flux2_scene_lora_stack(
+    scene: Dict[str, Any], visual_bible: Dict[str, Any]
+) -> List[Dict[str, object]]:
+    stack: List[Dict[str, object]] = []
+    style_lora_name = os.getenv("COMFYUI_FLUX2_STYLE_LORA", "").strip()
+    if style_lora_name:
+        stack.append(
+            {
+                "name": _validated_lora_name(style_lora_name),
+                "strength": max(
+                    0.0,
+                    min(
+                        1.0,
+                        _safe_float(
+                            os.getenv("COMFYUI_FLUX2_STYLE_LORA_STRENGTH"), 0.75
+                        ),
+                    ),
+                ),
+                "role": "style",
+                "character_id": None,
+            }
+        )
+    for character in _scene_cast_characters(scene, visual_bible):
+        lora = character.setdefault("lora", {})
+        env_key = str(lora.get("env_key") or "").strip()
+        lora_name = os.getenv(env_key, "").strip() if env_key else ""
+        if not lora_name:
+            continue
+        strength_env = f"{env_key}_STRENGTH"
+        strength = max(
+            0.0,
+            min(
+                1.0,
+                _safe_float(
+                    os.getenv(strength_env),
+                    _safe_float(lora.get("strength"), 0.85),
+                ),
+            ),
+        )
+        lora.update(
+            {
+                "status": "configured",
+                "name": _validated_lora_name(lora_name),
+                "strength": strength,
+            }
+        )
+        stack.append(
+            {
+                "name": lora["name"],
+                "strength": strength,
+                "role": "character",
+                "character_id": character["id"],
+            }
+        )
+    deduplicated: List[Dict[str, object]] = []
+    seen_names: set[str] = set()
+    for item in stack:
+        name = str(item["name"])
+        if name not in seen_names:
+            seen_names.add(name)
+            deduplicated.append(item)
+    if len(deduplicated) > 3:
+        raise ValueError("flux2_lora_stack_exceeds_limit")
+    return deduplicated
+
+
+def _scene_lora_trigger_tokens(
+    scene: Dict[str, Any], visual_bible: Dict[str, Any]
+) -> str:
+    tokens: List[str] = []
+    style_lora_name = os.getenv("COMFYUI_FLUX2_STYLE_LORA", "").strip()
+    style_trigger = os.getenv("COMFYUI_FLUX2_STYLE_LORA_TRIGGER", "").strip()
+    if style_lora_name and style_trigger:
+        tokens.append(style_trigger)
+    for character in _scene_cast_characters(scene, visual_bible):
+        lora = character.get("lora", {})
+        env_key = str(lora.get("env_key") or "").strip()
+        if env_key and os.getenv(env_key, "").strip():
+            trigger = str(lora.get("trigger_token") or "").strip()
+            if trigger:
+                tokens.append(trigger)
+    return ", ".join(dict.fromkeys(tokens))
+
+
+def _flux2_lora_gate(
+    scenes: List[Dict[str, Any]], visual_bible: Dict[str, Any]
+) -> Dict[str, Any]:
+    blockers: List[str] = []
+    require_style = os.getenv(
+        "COMFYUI_REQUIRE_STYLE_LORA", "true"
+    ).strip().lower() not in {"0", "false", "no"}
+    require_characters = os.getenv(
+        "COMFYUI_REQUIRE_CHARACTER_LORAS", "true"
+    ).strip().lower() not in {"0", "false", "no"}
+    style_name = os.getenv("COMFYUI_FLUX2_STYLE_LORA", "").strip()
+    if require_style and not style_name:
+        blockers.append("style_lora_missing")
+    elif style_name:
+        _validated_lora_name(style_name)
+
+    required_characters = _required_production_cast(scenes, visual_bible)
+    if require_characters:
+        for character in required_characters:
+            lora = character.setdefault("lora", {})
+            env_key = str(lora.get("env_key") or "")
+            configured_name = os.getenv(env_key, "").strip() if env_key else ""
+            expected_name = str(lora.get("expected_name") or "")
+            if not configured_name:
+                lora["status"] = "unconfigured"
+                blockers.append(f"character_lora_missing:{character['id']}")
+                continue
+            validated_name = _validated_lora_name(configured_name)
+            lora["name"] = validated_name
+            if Path(validated_name).name != expected_name:
+                lora["status"] = "stale"
+                blockers.append(
+                    f"character_lora_version_mismatch:{character['id']}:{expected_name}"
+                )
+            else:
+                lora["status"] = "configured"
+    return {
+        "status": "blocked" if blockers else "approved",
+        "blockers": blockers,
+        "style_lora": style_name,
+        "required_character_ids": [
+            str(character["id"]) for character in required_characters
+        ],
+    }
+
+
 def _visual_bible_text(visual_bible: Dict[str, Any]) -> str:
+    cast = visual_bible.get("cast_bible", {})
+    cast_identity = " | ".join(
+        f"{character.get('name')}: {character.get('identity_prompt')}"
+        for character in cast.get("characters", [])
+    )
     return (
         f"FILM VISUAL BIBLE: style={visual_bible.get('style_label')}; "
         f"medium={visual_bible.get('style_prompt')}; "
         f"aspect={visual_bible.get('aspect_ratio')}; "
         f"protagonist={visual_bible.get('protagonist')}; "
         f"protagonist_identity={visual_bible.get('protagonist_identity')}; "
+        f"cast_revision={cast.get('revision')}; "
+        f"cast={cast_identity}; "
         f"animals={visual_bible.get('animals')}; "
         f"palette={visual_bible.get('palette')}; "
         f"lens={visual_bible.get('lens')}; "
@@ -1007,42 +1684,449 @@ def _character_reference_enabled() -> bool:
     }
 
 
-def _build_character_reference_scene(visual_bible: Dict[str, Any]) -> Dict[str, Any]:
+def _cast_reference_max_attempts() -> int:
+    raw_value = os.getenv("CAST_REFERENCE_MAX_ATTEMPTS", "2").strip()
+    try:
+        configured = int(raw_value)
+    except ValueError:
+        configured = 2
+    return max(1, min(configured, 3))
+
+
+def _cast_reference_derived_concurrency() -> int:
+    raw_value = os.getenv("CAST_REFERENCE_DERIVED_CONCURRENCY", "3").strip()
+    try:
+        configured = int(raw_value)
+    except ValueError:
+        configured = 3
+    return max(1, min(configured, len(CAST_REFERENCE_VIEWS) - 1))
+
+
+def _cast_reference_quality_preset(
+    base_preset: Dict[str, Any],
+    view_id: str,
+) -> Dict[str, Any]:
+    preset = dict(base_preset)
+    if view_id != "full_body":
+        preset["height"] = min(int(preset["height"]), 1024)
+    return preset
+
+
+def _cast_reference_qwen_denoise(view_id: str) -> float:
+    defaults = {
+        "front": 1.0,
+        "three_quarter": 0.95,
+        "profile": 0.90,
+        "full_body": 1.0,
+        "expression_neutral": 0.35,
+        "expression_warm": 0.35,
+        "expression_concerned": 0.35,
+    }
+    if view_id not in defaults:
+        raise ValueError(f"unknown_cast_reference_view:{view_id}")
+    env_key = f"CAST_REFERENCE_QWEN_DENOISE_{view_id.upper()}"
+    return max(0.2, min(1.0, _safe_float(os.getenv(env_key), defaults[view_id])))
+
+
+def _cast_reference_pose_failure_limit() -> int:
+    raw_value = os.getenv("CAST_REFERENCE_POSE_FAILURE_LIMIT", "2").strip()
+    try:
+        configured = int(raw_value)
+    except ValueError:
+        configured = 2
+    return max(1, min(configured, len(CAST_REFERENCE_POSE_VIEWS)))
+
+
+def _block_cast_reference_views_for_pose_circuit(
+    character: Dict[str, Any],
+    view_ids: Sequence[str],
+) -> None:
+    views = character["reference"]["views"]
+    for view_id in view_ids:
+        view = views[view_id]
+        if view.get("automatic_approved"):
+            continue
+        view.update(
+            {
+                "status": "blocked_by_pose_circuit",
+                "automatic_approved": False,
+                "human_approved": False,
+                "approved": False,
+                "path": "",
+                "quality": {
+                    "issues": ["cast_reference_pose_circuit_open"],
+                },
+            }
+        )
+
+
+def _create_cast_reference_pose_guide(
+    *,
+    character_id: str,
+    view_id: str,
+    width: int,
+    height: int,
+) -> str:
+    if view_id not in CAST_REFERENCE_POSE_VIEWS:
+        raise ValueError(f"pose_guide_not_supported:{view_id}")
+
+    from PIL import Image, ImageDraw
+
+    guide_dir = Path("output") / "conditioning"
+    guide_dir.mkdir(parents=True, exist_ok=True)
+    guide_path = guide_dir / f"{character_id}_{view_id}_pose_guide.png"
+    canvas = Image.new("RGB", (width, height), (232, 226, 214))
+    draw = ImageDraw.Draw(canvas)
+    ink = (78, 83, 92)
+    accent = (137, 102, 88)
+    stroke = max(5, width // 110)
+
+    if view_id == "full_body":
+        center_x = width // 2
+        head_radius = max(42, width // 11)
+        head_y = int(height * 0.15)
+        draw.ellipse(
+            (
+                center_x - head_radius,
+                head_y - head_radius,
+                center_x + head_radius,
+                head_y + head_radius,
+            ),
+            outline=ink,
+            width=stroke,
+        )
+        shoulder_y = int(height * 0.27)
+        hip_y = int(height * 0.58)
+        foot_y = int(height * 0.91)
+        draw.line(
+            (
+                center_x,
+                head_y + head_radius,
+                center_x,
+                hip_y,
+            ),
+            fill=ink,
+            width=stroke,
+        )
+        draw.line(
+            (
+                int(width * 0.34),
+                shoulder_y,
+                int(width * 0.66),
+                shoulder_y,
+            ),
+            fill=ink,
+            width=stroke,
+        )
+        draw.line(
+            (
+                int(width * 0.34),
+                shoulder_y,
+                int(width * 0.27),
+                int(height * 0.55),
+            ),
+            fill=ink,
+            width=stroke,
+        )
+        draw.line(
+            (
+                int(width * 0.66),
+                shoulder_y,
+                int(width * 0.73),
+                int(height * 0.55),
+            ),
+            fill=ink,
+            width=stroke,
+        )
+        draw.line(
+            (
+                center_x,
+                hip_y,
+                int(width * 0.41),
+                foot_y,
+                int(width * 0.34),
+                foot_y,
+            ),
+            fill=ink,
+            width=stroke,
+        )
+        draw.line(
+            (
+                center_x,
+                hip_y,
+                int(width * 0.59),
+                foot_y,
+                int(width * 0.66),
+                foot_y,
+            ),
+            fill=ink,
+            width=stroke,
+        )
+    elif view_id == "profile":
+        left = int(width * 0.28)
+        top = int(height * 0.16)
+        bottom = int(height * 0.58)
+        center_y = (top + bottom) // 2
+        profile_points = [
+            (int(width * 0.52), top),
+            (int(width * 0.65), int(height * 0.20)),
+            (int(width * 0.68), int(height * 0.30)),
+            (int(width * 0.78), int(height * 0.34)),
+            (int(width * 0.68), int(height * 0.38)),
+            (int(width * 0.66), int(height * 0.48)),
+            (int(width * 0.57), bottom),
+            (left, int(height * 0.50)),
+            (int(width * 0.24), int(height * 0.28)),
+            (int(width * 0.35), int(height * 0.18)),
+            (int(width * 0.52), top),
+        ]
+        draw.line(profile_points, fill=ink, width=stroke, joint="curve")
+        eye_radius = max(6, width // 85)
+        draw.ellipse(
+            (
+                int(width * 0.59) - eye_radius,
+                center_y - eye_radius,
+                int(width * 0.59) + eye_radius,
+                center_y + eye_radius,
+            ),
+            fill=accent,
+        )
+        draw.arc(
+            (
+                int(width * 0.30),
+                int(height * 0.47),
+                int(width * 0.72),
+                int(height * 0.88),
+            ),
+            185,
+            355,
+            fill=ink,
+            width=stroke,
+        )
+    else:
+        face_box = (
+            int(width * 0.28),
+            int(height * 0.15),
+            int(width * 0.72),
+            int(height * 0.59),
+        )
+        draw.ellipse(face_box, outline=ink, width=stroke)
+        center_x = int(width * 0.56)
+        draw.arc(
+            (
+                center_x - int(width * 0.06),
+                int(height * 0.26),
+                center_x + int(width * 0.07),
+                int(height * 0.43),
+            ),
+            80,
+            250,
+            fill=accent,
+            width=stroke,
+        )
+        eye_y = int(height * 0.31)
+        draw.ellipse(
+            (
+                int(width * 0.40),
+                eye_y,
+                int(width * 0.46),
+                eye_y + int(height * 0.025),
+            ),
+            outline=accent,
+            width=max(3, stroke // 2),
+        )
+        draw.ellipse(
+            (
+                int(width * 0.57),
+                eye_y + int(height * 0.008),
+                int(width * 0.62),
+                eye_y + int(height * 0.030),
+            ),
+            outline=accent,
+            width=max(3, stroke // 2),
+        )
+        draw.line(
+            (
+                int(width * 0.30),
+                int(height * 0.66),
+                int(width * 0.70),
+                int(height * 0.66),
+            ),
+            fill=ink,
+            width=stroke,
+        )
+        draw.arc(
+            (
+                int(width * 0.25),
+                int(height * 0.48),
+                int(width * 0.76),
+                int(height * 0.90),
+            ),
+            190,
+            350,
+            fill=ink,
+            width=stroke,
+        )
+
+    canvas.save(guide_path, format="PNG")
+    return str(guide_path)
+
+
+def _cast_reference_attempt_path(
+    character_id: str,
+    view_id: str,
+    attempt: int,
+) -> str:
+    suffix = "" if attempt == 0 else f"_attempt_{attempt + 1}"
+    return f"output/{character_id}_character_reference_{view_id}{suffix}.png"
+
+
+def _cast_reference_attempt_reusable(reference_path: str) -> bool:
+    try:
+        return os.path.isfile(reference_path) and os.path.getsize(reference_path) > 1000
+    except OSError:
+        return False
+
+
+def _cast_reference_job_retryable(job_monitor: Mapping[str, Any]) -> bool:
+    status = str(job_monitor.get("status") or "").upper()
+    error = str(job_monitor.get("error") or "").lower()
+    if status in {"BUDGET_BLOCKED", "LOCAL_ASSET_MISSING", "PAYMENT_REQUIRED"}:
+        return False
+    return "http 402" not in error
+
+
+def _build_character_reference_scene(
+    visual_bible: Dict[str, Any],
+    character_id: str = "alice",
+    view_id: str = "three_quarter",
+) -> Dict[str, Any]:
+    if view_id not in CAST_REFERENCE_VIEWS:
+        raise ValueError(f"unknown_cast_reference_view:{view_id}")
     style_prompt = str(visual_bible.get("style_prompt") or "")
-    protagonist_identity = str(visual_bible.get("protagonist_identity") or "")
+    character = _cast_character(visual_bible, character_id)
+    if character is None and character_id == "alice":
+        character = {
+            "id": "alice",
+            "name": "Alice",
+            "identity_prompt": str(visual_bible.get("protagonist_identity") or ""),
+            "must_include": [
+                "one Alice approximately 10 years old",
+                "chestnut-brown shoulder-length hair",
+                "modest ivory-white long-sleeved Victorian day dress",
+                "natural child proportions",
+                "plain neutral backdrop",
+            ],
+            "must_not_include": [
+                "second Alice",
+                "adult Alice",
+                "toddler Alice",
+                "princess gown",
+                "story action",
+                "props",
+                "text",
+            ],
+        }
+    if character is None:
+        raise ValueError(f"unknown_cast_character:{character_id}")
+    character_name = str(character["name"])
+    character_kind = str(character.get("kind") or "human").strip().lower()
+    identity_prompt = str(character["identity_prompt"])
+    view_prompt = CAST_REFERENCE_VIEWS[view_id]
+    if view_id == "full_body":
+        if character_kind == "human":
+            view_prompt += (
+                ", natural human hands and feet, exactly five fingers per hand, ordinary "
+                "period shoes, no paws, claws, talons, hooves or animal limbs"
+            )
+        else:
+            view_prompt += (
+                ", complete species-correct body and natural paws or feet with no human "
+                "hands or shoes"
+            )
+    if view_id == "front":
+        standalone_requirements = [
+            str(item)
+            for item in list(character["must_include"])
+            if not any(
+                relation in str(item).lower()
+                for relation in (
+                    "older and taller than",
+                    "younger and shorter than",
+                )
+            )
+        ]
+        semantic_must_include = [view_prompt, *standalone_requirements]
+        semantic_must_not_include = list(character["must_not_include"])
+    else:
+        semantic_must_include = [
+            view_prompt,
+            *[
+                str(item)
+                for item in list(character["must_include"])[:4]
+                if str(item).strip()
+                and not any(
+                    relation in str(item).lower()
+                    for relation in (
+                        "older and taller than",
+                        "younger and shorter than",
+                    )
+                )
+            ],
+            "plain warm gray studio backdrop",
+        ]
+        semantic_must_not_include = [
+            "second subject",
+            "props or story action",
+            "text, logo or watermark",
+        ]
+        if view_id == "profile" and character_kind == "human":
+            semantic_must_not_include.extend(
+                [
+                    "two eyes or two eyebrows visible in a profile reference",
+                    "new isolated mole, beauty mark or dark facial spot",
+                ]
+            )
+        if view_id == "full_body" and character_kind == "human":
+            semantic_must_not_include.extend(
+                [
+                    "animal paws, claws, talons or hooves",
+                    "malformed hands or feet",
+                ]
+            )
+        if character_kind == "human":
+            semantic_must_not_include.append(
+                "new isolated mole, beauty mark or dark facial spot"
+            )
+    semantic_must_not_include = list(dict.fromkeys(semantic_must_not_include))
+    scene_id = (
+        f"{character_id}_reference"
+        if view_id == "three_quarter"
+        else f"{character_id}_reference_{view_id}"
+    )
     return {
-        "scene_id": "alice_reference",
+        "scene_id": scene_id,
+        "scene_role": "character_reference",
+        "character_id": character_id,
+        "character_kind": character_kind,
+        "reference_view_id": view_id,
         "description": (
-            "Character reference sheet for Alice only, used to preserve identity across the film."
+            f"Character reference {view_id} for {character_name} only, used to preserve identity across the film."
         ),
         "prompt": (
-            f"{style_prompt}. Production reference image for Alice only: "
-            f"{protagonist_identity}. One fully clothed Victorian child in a modest ivory-white "
-            "long-sleeved day dress, neutral standing pose, three-quarter view, clean natural face, "
-            "chestnut-brown shoulder-length hair, restrained curious expression, plain warm gray studio backdrop. "
-            "No story action, no props, no other people, no text."
+            f"{style_prompt}. Production reference image for {character_name} only: "
+            f"{identity_prompt}. Render exactly this reference view: {view_prompt}. "
+            "One subject and one image only, complete identity anchors readable, plain warm gray "
+            "studio backdrop. No contact sheet, no split panels, no story action, no props, no "
+            "other people or animals, no text."
         ),
         "duration": 0,
         "composition_notes": (
-            "technical character reference, neutral three-quarter pose, full body readable, plain backdrop"
+            f"technical character reference, {view_prompt}, plain backdrop"
         ),
         "source_excerpt": "",
-        "must_include": [
-            "one Alice approximately 10 years old",
-            "chestnut-brown shoulder-length hair",
-            "modest ivory-white long-sleeved Victorian day dress",
-            "natural child proportions",
-            "plain neutral backdrop",
-        ],
-        "must_not_include": [
-            "second Alice",
-            "adult Alice",
-            "toddler Alice",
-            "princess gown",
-            "story action",
-            "props",
-            "text",
-        ],
+        "must_include": semantic_must_include,
+        "must_not_include": semantic_must_not_include,
         "camera_motion": "static character reference",
     }
 
@@ -1059,6 +2143,838 @@ def _character_reference_accepted(image_metric: Dict[str, Any] | None) -> bool:
         and _safe_float(image_metric.get("semantic_score"))
         >= _image_semantic_min_score()
     )
+
+
+def _cast_reference_background_variation(path: str) -> float | None:
+    try:
+        from PIL import Image, ImageStat
+
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    patch_width = max(1, int(image.width * 0.18))
+    patch_height = max(1, int(image.height * 0.12))
+    left = image.crop((0, 0, patch_width, patch_height))
+    right = image.crop(
+        (
+            image.width - patch_width,
+            0,
+            image.width,
+            patch_height,
+        )
+    )
+    strip = Image.new("RGB", (patch_width * 2, patch_height))
+    strip.paste(left, (0, 0))
+    strip.paste(right, (patch_width, 0))
+    variation = sum(ImageStat.Stat(strip).stddev) / (3 * 255)
+    return round(variation, 6)
+
+
+def _normalize_cast_reference_canvas_border(path: str) -> bool:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    if image.width < 256 or image.height < 256:
+        return False
+    grayscale = image.convert("L")
+    pixels = grayscale.load()
+    band_x = max(2, int(image.width * 0.04))
+    band_y = max(2, int(image.height * 0.04))
+
+    def dark_row_fraction(y: int) -> float:
+        return sum(pixels[x, y] < 50 for x in range(image.width)) / image.width
+
+    def dark_column_fraction(x: int) -> float:
+        return sum(pixels[x, y] < 50 for y in range(image.height)) / image.height
+
+    horizontal_frame = max(
+        max(dark_row_fraction(y) for y in range(band_y)),
+        max(dark_row_fraction(y) for y in range(image.height - band_y, image.height)),
+    )
+    vertical_frame = max(
+        max(dark_column_fraction(x) for x in range(band_x)),
+        max(dark_column_fraction(x) for x in range(image.width - band_x, image.width)),
+    )
+    if horizontal_frame < 0.75 or vertical_frame < 0.75:
+        return False
+    margin = max(4, int(min(image.width, image.height) * 0.025))
+    cropped = image.crop(
+        (
+            margin,
+            margin,
+            image.width - margin,
+            image.height - margin,
+        )
+    )
+    cropped.resize(image.size, Image.Resampling.LANCZOS).save(path, format="PNG")
+    return True
+
+
+def _reconcile_cast_reference_semantic_false_negatives(
+    *,
+    image_metric: Dict[str, Any],
+    candidate_path: str,
+    view_id: str,
+    identity_accepted: bool,
+    composition_similarity: float,
+) -> None:
+    if not identity_accepted:
+        return
+    evidence = list(image_metric.get("semantic_qa_evidence", []))
+    overridden_codes: set[str] = set()
+    background_variation = _cast_reference_background_variation(candidate_path)
+    background_threshold = max(
+        0.005,
+        min(
+            0.15,
+            _safe_float(
+                os.getenv(
+                    "LOCAL_CAST_REFERENCE_BACKGROUND_MAX_VARIATION",
+                    "0.03",
+                ),
+                0.03,
+            ),
+        ),
+    )
+    if (
+        background_variation is not None
+        and background_variation <= background_threshold
+    ):
+        overridden_codes.update(
+            str(item.get("code") or "")
+            for item in evidence
+            if item.get("matched") is False
+            and "plain warm gray studio backdrop"
+            in str(item.get("question") or "").lower()
+        )
+
+    eye_count: int | None = None
+    if view_id == "three_quarter":
+        eye_count = _detect_profile_eye_count(candidate_path)
+        maximum_composition_similarity = max(
+            0.90,
+            min(
+                0.995,
+                _safe_float(
+                    os.getenv(
+                        "LOCAL_CAST_THREE_QUARTER_MAX_COMPOSITION_SIMILARITY",
+                        "0.97",
+                    ),
+                    0.97,
+                ),
+            ),
+        )
+        if (
+            eye_count is not None
+            and eye_count >= 2
+            and composition_similarity <= maximum_composition_similarity
+        ):
+            overridden_codes.add("cast_three_quarter_pose_missing")
+
+    overridden_codes.discard("")
+    if not overridden_codes:
+        return
+    image_metric["semantic_critical_failures"] = [
+        code
+        for code in image_metric.get("semantic_critical_failures", [])
+        if str(code) not in overridden_codes
+    ]
+    image_metric["issues"] = [
+        issue
+        for issue in image_metric.get("issues", [])
+        if not any(
+            str(issue) == code or str(issue).startswith(f"{code}_")
+            for code in overridden_codes
+        )
+    ]
+    image_metric["semantic_qa_evidence"] = [
+        *evidence,
+        {
+            "code": "cast_reference_deterministic_reconciliation",
+            "view_id": view_id,
+            "overridden_codes": sorted(overridden_codes),
+            "background_variation": background_variation,
+            "background_threshold": background_threshold,
+            "eye_count": eye_count,
+            "composition_similarity": round(composition_similarity, 4),
+            "matched": True,
+            "provider": "local_deterministic_gate",
+        },
+    ]
+    if image_metric["semantic_critical_failures"]:
+        return
+    image_metric["issues"] = [
+        issue
+        for issue in image_metric["issues"]
+        if issue != "semantic_quality_below_threshold"
+    ]
+    image_metric["semantic_score"] = 100.0
+    image_metric["semantic_accepted"] = True
+    technical_score = _safe_float(image_metric.get("technical_score"), 100.0)
+    image_metric["quality_score"] = round(
+        (technical_score * 0.4) + 60.0,
+        1,
+    )
+
+
+def _apply_cast_reference_identity_gate(
+    *,
+    character: Dict[str, Any],
+    anchor_path: str,
+    candidate_path: str,
+    view_id: str,
+    image_metric: Dict[str, Any] | None,
+) -> None:
+    if image_metric is None:
+        return
+    try:
+        from open3d_implementation.core.local_visual_qa import (
+            LocalVisualQAError,
+            evaluate_local_cast_reference_identity,
+        )
+    except ImportError as exc:
+        failure_code = f"cast_identity_qa_failed_{character['id']}"
+        image_metric["identity_score"] = 0.0
+        image_metric["identity_accepted"] = False
+        image_metric["character_identity"] = []
+        image_metric["semantic_accepted"] = False
+        image_metric["semantic_score"] = min(
+            79.0, _safe_float(image_metric.get("semantic_score"), 0.0)
+        )
+        image_metric["semantic_critical_failures"] = list(
+            dict.fromkeys(
+                [
+                    *image_metric.get("semantic_critical_failures", []),
+                    failure_code,
+                ]
+            )
+        )
+        image_metric["issues"] = sorted(
+            set([*image_metric.get("issues", []), failure_code])
+        )
+        image_metric["identity_error"] = f"{type(exc).__name__}:{str(exc)[:240]}"
+        return
+
+    try:
+        assessment = evaluate_local_cast_reference_identity(
+            reference_path=Path(anchor_path),
+            candidate_path=Path(candidate_path),
+            view_id=view_id,
+        )
+    except LocalVisualQAError as exc:
+        failure_code = f"cast_identity_qa_failed_{character['id']}"
+        image_metric["identity_score"] = 0.0
+        image_metric["identity_accepted"] = False
+        image_metric["character_identity"] = []
+        image_metric["semantic_accepted"] = False
+        image_metric["semantic_score"] = min(
+            79.0, _safe_float(image_metric.get("semantic_score"), 0.0)
+        )
+        image_metric["semantic_critical_failures"] = list(
+            dict.fromkeys(
+                [
+                    *image_metric.get("semantic_critical_failures", []),
+                    failure_code,
+                ]
+            )
+        )
+        image_metric["issues"] = sorted(
+            set([*image_metric.get("issues", []), failure_code])
+        )
+        image_metric["identity_error"] = f"{type(exc).__name__}:{str(exc)[:240]}"
+        return
+
+    dimensions = {
+        "appearance_embedding": round(assessment.crop_similarity * 100, 1),
+        "composition_embedding": round(
+            assessment.composition_similarity * 100,
+            1,
+        ),
+    }
+    evidence = [
+        {
+            "code": f"identity_embedding_{character['id']}",
+            "view_id": view_id,
+            "crop_similarity": assessment.crop_similarity,
+            "crop_threshold": assessment.crop_threshold,
+            "composition_similarity": assessment.composition_similarity,
+            "composition_threshold": assessment.composition_threshold,
+            "reference_box": list(assessment.reference_box),
+            "candidate_box": list(assessment.candidate_box),
+            "matched": assessment.accepted,
+        }
+    ]
+    identity_result = {
+        "character_id": str(character["id"]),
+        "character_name": str(character["name"]),
+        "score": assessment.score,
+        "dimensions": dimensions,
+        "accepted": assessment.accepted,
+        "issues": (
+            [] if assessment.accepted else [f"identity_embedding_{character['id']}"]
+        ),
+        "evidence": evidence,
+        "provider": "local_reference_comparison",
+        "model": assessment.model_name,
+    }
+    image_metric["character_identity"] = [identity_result]
+    image_metric["identity_score"] = assessment.score
+    image_metric["identity_accepted"] = assessment.accepted
+    if assessment.accepted:
+        _reconcile_cast_reference_semantic_false_negatives(
+            image_metric=image_metric,
+            candidate_path=candidate_path,
+            view_id=view_id,
+            identity_accepted=True,
+            composition_similarity=assessment.composition_similarity,
+        )
+        return
+
+    failure_code = f"identity_mismatch_{character['id']}"
+    image_metric["semantic_accepted"] = False
+    image_metric["semantic_score"] = min(
+        79.0, _safe_float(image_metric.get("semantic_score"), 0.0)
+    )
+    image_metric["semantic_critical_failures"] = list(
+        dict.fromkeys(
+            [
+                *image_metric.get("semantic_critical_failures", []),
+                failure_code,
+            ]
+        )
+    )
+    image_metric["issues"] = sorted(
+        set([*image_metric.get("issues", []), failure_code])
+    )
+
+
+def _required_scene_cast(
+    scenes: List[Dict[str, Any]], visual_bible: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    required: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for scene in scenes:
+        scene_characters = _scene_cast_characters(scene, visual_bible)
+        scene["cast_character_ids"] = [
+            str(character["id"]) for character in scene_characters
+        ]
+        for character in scene_characters:
+            character_id = str(character["id"])
+            if character_id not in seen:
+                seen.add(character_id)
+                required.append(character)
+    cast_bible = visual_bible.setdefault("cast_bible", {})
+    cast_bible["required_for_scenes"] = [str(character["id"]) for character in required]
+    return required
+
+
+def _required_production_cast(
+    scenes: List[Dict[str, Any]],
+    visual_bible: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    required = list(_required_scene_cast(scenes, visual_bible))
+    seen = {str(character["id"]) for character in required}
+    try:
+        recurring_min_mentions = int(
+            os.getenv("CAST_BIBLE_RECURRING_MIN_MENTIONS", "2")
+        )
+    except ValueError:
+        recurring_min_mentions = 2
+    recurring_min_mentions = max(1, min(20, recurring_min_mentions))
+    for character in visual_bible.get("cast_bible", {}).get("characters", []):
+        character_id = str(character.get("id") or "")
+        if (
+            character_id
+            and character_id not in seen
+            and _safe_int(character.get("story_mentions"), 0) >= recurring_min_mentions
+        ):
+            seen.add(character_id)
+            required.append(character)
+    cast_bible = visual_bible.setdefault("cast_bible", {})
+    cast_bible["required_for_production"] = [
+        str(character["id"]) for character in required
+    ]
+    return required
+
+
+def _approved_cast_reference_path(character: Dict[str, Any]) -> str | None:
+    reference = character.get("reference") or {}
+    path = str(reference.get("path") or "").strip()
+    required_views = reference.get("required_views") or list(CAST_REFERENCE_VIEWS)
+    views = reference.get("views") or {}
+    views_valid = bool(required_views) and all(
+        isinstance(views.get(view_id), dict)
+        and views[view_id].get("approved") is True
+        and views[view_id].get("checksum")
+        and os.path.isfile(str(views[view_id].get("path") or ""))
+        and os.path.getsize(str(views[view_id].get("path") or "")) > 1000
+        for view_id in required_views
+    )
+    if (
+        reference.get("approved") is True
+        and reference.get("checksum")
+        and views_valid
+        and path
+        and os.path.isfile(path)
+        and os.path.getsize(path) > 1000
+    ):
+        return path
+    return None
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _trusted_resumed_cast_reference(path: str) -> bool:
+    candidate = Path(path).resolve()
+    if candidate.parent.name != "output" or not candidate.is_file():
+        return False
+    trust_path = candidate.parent / ".validated_cast_reference_resume.json"
+    try:
+        payload = json.loads(trust_path.read_text(encoding="utf-8"))
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        OSError,
+        UnicodeDecodeError,
+    ):
+        return False
+    if not isinstance(payload, dict) or payload.get("schema_version") != "1.0":
+        return False
+    assets = payload.get("assets")
+    if not isinstance(assets, list) or not 0 < len(assets) <= 128:
+        return False
+    for asset in assets:
+        if not isinstance(asset, dict) or asset.get("name") != candidate.name:
+            continue
+        checksum = str(asset.get("sha256") or "").lower()
+        return bool(
+            re.fullmatch(r"[0-9a-f]{64}", checksum)
+            and _file_sha256(str(candidate)) == checksum
+        )
+    return False
+
+
+def _begin_cast_reference_revision(character: Dict[str, Any]) -> None:
+    reference = character.setdefault("reference", {})
+    reference["pending_from_checksum"] = str(reference.get("checksum") or "")
+    reference["pending_from_version"] = max(1, int(reference.get("version") or 1))
+    reference.update(
+        {
+            "status": "generating",
+            "approved": False,
+            "automatic_approved": False,
+            "human_approved": False,
+            "path": "",
+            "required_views": list(CAST_REFERENCE_VIEWS),
+            "views": {
+                view_id: {
+                    "status": "pending",
+                    "approved": False,
+                    "automatic_approved": False,
+                    "human_approved": False,
+                    "path": "",
+                    "checksum": "",
+                    "quality": {},
+                }
+                for view_id in CAST_REFERENCE_VIEWS
+            },
+        }
+    )
+
+
+def _update_cast_reference(
+    character: Dict[str, Any],
+    reference_path: str,
+    image_metric: Dict[str, Any] | None,
+    view_id: str = "three_quarter",
+    human_approved: bool = False,
+) -> bool:
+    if view_id not in CAST_REFERENCE_VIEWS:
+        raise ValueError(f"unknown_cast_reference_view:{view_id}")
+    accepted = bool(
+        _character_reference_accepted(image_metric)
+        and os.path.isfile(reference_path)
+        and os.path.getsize(reference_path) > 1000
+    )
+    reference = character.setdefault("reference", {})
+    reference.setdefault("required_views", list(CAST_REFERENCE_VIEWS))
+    views = reference.setdefault("views", {})
+    view = views.setdefault(view_id, {})
+    view.update(
+        {
+            "status": (
+                "approved"
+                if accepted and human_approved
+                else "pending_human_review" if accepted else "rejected"
+            ),
+            "automatic_approved": accepted,
+            "human_approved": bool(accepted and human_approved),
+            "approved": bool(accepted and human_approved),
+            "path": reference_path if accepted else "",
+            "checksum": _file_sha256(reference_path) if accepted else "",
+            "quality": {
+                "quality_score": (
+                    image_metric.get("quality_score") if image_metric else None
+                ),
+                "semantic_score": (
+                    image_metric.get("semantic_score") if image_metric else None
+                ),
+                "technical_accepted": (
+                    image_metric.get("technical_accepted") if image_metric else False
+                ),
+                "semantic_accepted": (
+                    image_metric.get("semantic_accepted") if image_metric else False
+                ),
+                "semantic_critical_failures": (
+                    list(image_metric.get("semantic_critical_failures", []))
+                    if image_metric
+                    else []
+                ),
+                "semantic_evidence": (
+                    list(image_metric.get("semantic_qa_evidence", []))[:20]
+                    if image_metric
+                    else []
+                ),
+                "identity_score": (
+                    image_metric.get("identity_score") if image_metric else None
+                ),
+                "identity_accepted": (
+                    image_metric.get("identity_accepted") if image_metric else None
+                ),
+                "character_identity": (
+                    list(image_metric.get("character_identity", []))[:4]
+                    if image_metric
+                    else []
+                ),
+                "issues": list(image_metric.get("issues", [])) if image_metric else [],
+            },
+        }
+    )
+    required_views = reference["required_views"]
+    automatic_pack_approved = bool(required_views) and all(
+        views.get(required_view, {}).get("automatic_approved") is True
+        for required_view in required_views
+    )
+    if not automatic_pack_approved:
+        reference.update(
+            {
+                "status": "references_pending" if accepted else "rejected",
+                "automatic_approved": False,
+                "human_approved": False,
+                "approved": False,
+                "path": "",
+            }
+        )
+        return False
+
+    checksum_source = "|".join(
+        f"{required_view}:{views[required_view]['checksum']}"
+        for required_view in required_views
+    )
+    checksum = hashlib.sha256(checksum_source.encode("utf-8")).hexdigest()
+    previous_checksum = str(reference.pop("pending_from_checksum", "") or "")
+    previous_version = max(1, int(reference.pop("pending_from_version", 1) or 1))
+    version = (
+        previous_version + 1
+        if previous_checksum and checksum != previous_checksum
+        else previous_version
+    )
+    primary_view = views["three_quarter"]
+    human_pack_approved = all(
+        views.get(required_view, {}).get("human_approved") is True
+        for required_view in required_views
+    )
+    reference.update(
+        {
+            "status": "approved" if human_pack_approved else "pending_human_review",
+            "automatic_approved": True,
+            "human_approved": human_pack_approved,
+            "approved": human_pack_approved,
+            "path": primary_view["path"],
+            "version": version,
+            "checksum": checksum,
+            "quality": dict(primary_view.get("quality") or {}),
+        }
+    )
+    character_id = str(character.get("id") or "character")
+    lora = character.setdefault("lora", {})
+    expected_name = f"char_{character_id}_v{version}.safetensors"
+    lora.update(
+        {
+            "expected_name": expected_name,
+            "trigger_token": f"char_{character_id}_v{version}",
+        }
+    )
+    configured_name = os.getenv(str(lora.get("env_key") or ""), "").strip()
+    if not configured_name:
+        lora["status"] = "unconfigured"
+        lora["name"] = ""
+    elif Path(configured_name).name == expected_name:
+        lora["status"] = "configured"
+        lora["name"] = configured_name
+    else:
+        lora["status"] = "stale"
+        lora["name"] = configured_name
+    return human_pack_approved
+
+
+def _scene_cast_reference_versions(
+    scene: Dict[str, Any], visual_bible: Dict[str, Any]
+) -> Dict[str, Dict[str, object]]:
+    versions: Dict[str, Dict[str, object]] = {}
+    for character in _scene_cast_characters(scene, visual_bible):
+        reference = character.get("reference") or {}
+        versions[str(character["id"])] = {
+            "version": max(1, int(reference.get("version") or 1)),
+            "checksum": str(reference.get("checksum") or ""),
+            "human_approved": reference.get("human_approved") is True,
+            "human_reviewed_at": str(reference.get("human_reviewed_at") or ""),
+        }
+    return versions
+
+
+def _set_cast_reference_human_approval(
+    character: Dict[str, Any], approved: bool
+) -> Dict[str, Any]:
+    reference = character.get("reference") or {}
+    required_views = list(reference.get("required_views") or [])
+    views = reference.get("views") or {}
+    if not required_views or reference.get("automatic_approved") is not True:
+        raise ValueError("cast_reference_automatic_gate_not_passed")
+    for view_id in required_views:
+        view = views.get(view_id) or {}
+        path = str(view.get("path") or "")
+        if (
+            view.get("automatic_approved") is not True
+            or not path
+            or not os.path.isfile(path)
+            or os.path.getsize(path) <= 1000
+            or _file_sha256(path) != view.get("checksum")
+        ):
+            raise ValueError(f"cast_reference_view_invalid:{view_id}")
+        view.update(
+            {
+                "human_approved": approved,
+                "approved": approved,
+                "status": "approved" if approved else "rejected_by_human",
+            }
+        )
+    reference.update(
+        {
+            "human_approved": approved,
+            "approved": approved,
+            "status": "approved" if approved else "rejected_by_human",
+            "human_reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    if not approved:
+        lora = character.setdefault("lora", {})
+        lora["status"] = "stale" if lora.get("name") else "unconfigured"
+    return reference
+
+
+def _refresh_cast_bible_status(
+    visual_bible: Dict[str, Any], required_characters: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    cast_bible = visual_bible.setdefault("cast_bible", {})
+    approved_ids = [
+        str(character["id"])
+        for character in required_characters
+        if _approved_cast_reference_path(character)
+    ]
+    missing_ids = [
+        str(character["id"])
+        for character in required_characters
+        if str(character["id"]) not in approved_ids
+    ]
+    cast_bible.update(
+        {
+            "approved_reference_ids": approved_ids,
+            "missing_reference_ids": missing_ids,
+            "status": (
+                "not_required"
+                if not required_characters
+                else "approved" if not missing_ids else "blocked"
+            ),
+        }
+    )
+    return cast_bible
+
+
+def _cast_reference_waiting_stage(
+    required_characters: Sequence[Dict[str, Any]],
+) -> str:
+    automatic_ready = bool(required_characters) and all(
+        (character.get("reference") or {}).get("automatic_approved") is True
+        for character in required_characters
+    )
+    return (
+        "awaiting_cast_reference_approval"
+        if automatic_ready
+        else "awaiting_cast_reference_regeneration"
+    )
+
+
+def _scene_reference_image_path(
+    scene: Dict[str, Any], visual_bible: Dict[str, Any]
+) -> str | None:
+    scene_characters = _scene_cast_characters(scene, visual_bible)
+    ordered = sorted(
+        scene_characters,
+        key=lambda character: 0 if character.get("role") == "protagonist" else 1,
+    )
+    for character in ordered:
+        reference_path = _approved_cast_reference_path(character)
+        if reference_path:
+            return reference_path
+    return None
+
+
+def _fal_reference_limit() -> int:
+    return max(
+        1,
+        min(
+            12,
+            _safe_int(os.getenv("FAL_REFERENCE_MAX_IMAGES"), 6),
+        ),
+    )
+
+
+def _scene_reference_image_paths(
+    scene: Dict[str, Any], visual_bible: Dict[str, Any]
+) -> List[str]:
+    ordered_characters = sorted(
+        _scene_cast_characters(scene, visual_bible),
+        key=lambda character: 0 if character.get("role") == "protagonist" else 1,
+    )
+    selected: List[str] = []
+    view_priority = ("three_quarter", "full_body", "front")
+    for character in ordered_characters:
+        if not _approved_cast_reference_path(character):
+            continue
+        reference = character.get("reference") or {}
+        views = reference.get("views") or {}
+        for view_id in view_priority:
+            view = views.get(view_id) or {}
+            path = str(view.get("path") or "").strip()
+            if (
+                view.get("approved") is True
+                and view.get("human_approved") is True
+                and path
+                and os.path.isfile(path)
+                and os.path.getsize(path) > 1000
+                and path not in selected
+            ):
+                selected.append(path)
+                if len(selected) >= _fal_reference_limit():
+                    return selected
+    return selected
+
+
+def _character_identity_reference_paths(
+    character: Dict[str, Any],
+) -> List[str]:
+    if not _approved_cast_reference_path(character):
+        return []
+    views = (character.get("reference") or {}).get("views") or {}
+    selected: List[str] = []
+    for view_id in (
+        "front",
+        "expression_neutral",
+        "expression_concerned",
+        "three_quarter",
+    ):
+        view = views.get(view_id) or {}
+        path = str(view.get("path") or "").strip()
+        if (
+            view.get("approved") is True
+            and view.get("human_approved") is True
+            and path
+            and os.path.isfile(path)
+            and os.path.getsize(path) > 1000
+            and path not in selected
+        ):
+            selected.append(path)
+    return selected[:3]
+
+
+def _contrastive_identity_reference_paths(
+    visual_bible: Dict[str, Any],
+    *,
+    excluded_character_id: str,
+) -> List[str]:
+    references: List[str] = []
+    for character in visual_bible.get("cast_bible", {}).get("characters", []):
+        if str(character.get("id")) == excluded_character_id:
+            continue
+        references.extend(_character_identity_reference_paths(character))
+        if len(references) >= 12:
+            break
+    return list(dict.fromkeys(references))[:12]
+
+
+def _fal_reference_label(
+    reference_image_path: str,
+    visual_bible: Dict[str, Any],
+) -> str:
+    normalized_path = os.path.abspath(reference_image_path)
+    for character in visual_bible.get("cast_bible", {}).get("characters", []):
+        reference = character.get("reference") or {}
+        for view_id, view in (reference.get("views") or {}).items():
+            path = str((view or {}).get("path") or "").strip()
+            if path and os.path.abspath(path) == normalized_path:
+                return f"{character.get('name') or character.get('id')} ({view_id})"
+    return Path(reference_image_path).stem
+
+
+def _reference_character_name(
+    reference_image_path: str | None, visual_bible: Dict[str, Any]
+) -> str:
+    if not reference_image_path:
+        return "the primary character"
+    normalized_path = os.path.abspath(reference_image_path)
+    for character in visual_bible.get("cast_bible", {}).get("characters", []):
+        approved_path = _approved_cast_reference_path(character)
+        if approved_path and os.path.abspath(approved_path) == normalized_path:
+            return str(character["name"])
+    return "the primary character"
+
+
+def _identity_retry_reference_path(
+    image_metric: Dict[str, Any],
+    visual_bible: Dict[str, Any],
+    current_reference_path: str | None,
+) -> str | None:
+    failed_character_ids = [
+        str(assessment.get("character_id"))
+        for assessment in image_metric.get("character_identity", [])
+        if assessment.get("accepted") is False and assessment.get("character_id")
+    ]
+    if not failed_character_ids:
+        for failure in image_metric.get("semantic_critical_failures", []):
+            failure_code = str(failure)
+            if failure_code.startswith("identity_mismatch_"):
+                failed_character_ids.append(
+                    failure_code.removeprefix("identity_mismatch_")
+                )
+    for character_id in failed_character_ids:
+        character = _cast_character(visual_bible, character_id)
+        if character:
+            reference_path = _approved_cast_reference_path(character)
+            if reference_path:
+                return reference_path
+    return current_reference_path
 
 
 def _motion_plan(scene: Dict[str, Any]) -> Dict[str, str]:
@@ -1169,6 +3085,39 @@ def _build_image_prompt(
     must_not_include = ", ".join(
         str(item) for item in scene.get("must_not_include", []) if item
     )
+    if scene.get("scene_role") == "character_reference":
+        view_id = str(scene.get("reference_view_id") or "three_quarter")
+        view_contract = CAST_REFERENCE_VIEWS.get(
+            view_id,
+            CAST_REFERENCE_VIEWS["three_quarter"],
+        )
+        retry_clause = (
+            f" Correct only these previous QA failures: {retry_instruction.strip()}."
+            if retry_instruction.strip()
+            else ""
+        )
+        return re.sub(
+            r"\s+",
+            " ",
+            (
+                "Production character turnaround reference, not a narrative scene. "
+                "This is a technical Cast Bible asset, never a film still or story frame. "
+                f"Target view: {view_contract}. "
+                f"Identity and wardrobe contract: {base_prompt[:900]}. "
+                f"Must include: {must_include[:500]}. "
+                f"Must not include: {must_not_include[:420]}. "
+                f"Rendering medium: {style['prompt'][:260]}. "
+                "When an input image is supplied, it is the canonical identity anchor: "
+                "preserve the exact same fictional character, apparent age, face geometry, "
+                "hair, eye color, wardrobe, body proportions, linework and palette. Change "
+                "only the requested camera angle, framing, pose or expression. "
+                "Show exactly one subject centered in one vertical 9:16 image. Use a flat, "
+                "uniform, plain warm-gray studio backdrop with no scenery. No landscape, "
+                "garden, trees, architecture, furniture, room, props, story action, contact "
+                "sheet, split panel, border, text, logo or watermark."
+                f"{retry_clause}"
+            ),
+        ).strip()[:3000]
     scene_text = _scene_text(scene)
     scene_contract = _build_scene_contract(scene)
     shot_plan = _shot_plan(scene)
@@ -1232,12 +3181,13 @@ def _build_image_prompt(
         "; ".join(scene_contract["animal_rules"])
         or "only show animals and objects explicitly requested by this scene"
     )[:350]
+    scene_identity = _scene_cast_identity_text(scene, visual_bible)
     compact_bible = (
         f"Film style: {visual_bible.get('style_label', style['label'])}; "
         f"medium: {style['prompt'][:180]}; "
-        f"protagonist: {str(visual_bible.get('protagonist_identity', visual_bible.get('protagonist', 'consistent named protagonist')))[:180]}; "
+        f"scene cast identity: {scene_identity[:420]}; "
         f"palette: {str(visual_bible.get('palette', ''))[:100]}."
-    )[:560]
+    )[:820]
     return (
         f"Scene-first instruction: {description[:360]}. "
         f"Visual prompt: {base_prompt[:520]}. "
@@ -1283,11 +3233,7 @@ def _build_flux2_image_prompt(
     identity = (
         "no character, person, face, hand or body is allowed in this prop reference"
         if is_prop_reference
-        else str(
-            (visual_bible or {}).get("protagonist_identity")
-            or (visual_bible or {}).get("protagonist")
-            or "keep every named character consistent with the film"
-        ).strip()
+        else _scene_cast_identity_text(scene, visual_bible or {}).strip()
     )
     required = "; ".join(str(item) for item in contract["required"] if item)
     forbidden_items = [str(item) for item in contract["forbidden"] if item]
@@ -1319,6 +3265,7 @@ def _build_flux2_image_prompt(
         if retry_instruction.strip()
         else ""
     )
+    lora_trigger_tokens = _scene_lora_trigger_tokens(scene, visual_bible or {})
     opening = (
         "Create one isolated vertical 9:16 prop design reference on a plain neutral background."
         if is_prop_reference
@@ -1339,7 +3286,8 @@ def _build_flux2_image_prompt(
         if is_prop_reference
         else (
             "No visible text, caption, border, watermark, character duplication, unrelated people, "
-            "adult-looking child, distorted anatomy or mixed visual medium."
+            "adult-looking child, distorted anatomy, contact sheet, split panel, storyboard grid, "
+            "multiple frames or mixed visual medium."
         )
     )
     sections = [
@@ -1347,6 +3295,11 @@ def _build_flux2_image_prompt(
         f"Story action: {compact(description, 500)}",
         f"Required subjects and facts: {compact(required, 900)}",
         f"Character identity: {compact(identity, 420)}",
+        (
+            f"Identity/style trigger tokens: {lora_trigger_tokens}"
+            if lora_trigger_tokens
+            else ""
+        ),
         (
             f"Camera: {shot['shot_type']}; {shot['camera_angle']}. "
             f"Blocking: {shot['blocking']}. Focus priority: {shot['focal_priority']}."
@@ -1464,6 +3417,7 @@ def _build_qwen_semantic_edit_prompt(
     *,
     masked_edit: bool = False,
     prop_reference_slot: int = 3,
+    character_reference_name: str = "Alice",
 ) -> str:
     contract = _build_scene_contract(scene)
     required = "; ".join(str(item) for item in contract.get("required", []) if item)
@@ -1472,6 +3426,101 @@ def _build_qwen_semantic_edit_prompt(
     )
     forbidden = "; ".join(str(item) for item in contract.get("forbidden", []) if item)
     scene_text = _scene_text(scene)
+    if scene.get("scene_role") == "character_reference":
+        view_id = str(scene.get("reference_view_id") or "three_quarter")
+        source_role = str(scene.get("qwen_source_role") or "identity_anchor")
+        character_kind = str(scene.get("character_kind") or "human").lower()
+        view_prompt = CAST_REFERENCE_VIEWS.get(
+            view_id, CAST_REFERENCE_VIEWS["three_quarter"]
+        )
+        full_body_anatomy = (
+            "Use natural human hands and feet with ordinary period shoes. Never generate "
+            "paws, claws, talons, hooves, animal toes or animal limbs."
+            if character_kind == "human"
+            else (
+                "Use species-correct paws or feet. Never generate human hands, human feet "
+                "or shoes."
+            )
+        )
+        full_body_extent = (
+            "from head through both shoes"
+            if character_kind == "human"
+            else "from head through every species-correct paw or foot"
+        )
+        target_enforcement = {
+            "front": (
+                "Keep the face and torso square to camera, with both eyes symmetrical and "
+                "the gaze directed at the lens."
+            ),
+            "three_quarter": (
+                "Do not return the original frontal view. Rotate the head and shoulders "
+                "visibly by 25 degrees. Keep both eyes fully visible, retain the far eyebrow "
+                "and far cheek, and keep the nose inside the far-cheek silhouette."
+            ),
+            "profile": (
+                "Do not return a frontal or three-quarter view. Rotate the head exactly 90 "
+                "degrees to the character's left. Show exactly one eye, one eyebrow and one "
+                "ear, with the nose and lips breaking the facial silhouette. Preserve the "
+                "canonical preteen cheek, jaw and forehead proportions. Do not invent a mole, "
+                "beauty mark, isolated dark facial spot or any facial feature absent from the "
+                "canonical identity anchor."
+            ),
+            "full_body": (
+                f"Zoom out and redraw the complete body {full_body_extent}. "
+                "Leave clear background margin above the head and below both feet; reject any "
+                "chest-up, waist-up, seated or cropped composition. "
+                f"{full_body_anatomy}"
+            ),
+            "expression_neutral": (
+                "Keep the front camera angle and change only the face to a calm neutral expression."
+            ),
+            "expression_warm": (
+                "Keep the front camera angle and change only the face to a subtle warm expression."
+            ),
+            "expression_concerned": (
+                "Keep the front camera angle and change only the face to a restrained concerned expression."
+            ),
+        }.get(view_id, "Obey the target view without changing character identity.")
+        identity_prompt = str(scene.get("prompt") or scene.get("description") or "")
+        source_contract = (
+            "Image 1 is a neutral geometric pose and framing guide; it contains no character "
+            "identity and must not be copied as line art. Image 2 is the sole canonical "
+            "identity anchor. Replace the guide with the exact fictional character from Image "
+            "2 while preserving Image 1's camera angle, pose and framing."
+            if source_role == "pose_guide"
+            else (
+                "Image 1 is the sole canonical identity anchor and the latent canvas. Preserve "
+                "its exact fictional character identity, age, hair, wardrobe and rendering "
+                "style. Image 2 is only a neutral geometric pose guide for camera angle and "
+                "framing; never copy its lines, polygons, blank face or simplified anatomy."
+                if source_role == "identity_latent_pose_reference"
+                else (
+                    "Image 1 is the sole canonical identity anchor and the only source image. "
+                    "Preserve its exact fictional character identity, age, hair, wardrobe and "
+                    "rendering style. Rotate the existing character through the requested camera "
+                    "angle without adding a second face, duplicated features or guide geometry."
+                    if source_role == "identity_anchor_only"
+                    else (
+                        "Image 1 and Image 2 show the canonical identity anchor for this fictional "
+                        "character."
+                    )
+                )
+            )
+        )
+        prompt = (
+            f"{source_contract} Create one new production identity reference derived from that exact "
+            "character, not a redesign. Preserve the same face geometry, apparent age, hair or "
+            "coat pattern, eye color, wardrobe design, body proportions, linework, palette and "
+            "rendering medium. Change only the camera view, body framing or facial expression "
+            f"needed for this target. Hard framing contract: {view_prompt}. The framing, "
+            "camera angle and expression contract are mandatory and must not be improvised. "
+            "Use one subject on a plain warm gray studio background in a single 9:16 image. "
+            "No contact sheet, split panel, duplicate, props, story action, text, logo or "
+            f"watermark. Target-only enforcement: {target_enforcement} "
+            f"Generation direction: {directed_prompt[:600]}. "
+            f"Identity contract: {identity_prompt[:900]}."
+        )
+        return re.sub(r"\s+", " ", prompt).strip()[:3000]
     spatial_constraints = ""
     if _text_has_any_phrase(
         scene_text,
@@ -1502,11 +3551,10 @@ def _build_qwen_semantic_edit_prompt(
         "Image 1 is a rejected draft, not an approved identity reference. "
         "Lock Image 1 canvas dimensions, portrait aspect ratio, camera position, "
         "room geometry and subject blocking; do not crop, zoom or turn it square. "
-        "When Image 2 is provided, it is the approved Alice identity and age "
-        "reference; replace Alice in Image 1 with the same unmistakably ten-year-old "
-        "child from Image 2. Preserve her round preteen facial family, exact hair, "
-        "flat child torso, short child proportions and modest ivory Victorian dress. "
-        "Never age her into a teenager or adult and never add makeup or adult curves. "
+        f"When Image 2 is provided, it is the approved identity reference for {character_reference_name}; "
+        f"replace {character_reference_name} in Image 1 with the same unmistakable character from Image 2. "
+        "Preserve the approved face family, age group, hair or coat design, wardrobe silhouette and body proportions. "
+        "Never change the character's age group, gender, species or defining design anchors. "
         "When Image 3 is provided, it is the approved hero-object design reference; "
         "copy its compact bowl geometry, separate lid, teaspoon scale and tiny mouse "
         "visibility into the masked tabletop region without copying its background. "
@@ -1577,9 +3625,156 @@ def _replace_scene_asset(
 
 def _image_generation_provider() -> str:
     provider = os.getenv("IMAGE_GENERATION_PROVIDER", "comfyui").strip().lower()
-    if provider not in {"gemini", "comfyui"}:
+    aliases = {
+        "fal_flux": "fal",
+        "fal_flux1": "fal",
+        "fal.ai": "fal",
+    }
+    provider = aliases.get(provider, provider)
+    if provider not in {"gemini", "comfyui", "fal"}:
         return "comfyui"
     return provider
+
+
+def _fal_flux_model() -> str:
+    return os.getenv("FAL_FLUX_MODEL_ID", "fal-ai/flux/schnell").strip()
+
+
+def _fal_flux_is_schnell(model_name: str) -> bool:
+    return model_name.rstrip("/") == "fal-ai/flux/schnell"
+
+
+def _fal_flux_generation_method(model_name: str) -> str:
+    return "fal_flux1_schnell" if _fal_flux_is_schnell(model_name) else "fal_flux1"
+
+
+def _fal_instant_character_model() -> str:
+    return os.getenv(
+        "FAL_INSTANT_CHARACTER_MODEL_ID",
+        "fal-ai/instant-character",
+    ).strip()
+
+
+def _fal_flux_pulid_model() -> str:
+    return os.getenv(
+        "FAL_FLUX_PULID_MODEL_ID",
+        "fal-ai/flux-pulid",
+    ).strip()
+
+
+def _fal_reference_edit_model() -> str:
+    return os.getenv(
+        "FAL_REFERENCE_EDIT_MODEL_ID",
+        "fal-ai/nano-banana/edit",
+    ).strip()
+
+
+def _fal_cast_reference_strategy(
+    *,
+    character_kind: str,
+    derived_reference_view: bool,
+    has_anchor: bool,
+) -> Literal["flux_schnell", "nano_banana_edit"]:
+    del character_kind
+    if not derived_reference_view or not has_anchor:
+        return "flux_schnell"
+    return "nano_banana_edit"
+
+
+def _fal_kling_model() -> str:
+    return os.getenv(
+        "FAL_KLING_MODEL_ID",
+        "fal-ai/kling-video/v3/standard/image-to-video",
+    ).strip()
+
+
+def _fal_kling_lipsync_model() -> str:
+    return os.getenv(
+        "FAL_KLING_LIPSYNC_MODEL_ID",
+        "fal-ai/kling-video/lipsync/audio-to-video",
+    ).strip()
+
+
+def _fal_lipsync_enabled() -> bool:
+    return os.getenv("FAL_KLING_LIPSYNC_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
+
+def _video_generation_provider() -> str:
+    provider = os.getenv("VIDEO_GENERATION_PROVIDER", "runway").strip().lower()
+    aliases = {
+        "fal": "fal_kling",
+        "kling": "fal_kling",
+        "kling3": "fal_kling",
+        "fal.ai": "fal_kling",
+    }
+    provider = aliases.get(provider, provider)
+    return provider if provider in {"runway", "fal_kling"} else "runway"
+
+
+def _fal_scene_loras(
+    scene: Dict[str, Any],
+    visual_bible: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    loras: List[Dict[str, Any]] = []
+    style_lora_url = os.getenv("FAL_STYLE_LORA_URL", "").strip()
+    if style_lora_url:
+        loras.append(
+            {
+                "path": validate_external_url(
+                    style_lora_url,
+                    allowed_host_suffixes=(
+                        "fal.media",
+                        "huggingface.co",
+                        "hf.co",
+                    ),
+                ),
+                "scale": max(
+                    0.0,
+                    min(
+                        2.0,
+                        _safe_float(os.getenv("FAL_STYLE_LORA_SCALE"), 0.75),
+                    ),
+                ),
+            }
+        )
+    for character in _scene_cast_characters(scene, visual_bible):
+        character_id = re.sub(
+            r"[^A-Z0-9]+",
+            "_",
+            str(character.get("id") or "").upper(),
+        ).strip("_")
+        if not character_id:
+            continue
+        lora_url = os.getenv(f"FAL_CHARACTER_LORA_{character_id}_URL", "").strip()
+        if not lora_url:
+            continue
+        loras.append(
+            {
+                "path": validate_external_url(
+                    lora_url,
+                    allowed_host_suffixes=(
+                        "fal.media",
+                        "huggingface.co",
+                        "hf.co",
+                    ),
+                ),
+                "scale": max(
+                    0.0,
+                    min(
+                        2.0,
+                        _safe_float(
+                            os.getenv(f"FAL_CHARACTER_LORA_{character_id}_SCALE"),
+                            0.9,
+                        ),
+                    ),
+                ),
+            }
+        )
+    return loras
 
 
 def _gemini_image_model(quality_preset_key: str) -> str:
@@ -2113,6 +4308,7 @@ def _build_flux2_klein_workflow(
     quality_preset: Mapping[str, object],
     scene_seed: int,
     scene_id: object,
+    lora_stack: Sequence[Mapping[str, object]] | None = None,
 ) -> Dict[str, Dict[str, object]]:
     """Build the official ComfyUI FLUX.2 Klein Base 4B text-to-image graph."""
     diffusion_model, text_encoder, vae_model = _comfyui_flux2_model_names()
@@ -2126,7 +4322,7 @@ def _build_flux2_klein_workflow(
         dimensions[key] = value
     width = dimensions["width"]
     height = dimensions["height"]
-    return {
+    workflow: Dict[str, Dict[str, object]] = {
         "1": {
             "inputs": {
                 "unet_name": diffusion_model,
@@ -2205,6 +4401,27 @@ def _build_flux2_klein_workflow(
             "class_type": "SaveImage",
         },
     }
+    current_model: list[object] = ["1", 0]
+    for index, lora in enumerate(list(lora_stack or [])[:3], start=20):
+        lora_name = _validated_lora_name(str(lora.get("name") or ""))
+        raw_strength = lora.get("strength", 0.85)
+        if isinstance(raw_strength, bool) or not isinstance(raw_strength, (int, float)):
+            raise ValueError("invalid_flux2_lora_strength")
+        strength = float(raw_strength)
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("invalid_flux2_lora_strength")
+        node_id = str(index)
+        workflow[node_id] = {
+            "inputs": {
+                "model": current_model,
+                "lora_name": lora_name,
+                "strength_model": strength,
+            },
+            "class_type": "LoraLoaderModelOnly",
+        }
+        current_model = [node_id, 0]
+    workflow["7"]["inputs"]["model"] = current_model
+    return workflow
 
 
 def _build_qwen_image_edit_2511_workflow(
@@ -2217,6 +4434,7 @@ def _build_qwen_image_edit_2511_workflow(
     prop_reference_image_name: str | None = None,
     inpaint_image_name: str | None = None,
     inpaint_denoise: float | None = None,
+    edit_denoise: float | None = None,
 ) -> Dict[str, Dict[str, object]]:
     """Build the native ComfyUI Qwen-Image-Edit-2511 semantic repair graph."""
     diffusion_model, text_encoder, vae_model = _comfyui_qwen_edit_model_names()
@@ -2295,7 +4513,11 @@ def _build_qwen_image_edit_2511_workflow(
                 "cfg": 3.0,
                 "sampler_name": "euler",
                 "scheduler": "simple",
-                "denoise": 1.0,
+                "denoise": (
+                    1.0
+                    if edit_denoise is None
+                    else max(0.2, min(1.0, float(edit_denoise)))
+                ),
                 "model": ["10", 0],
                 "positive": ["8", 0],
                 "negative": ["9", 0],
@@ -2670,7 +4892,11 @@ def _submit_runpod_job(
     run_url: str,
     request_payload: Mapping[str, object],
     headers: Mapping[str, str],
-) -> tuple[requests.Response, List[Dict[str, int | str]]]:
+    api_key: str = "",
+    endpoint_id: str = "",
+    budget_scope: str = "",
+    estimated_max_cost_usd: float = 0.0,
+) -> tuple[requests.Response, List[Dict[str, float | int | str]]]:
     """Submit once, with one bounded retry for RunPod capacity propagation."""
     retry_seconds = max(
         0,
@@ -2682,7 +4908,13 @@ def _submit_runpod_job(
             ),
         ),
     )
-    submission_attempts: List[Dict[str, int | str]] = []
+    submission_attempts: List[Dict[str, float | int | str]] = []
+    reservation = reserve_runpod_job_budget(
+        api_key=api_key,
+        endpoint_id=endpoint_id,
+        budget_scope=budget_scope,
+        estimated_max_cost_usd=estimated_max_cost_usd,
+    )
 
     response = requests.post(
         run_url,
@@ -2690,7 +4922,19 @@ def _submit_runpod_job(
         headers=headers,
         timeout=30,
     )
-    submission_attempts.append({"attempt": 1, "http_status": response.status_code})
+    first_attempt: Dict[str, float | int | str] = {
+        "attempt": 1,
+        "http_status": response.status_code,
+    }
+    if reservation["status"] != "disabled":
+        first_attempt.update(
+            {
+                "budget_status": str(reservation["status"]),
+                "budget_reserved_usd": float(reservation["reserved_usd"]),
+                "run_reserved_usd": float(reservation.get("run_reserved_usd", 0.0)),
+            }
+        )
+    submission_attempts.append(first_attempt)
 
     endpoint_paused = (
         response.status_code == 409 and "ENDPOINT_PAUSED" in response.text.upper()
@@ -2755,6 +4999,31 @@ def _apply_runpod_execution_telemetry(
     job_monitor["cost_estimate_status"] = "execution_time_unavailable"
 
 
+def _runpod_poll_timeout_reason(
+    status_payload: Mapping[str, object],
+    *,
+    max_queue_wait_seconds: int,
+    max_execution_wait_seconds: int,
+) -> str | None:
+    """Keep capacity wait separate from the paid inference deadline."""
+    status = str(status_payload.get("status") or "")
+    if status == "IN_QUEUE":
+        queue_seconds = max(
+            0.0,
+            _safe_float(status_payload.get("delayTime")) / 1000,
+        )
+        if queue_seconds >= max_queue_wait_seconds:
+            return f"queue_timeout_after_{max_queue_wait_seconds}s"
+    if status == "IN_PROGRESS":
+        execution_seconds = max(
+            0.0,
+            _safe_float(status_payload.get("executionTime")) / 1000,
+        )
+        if execution_seconds >= max_execution_wait_seconds:
+            return f"execution_timeout_after_{max_execution_wait_seconds}s"
+    return None
+
+
 def _run_comfyui_image_attempt(
     *,
     scene: Dict[str, Any],
@@ -2777,6 +5046,7 @@ def _run_comfyui_image_attempt(
     reference_image_path: str | None = None,
     prop_reference_image_path: str | None = None,
     semantic_repair_backend_override: str | None = None,
+    qwen_edit_denoise_override: float | None = None,
     qwen_inpaint_denoise_override: float | None = None,
     sdxl_inpaint_denoise_override: float | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
@@ -3006,6 +5276,9 @@ def _run_comfyui_image_attempt(
                 directed_prompt,
                 masked_edit=bool(qwen_inpaint_image_name),
                 prop_reference_slot=(3 if qwen_reference_image_name else 2),
+                character_reference_name=_reference_character_name(
+                    reference_image_path, visual_bible
+                ),
             ),
             input_image_name=qwen_edit_image_name,
             scene_seed=scene_seed,
@@ -3015,6 +5288,7 @@ def _run_comfyui_image_attempt(
             prop_reference_image_name=qwen_prop_reference_image_name,
             inpaint_image_name=qwen_inpaint_image_name,
             inpaint_denoise=qwen_inpaint_denoise_override,
+            edit_denoise=qwen_edit_denoise_override,
         )
         generation_method = (
             "comfyui_qwen_masked_image_edit_2511"
@@ -3027,6 +5301,7 @@ def _run_comfyui_image_attempt(
             quality_preset=quality_preset,
             scene_seed=scene_seed,
             scene_id=scene["scene_id"],
+            lora_stack=_flux2_scene_lora_stack(scene, visual_bible),
         )
         generation_method = "comfyui_flux2_klein"
     else:
@@ -3127,11 +5402,19 @@ def _run_comfyui_image_attempt(
         "inpaint_denoise": (
             (
                 qwen_inpaint_denoise_override
-                if qwen_edit_enabled and qwen_inpaint_denoise_override is not None
+                if qwen_edit_enabled
+                and qwen_inpaint_image_name
+                and qwen_inpaint_denoise_override is not None
                 else (
-                    _comfyui_qwen_inpaint_denoise()
+                    qwen_edit_denoise_override
                     if qwen_edit_enabled
-                    else _comfyui_inpaint_denoise()
+                    and not qwen_inpaint_image_name
+                    and qwen_edit_denoise_override is not None
+                    else (
+                        _comfyui_qwen_inpaint_denoise()
+                        if qwen_edit_enabled
+                        else _comfyui_inpaint_denoise()
+                    )
                 )
             )
             if effective_controlled_workflow
@@ -3153,6 +5436,44 @@ def _run_comfyui_image_attempt(
         "last_remote_status": None,
     }
 
+    max_execution_wait = max(
+        30,
+        min(
+            1_800,
+            _safe_int(os.getenv("COMFYUI_RUNPOD_MAX_WAIT_SECONDS", "120"), 120),
+        ),
+    )
+    max_queue_wait = max(
+        30,
+        min(
+            3_600,
+            _safe_int(
+                os.getenv("COMFYUI_RUNPOD_MAX_QUEUE_SECONDS", "900"),
+                900,
+            ),
+        ),
+    )
+    max_poll_wait = max_queue_wait + max_execution_wait + 30
+    reservation_seconds = max(
+        60,
+        min(
+            max_execution_wait,
+            _safe_int(
+                os.getenv("AI_FILM_RUNPOD_JOB_RESERVATION_SECONDS", "420"),
+                420,
+            ),
+        ),
+    )
+    estimated_max_cost_usd = round(
+        reservation_seconds * effective_gpu_usd_per_second,
+        6,
+    )
+    budget_scope = str(Path.cwd().resolve())
+    job_monitor["budget_reservation_seconds"] = reservation_seconds
+    job_monitor["budget_reservation_usd"] = estimated_max_cost_usd
+    job_monitor["max_queue_wait_seconds"] = max_queue_wait
+    job_monitor["max_execution_wait_seconds"] = max_execution_wait
+
     try:
         request_payload: Dict[str, Any] = {"input": {"workflow": workflow}}
         if input_images:
@@ -3161,9 +5482,25 @@ def _run_comfyui_image_attempt(
             run_url=run_url,
             request_payload=request_payload,
             headers=headers,
+            api_key=runpod_api_key,
+            endpoint_id=effective_endpoint_id,
+            budget_scope=budget_scope,
+            estimated_max_cost_usd=estimated_max_cost_usd,
         )
         job_monitor["submission_attempts"] = submission_attempts
+    except RunPodCostGuardError as exc:
+        job_monitor["status"] = "BUDGET_BLOCKED"
+        job_monitor["error"] = str(exc)
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
+        job_monitor["estimated_cost_usd"] = 0.0
+        job_monitor["cost_estimate_status"] = "blocked_before_submission"
+        return job_monitor, None, None
     except requests.RequestException as exc:
+        job_monitor["budget_settlement"] = settle_runpod_job_budget(
+            budget_scope=budget_scope,
+            reserved_usd=estimated_max_cost_usd,
+            actual_cost_usd=0.0,
+        )
         job_monitor["status"] = "SUBMIT_FAILED"
         job_monitor["error"] = f"{type(exc).__name__}: {exc}"
         job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
@@ -3172,6 +5509,11 @@ def _run_comfyui_image_attempt(
         return job_monitor, None, None
 
     if response.status_code != 200:
+        job_monitor["budget_settlement"] = settle_runpod_job_budget(
+            budget_scope=budget_scope,
+            reserved_usd=estimated_max_cost_usd,
+            actual_cost_usd=0.0,
+        )
         job_monitor["status"] = "SUBMIT_FAILED"
         job_monitor["error"] = f"HTTP {response.status_code}: {response.text[:300]}"
         job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
@@ -3183,9 +5525,8 @@ def _run_comfyui_image_attempt(
     job_monitor["job_id"] = job_id
     print(f"🆔 Job ID: {job_id}")
 
-    max_wait = int(os.getenv("COMFYUI_RUNPOD_MAX_WAIT_SECONDS", "120"))
     wait_time = 0
-    while wait_time < max_wait:
+    while wait_time < max_poll_wait:
         time.sleep(3)
         wait_time += 3
 
@@ -3204,6 +5545,11 @@ def _run_comfyui_image_attempt(
             )
             continue
 
+        if status_response.status_code == 402:
+            job_monitor["status"] = "PAYMENT_REQUIRED"
+            job_monitor["error"] = "HTTP 402: RunPod credits or billing unavailable"
+            job_monitor["cost_estimate_status"] = "billing_blocked"
+            break
         if status_response.status_code != 200:
             print(f"⚠️ Erro ao consultar status: {status_response.status_code}")
             continue
@@ -3218,6 +5564,21 @@ def _run_comfyui_image_attempt(
             effective_gpu_usd_per_second,
         )
         job_monitor["polls"].append({"status": job_status, "wait_seconds": wait_time})
+        timeout_reason = _runpod_poll_timeout_reason(
+            status_payload,
+            max_queue_wait_seconds=max_queue_wait,
+            max_execution_wait_seconds=max_execution_wait,
+        )
+        if timeout_reason:
+            job_monitor["status"] = (
+                "QUEUE_TIMEOUT"
+                if timeout_reason.startswith("queue_timeout")
+                else "LOCAL_TIMEOUT"
+            )
+            job_monitor["error"] = timeout_reason
+            if job_id:
+                _cancel_runpod_job(effective_endpoint_id, runpod_api_key, job_id)
+            break
 
         if job_status == "COMPLETED":
             images = status_payload.get("output", {}).get("images", [])
@@ -3237,6 +5598,14 @@ def _run_comfyui_image_attempt(
                 job_monitor["error"] = "invalid_decoded_image"
                 break
 
+            job_monitor["budget_settlement"] = settle_runpod_job_budget(
+                budget_scope=budget_scope,
+                reserved_usd=estimated_max_cost_usd,
+                actual_cost_usd=max(
+                    0.0,
+                    _safe_float(job_monitor.get("estimated_cost_usd")),
+                ),
+            )
             image_record = {
                 "scene_id": scene["scene_id"],
                 "image_path": image_path,
@@ -3266,16 +5635,20 @@ def _run_comfyui_image_attempt(
                 "qwen_prop_reference_image": qwen_prop_reference_image_name or "",
                 "refiner_enabled": refiner_enabled,
                 "refiner_checkpoint": refiner_checkpoint,
+                "cast_reference_versions": _scene_cast_reference_versions(
+                    scene, visual_bible
+                ),
             }
             job_monitor["image_path"] = image_path
             technical_metrics = _probe_image_quality(image_path, scene=scene)
-            semantic_metrics = _evaluate_image_semantics(
-                image_path,
-                scene,
-                directed_prompt,
-                image_style,
-                visual_bible,
-            )
+            with _LOCAL_SEMANTIC_QA_LOCK:
+                semantic_metrics = _evaluate_image_semantics(
+                    image_path,
+                    scene,
+                    directed_prompt,
+                    image_style,
+                    visual_bible,
+                )
             combined_metrics = _combine_image_quality(
                 technical_metrics,
                 semantic_metrics,
@@ -3301,6 +5674,9 @@ def _run_comfyui_image_attempt(
                 "qwen_prop_reference_image": qwen_prop_reference_image_name or "",
                 "refiner_enabled": refiner_enabled,
                 "refiner_checkpoint": refiner_checkpoint,
+                "cast_reference_versions": _scene_cast_reference_versions(
+                    scene, visual_bible
+                ),
                 **combined_metrics,
             }
             job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
@@ -3318,10 +5694,18 @@ def _run_comfyui_image_attempt(
 
     else:
         job_monitor["status"] = "LOCAL_TIMEOUT"
-        job_monitor["error"] = f"timeout_after_{max_wait}s"
+        job_monitor["error"] = f"poll_timeout_after_{max_poll_wait}s"
         if job_id:
             _cancel_runpod_job(effective_endpoint_id, runpod_api_key, job_id)
 
+    job_monitor["budget_settlement"] = settle_runpod_job_budget(
+        budget_scope=budget_scope,
+        reserved_usd=estimated_max_cost_usd,
+        actual_cost_usd=max(
+            0.0,
+            _safe_float(job_monitor.get("estimated_cost_usd")),
+        ),
+    )
     job_monitor["elapsed_seconds"] = round(time.monotonic() - job_started_at, 3)
     return job_monitor, None, None
 
@@ -3426,7 +5810,6 @@ def _run_gemini_image_attempt(
         return job_monitor, None, None
 
     try:
-        from google import genai
         from google.genai import errors, types
     except ImportError as exc:
         job_monitor["status"] = "SUBMIT_FAILED"
@@ -3442,7 +5825,11 @@ def _run_gemini_image_attempt(
     )
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = _build_google_genai_client(
+            api_key,
+            timeout_env="GEMINI_IMAGE_TIMEOUT_SECONDS",
+            default_timeout_seconds=180,
+        )
         contents: Any = generation_prompt
         if reference_image_path:
             reference_path = Path(reference_image_path)
@@ -3517,6 +5904,7 @@ def _run_gemini_image_attempt(
         ),
         "runpod_job_id": None,
         "generation_method": "gemini_image",
+        "cast_reference_versions": _scene_cast_reference_versions(scene, visual_bible),
     }
     technical_metrics = _probe_image_quality(image_path, scene=scene)
     semantic_metrics = _evaluate_image_semantics(
@@ -3535,6 +5923,858 @@ def _run_gemini_image_attempt(
         "quality_preset": quality_preset_key,
         "model": model_name,
         "seed": scene_seed,
+        "cast_reference_versions": _scene_cast_reference_versions(scene, visual_bible),
+        **combined_metrics,
+    }
+    job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
+    job_monitor["quality_score"] = combined_metrics.get("quality_score")
+    job_monitor["semantic_accepted"] = combined_metrics.get("semantic_accepted")
+    job_monitor["quality_issues"] = combined_metrics.get("issues", [])
+    return job_monitor, image_record, image_metric
+
+
+def _run_fal_flux_image_attempt(
+    *,
+    scene: Dict[str, Any],
+    image_path: str,
+    directed_prompt: str,
+    image_style: str,
+    style_label: str,
+    quality_preset_key: str,
+    quality_preset: Dict[str, Any],
+    scene_seed: int,
+    visual_bible: Dict[str, Any],
+    attempt: int,
+    reference_image_path: str | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    model_name = _fal_flux_model()
+    schnell_model = _fal_flux_is_schnell(model_name)
+    width = max(512, min(2048, _safe_int(quality_preset.get("width"), 1024)))
+    height = max(512, min(2048, _safe_int(quality_preset.get("height"), 1792)))
+    default_steps = 4 if schnell_model else _safe_int(quality_preset.get("steps"), 28)
+    max_steps = 12 if schnell_model else 50
+    acceleration = os.getenv("FAL_FLUX_ACCELERATION", "none").strip().lower()
+    if acceleration not in {"none", "regular", "high"}:
+        acceleration = "none"
+    started_at = time.monotonic()
+    job_monitor: Dict[str, Any] = {
+        "scene_id": scene["scene_id"],
+        "provider": "fal",
+        "service": "flux",
+        "job_id": None,
+        "status": "SUBMITTING",
+        "attempt": attempt,
+        "style": image_style,
+        "style_label": style_label,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "elapsed_seconds": 0.0,
+        "queue_seconds": 0.0,
+        "execution_seconds": 0.0,
+        "polls": [],
+        "error": None,
+        "image_path": None,
+        "reference_image_path": reference_image_path,
+        "identity_conditioning": (
+            "prompt_seed_only" if schnell_model else "reference_and_lora_capable"
+        ),
+        "reference_image_applied": False,
+        "lora_count": 0,
+        "estimated_cost_usd": flux_cost_estimate_usd(width, height),
+        "cost_estimate_status": "configured_model_rate",
+    }
+    inputs: Dict[str, Any] = {
+        "prompt": directed_prompt,
+        "image_size": {"width": width, "height": height},
+        "num_inference_steps": max(
+            1,
+            min(
+                max_steps,
+                _safe_int(
+                    os.getenv("FAL_FLUX_INFERENCE_STEPS"),
+                    default_steps,
+                ),
+            ),
+        ),
+        "guidance_scale": max(
+            0.0,
+            min(35.0, _safe_float(os.getenv("FAL_FLUX_GUIDANCE_SCALE"), 3.5)),
+        ),
+        "seed": scene_seed,
+        "num_images": 1,
+        "enable_safety_checker": True,
+        "output_format": "png",
+        "acceleration": acceleration,
+    }
+    advanced_model = model_name.startswith("fal-ai/flux-general")
+    lora_model = advanced_model or "flux-lora" in model_name
+    try:
+        if advanced_model:
+            inputs["negative_prompt"] = _scene_negative_prompt(scene)
+        loras = _fal_scene_loras(scene, visual_bible)
+        if loras and lora_model:
+            inputs["loras"] = loras
+            job_monitor["lora_count"] = len(loras)
+        if reference_image_path and advanced_model:
+            inputs["reference_image_url"] = file_to_data_uri(
+                reference_image_path,
+                max_bytes=20 * 1024 * 1024,
+                allowed_mime_types=(
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                ),
+            )
+            inputs["reference_strength"] = max(
+                0.0,
+                min(
+                    1.0,
+                    _safe_float(
+                        os.getenv("FAL_FLUX_REFERENCE_STRENGTH"),
+                        0.72,
+                    ),
+                ),
+            )
+            inputs["reference_start"] = 0.0
+            inputs["reference_end"] = 1.0
+            job_monitor["reference_image_applied"] = True
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_flux_input_error:{type(exc).__name__}:{exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    try:
+        client = FalQueueClient.from_environment()
+        result = client.run(model_name, inputs)
+        output_url = extract_image_url(result.data)
+        client.download(
+            output_url,
+            image_path,
+            max_bytes=40 * 1024 * 1024,
+            allowed_content_prefixes=("image/",),
+        )
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_flux_error:{type(exc).__name__}:{exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    job_monitor.update(
+        {
+            "job_id": result.request_id,
+            "status": "COMPLETED",
+            "elapsed_seconds": result.elapsed_seconds,
+            "queue_seconds": result.queue_seconds,
+            "execution_seconds": result.execution_seconds,
+            "polls": list(result.status_history),
+            "image_path": image_path,
+            "output_url": output_url,
+        }
+    )
+    if not (os.path.exists(image_path) and os.path.getsize(image_path) > 1000):
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "invalid_fal_flux_image"
+        return job_monitor, None, None
+
+    generation_method = _fal_flux_generation_method(model_name)
+    image_record = {
+        "scene_id": scene["scene_id"],
+        "image_path": image_path,
+        "source_url": output_url,
+        "prompt": directed_prompt,
+        "base_prompt": scene["prompt"],
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "duration": scene.get("duration", 6),
+        "camera_motion": scene.get(
+            "camera_motion",
+            _motion_plan(scene)["description"],
+        ),
+        "runpod_job_id": None,
+        "fal_request_id": result.request_id,
+        "generation_method": generation_method,
+        "cast_reference_versions": _scene_cast_reference_versions(scene, visual_bible),
+    }
+    technical_metrics = _probe_image_quality(image_path, scene=scene)
+    semantic_metrics = _evaluate_image_semantics(
+        image_path,
+        scene,
+        directed_prompt,
+        image_style,
+        visual_bible,
+    )
+    combined_metrics = _combine_image_quality(technical_metrics, semantic_metrics)
+    image_metric = {
+        "scene_id": scene["scene_id"],
+        "path": image_path,
+        "generation_method": generation_method,
+        "attempt": attempt,
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "fal_request_id": result.request_id,
+        "cast_reference_versions": _scene_cast_reference_versions(scene, visual_bible),
+        **combined_metrics,
+    }
+    job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
+    job_monitor["quality_score"] = combined_metrics.get("quality_score")
+    job_monitor["semantic_accepted"] = combined_metrics.get("semantic_accepted")
+    job_monitor["quality_issues"] = combined_metrics.get("issues", [])
+    return job_monitor, image_record, image_metric
+
+
+def _fal_nano_banana_aspect_ratio(width: int, height: int) -> str:
+    target = width / max(1, height)
+    candidates = {
+        "21:9": 21 / 9,
+        "16:9": 16 / 9,
+        "3:2": 3 / 2,
+        "4:3": 4 / 3,
+        "5:4": 5 / 4,
+        "1:1": 1.0,
+        "4:5": 4 / 5,
+        "3:4": 3 / 4,
+        "2:3": 2 / 3,
+        "9:16": 9 / 16,
+    }
+    return min(candidates, key=lambda ratio: abs(candidates[ratio] - target))
+
+
+def _run_fal_reference_edit_attempt(
+    *,
+    scene: Dict[str, Any],
+    image_path: str,
+    directed_prompt: str,
+    image_style: str,
+    style_label: str,
+    quality_preset_key: str,
+    quality_preset: Dict[str, Any],
+    scene_seed: int,
+    visual_bible: Dict[str, Any],
+    attempt: int,
+    reference_image_paths: Sequence[str],
+) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    model_name = _fal_reference_edit_model()
+    width = max(512, min(2048, _safe_int(quality_preset.get("width"), 1024)))
+    height = max(512, min(2048, _safe_int(quality_preset.get("height"), 1024)))
+    unique_reference_paths = list(dict.fromkeys(reference_image_paths))[
+        : _fal_reference_limit()
+    ]
+    reference_labels = [
+        _fal_reference_label(path, visual_bible) for path in unique_reference_paths
+    ]
+    started_at = time.monotonic()
+    job_monitor: Dict[str, Any] = {
+        "scene_id": scene["scene_id"],
+        "provider": "fal",
+        "service": "nano_banana_edit",
+        "job_id": None,
+        "status": "SUBMITTING",
+        "attempt": attempt,
+        "style": image_style,
+        "style_label": style_label,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "elapsed_seconds": 0.0,
+        "queue_seconds": 0.0,
+        "execution_seconds": 0.0,
+        "polls": [],
+        "error": None,
+        "image_path": None,
+        "reference_image_paths": unique_reference_paths,
+        "reference_labels": reference_labels,
+        "reference_image_count": len(unique_reference_paths),
+        "identity_conditioning": "canonical_multi_reference_edit",
+        "reference_image_applied": bool(unique_reference_paths),
+        "estimated_cost_usd": nano_banana_edit_cost_estimate_usd(1),
+        "cost_estimate_status": "provider_fixed_per_image_rate",
+    }
+    if not unique_reference_paths:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "fal_reference_edit_requires_reference"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    try:
+        reference_image_urls = [
+            file_to_data_uri(
+                path,
+                max_bytes=20 * 1024 * 1024,
+                allowed_mime_types=(
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                ),
+            )
+            for path in unique_reference_paths
+        ]
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = (
+            f"fal_reference_edit_input_error:{type(exc).__name__}:{exc}"
+        )
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    mapping = "; ".join(
+        f"input image {index} = {label}"
+        for index, label in enumerate(reference_labels, start=1)
+    )
+    canonical_lock = (
+        "CANONICAL REFERENCE LOCK: Supplied inputs that are not explicitly labelled as "
+        "pose guides are immutable identity and wardrobe references, not layouts to copy. "
+        "Preserve each named character's face, age, hair, body proportions, outfit "
+        "construction, colors and illustration style exactly. Do not blend characters "
+        "or exchange clothes. "
+    )
+    pose_guide_labels = [
+        label for label in reference_labels if label.endswith("_pose_guide")
+    ]
+    pose_guide_lock = (
+        "POSE GUIDE CONTRACT: Inputs labelled "
+        f"{', '.join(pose_guide_labels)} control pose and framing only. Never copy "
+        "their colors, line art, anatomy or identity. Rotate the canonical subject "
+        "to visibly match the guide while preserving the canonical face and wardrobe. "
+        if pose_guide_labels
+        else ""
+    )
+    three_quarter_bracket_labels = [
+        label
+        for label in reference_labels
+        if "_character_reference_front" in label
+        or "_character_reference_profile" in label
+        or label.endswith("(front)")
+        or label.endswith("(profile)")
+    ]
+    three_quarter_bracket_lock = (
+        "THREE-QUARTER POSE BRACKET: The front and strict profile inputs show the same "
+        "canonical character. Create the exact halfway head orientation between them: "
+        "both eyes visible, nose clearly off-center, one cheek narrower, one ear partly "
+        "occluded, and shoulders rotated with the head. Do not copy either endpoint pose. "
+        if scene.get("reference_view_id") == "three_quarter"
+        and len(three_quarter_bracket_labels) >= 2
+        else ""
+    )
+    if scene.get("scene_role") == "character_reference":
+        edit_prompt = (
+            f"{directed_prompt}\n\n"
+            f"{canonical_lock}"
+            f"{pose_guide_lock}"
+            f"{three_quarter_bracket_lock}"
+            "Create exactly one technical Cast Bible reference on a uniform studio "
+            "background, never a narrative frame. The background must extend cleanly to "
+            "all four canvas edges. Never draw an outline, keyline, frame, border, margin "
+            "or page around the image. Never output a contact sheet, split screen, model "
+            f"sheet, text or caption. Reference mapping: {mapping}."
+        )
+    else:
+        edit_prompt = (
+            f"{directed_prompt}\n\n"
+            f"{canonical_lock}"
+            "Create exactly one new narrative frame matching the requested action, setting "
+            "and camera composition. Never output a contact sheet, split screen, model "
+            f"sheet, text, caption or border. Reference mapping: {mapping}."
+        )
+    inputs: Dict[str, Any] = {
+        "prompt": edit_prompt,
+        "image_urls": reference_image_urls,
+        "num_images": 1,
+        "seed": scene_seed,
+        "aspect_ratio": _fal_nano_banana_aspect_ratio(width, height),
+        "output_format": "png",
+        "safety_tolerance": os.getenv("FAL_NANO_BANANA_SAFETY_TOLERANCE", "4"),
+        "limit_generations": True,
+    }
+    try:
+        client = FalQueueClient.from_environment()
+        result = client.run(model_name, inputs)
+        output_url = extract_image_url(result.data)
+        client.download(
+            output_url,
+            image_path,
+            max_bytes=40 * 1024 * 1024,
+            allowed_content_prefixes=("image/",),
+        )
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_reference_edit_error:{type(exc).__name__}:{exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    job_monitor.update(
+        {
+            "job_id": result.request_id,
+            "status": "COMPLETED",
+            "elapsed_seconds": result.elapsed_seconds,
+            "queue_seconds": result.queue_seconds,
+            "execution_seconds": result.execution_seconds,
+            "polls": list(result.status_history),
+            "image_path": image_path,
+            "output_url": output_url,
+        }
+    )
+    if not (os.path.exists(image_path) and os.path.getsize(image_path) > 1000):
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "invalid_fal_reference_edit_image"
+        return job_monitor, None, None
+    border_removed = bool(
+        scene.get("scene_role") == "character_reference"
+        and _normalize_cast_reference_canvas_border(image_path)
+    )
+    job_monitor["canvas_border_removed"] = border_removed
+
+    generation_method = "fal_nano_banana_edit"
+    image_record = {
+        "scene_id": scene["scene_id"],
+        "image_path": image_path,
+        "source_url": output_url,
+        "prompt": directed_prompt,
+        "base_prompt": scene["prompt"],
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "duration": scene.get("duration", 6),
+        "camera_motion": scene.get(
+            "camera_motion",
+            _motion_plan(scene)["description"],
+        ),
+        "runpod_job_id": None,
+        "fal_request_id": result.request_id,
+        "generation_method": generation_method,
+        "controlled_workflow": True,
+        "canvas_border_removed": border_removed,
+        "reference_image_paths": unique_reference_paths,
+        "reference_labels": reference_labels,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
+    }
+    technical_metrics = _probe_image_quality(image_path, scene=scene)
+    semantic_metrics = _evaluate_image_semantics(
+        image_path,
+        scene,
+        directed_prompt,
+        image_style,
+        visual_bible,
+    )
+    combined_metrics = _combine_image_quality(technical_metrics, semantic_metrics)
+    image_metric = {
+        "scene_id": scene["scene_id"],
+        "path": image_path,
+        "generation_method": generation_method,
+        "attempt": attempt,
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "fal_request_id": result.request_id,
+        "controlled_workflow": True,
+        "canvas_border_removed": border_removed,
+        "reference_image_paths": unique_reference_paths,
+        "reference_labels": reference_labels,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
+        **combined_metrics,
+    }
+    job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
+    job_monitor["quality_score"] = combined_metrics.get("quality_score")
+    job_monitor["semantic_accepted"] = combined_metrics.get("semantic_accepted")
+    job_monitor["quality_issues"] = combined_metrics.get("issues", [])
+    return job_monitor, image_record, image_metric
+
+
+def _run_fal_instant_character_attempt(
+    *,
+    scene: Dict[str, Any],
+    image_path: str,
+    directed_prompt: str,
+    image_style: str,
+    style_label: str,
+    quality_preset_key: str,
+    quality_preset: Dict[str, Any],
+    scene_seed: int,
+    visual_bible: Dict[str, Any],
+    attempt: int,
+    reference_image_path: str,
+) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    model_name = _fal_instant_character_model()
+    width = max(512, min(2048, _safe_int(quality_preset.get("width"), 1024)))
+    height = max(512, min(2048, _safe_int(quality_preset.get("height"), 1024)))
+    started_at = time.monotonic()
+    job_monitor: Dict[str, Any] = {
+        "scene_id": scene["scene_id"],
+        "provider": "fal",
+        "service": "instant_character",
+        "job_id": None,
+        "status": "SUBMITTING",
+        "attempt": attempt,
+        "style": image_style,
+        "style_label": style_label,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "elapsed_seconds": 0.0,
+        "queue_seconds": 0.0,
+        "execution_seconds": 0.0,
+        "polls": [],
+        "error": None,
+        "image_path": None,
+        "reference_image_path": reference_image_path,
+        "identity_conditioning": "instant_character_reference",
+        "reference_image_applied": True,
+        "estimated_cost_usd": instant_character_cost_estimate_usd(width, height),
+        "cost_estimate_status": "configured_model_rate",
+    }
+    try:
+        reference_image_url = file_to_data_uri(
+            reference_image_path,
+            max_bytes=20 * 1024 * 1024,
+            allowed_mime_types=(
+                "image/png",
+                "image/jpeg",
+                "image/webp",
+            ),
+        )
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = (
+            f"fal_instant_character_input_error:{type(exc).__name__}:{exc}"
+        )
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    inputs: Dict[str, Any] = {
+        "prompt": directed_prompt,
+        "image_url": reference_image_url,
+        "image_size": {"width": width, "height": height},
+        "scale": max(
+            0.1,
+            min(
+                2.0,
+                _safe_float(os.getenv("FAL_INSTANT_CHARACTER_SCALE"), 1.0),
+            ),
+        ),
+        "negative_prompt": _scene_negative_prompt(scene),
+        "seed": scene_seed,
+        "guidance_scale": max(
+            0.0,
+            min(
+                35.0,
+                _safe_float(
+                    os.getenv("FAL_INSTANT_CHARACTER_GUIDANCE_SCALE"),
+                    3.5,
+                ),
+            ),
+        ),
+        "num_inference_steps": max(
+            1,
+            min(
+                50,
+                _safe_int(
+                    os.getenv("FAL_INSTANT_CHARACTER_INFERENCE_STEPS"),
+                    28,
+                ),
+            ),
+        ),
+        "num_images": 1,
+        "enable_safety_checker": True,
+        "output_format": "png",
+    }
+    try:
+        client = FalQueueClient.from_environment()
+        result = client.run(model_name, inputs)
+        output_url = extract_image_url(result.data)
+        client.download(
+            output_url,
+            image_path,
+            max_bytes=40 * 1024 * 1024,
+            allowed_content_prefixes=("image/",),
+        )
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_instant_character_error:{type(exc).__name__}:{exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    job_monitor.update(
+        {
+            "job_id": result.request_id,
+            "status": "COMPLETED",
+            "elapsed_seconds": result.elapsed_seconds,
+            "queue_seconds": result.queue_seconds,
+            "execution_seconds": result.execution_seconds,
+            "polls": list(result.status_history),
+            "image_path": image_path,
+            "output_url": output_url,
+        }
+    )
+    if not (os.path.exists(image_path) and os.path.getsize(image_path) > 1000):
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "invalid_fal_instant_character_image"
+        return job_monitor, None, None
+
+    generation_method = "fal_instant_character"
+    image_record = {
+        "scene_id": scene["scene_id"],
+        "image_path": image_path,
+        "source_url": output_url,
+        "prompt": directed_prompt,
+        "base_prompt": scene["prompt"],
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "duration": scene.get("duration", 6),
+        "camera_motion": scene.get(
+            "camera_motion",
+            _motion_plan(scene)["description"],
+        ),
+        "runpod_job_id": None,
+        "fal_request_id": result.request_id,
+        "generation_method": generation_method,
+        "controlled_workflow": True,
+        "reference_image_path": reference_image_path,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
+    }
+    technical_metrics = _probe_image_quality(image_path, scene=scene)
+    semantic_metrics = _evaluate_image_semantics(
+        image_path,
+        scene,
+        directed_prompt,
+        image_style,
+        visual_bible,
+    )
+    combined_metrics = _combine_image_quality(technical_metrics, semantic_metrics)
+    image_metric = {
+        "scene_id": scene["scene_id"],
+        "path": image_path,
+        "generation_method": generation_method,
+        "attempt": attempt,
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "fal_request_id": result.request_id,
+        "controlled_workflow": True,
+        "reference_image_path": reference_image_path,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
+        **combined_metrics,
+    }
+    job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
+    job_monitor["quality_score"] = combined_metrics.get("quality_score")
+    job_monitor["semantic_accepted"] = combined_metrics.get("semantic_accepted")
+    job_monitor["quality_issues"] = combined_metrics.get("issues", [])
+    return job_monitor, image_record, image_metric
+
+
+def _run_fal_flux_pulid_attempt(
+    *,
+    scene: Dict[str, Any],
+    image_path: str,
+    directed_prompt: str,
+    image_style: str,
+    style_label: str,
+    quality_preset_key: str,
+    quality_preset: Dict[str, Any],
+    scene_seed: int,
+    visual_bible: Dict[str, Any],
+    attempt: int,
+    reference_image_path: str,
+) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    model_name = _fal_flux_pulid_model()
+    width = max(512, min(2048, _safe_int(quality_preset.get("width"), 1024)))
+    height = max(512, min(2048, _safe_int(quality_preset.get("height"), 1024)))
+    started_at = time.monotonic()
+    job_monitor: Dict[str, Any] = {
+        "scene_id": scene["scene_id"],
+        "provider": "fal",
+        "service": "flux_pulid",
+        "job_id": None,
+        "status": "SUBMITTING",
+        "attempt": attempt,
+        "style": image_style,
+        "style_label": style_label,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "elapsed_seconds": 0.0,
+        "queue_seconds": 0.0,
+        "execution_seconds": 0.0,
+        "polls": [],
+        "error": None,
+        "image_path": None,
+        "reference_image_path": reference_image_path,
+        "identity_conditioning": "flux_pulid_reference",
+        "reference_image_applied": True,
+        "estimated_cost_usd": flux_pulid_cost_estimate_usd(width, height),
+        "cost_estimate_status": "configured_model_rate",
+    }
+    try:
+        reference_image_url = file_to_data_uri(
+            reference_image_path,
+            max_bytes=20 * 1024 * 1024,
+            allowed_mime_types=(
+                "image/png",
+                "image/jpeg",
+                "image/webp",
+            ),
+        )
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_flux_pulid_input_error:{type(exc).__name__}:{exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    inputs: Dict[str, Any] = {
+        "prompt": directed_prompt,
+        "reference_image_url": reference_image_url,
+        "image_size": {"width": width, "height": height},
+        "negative_prompt": _scene_negative_prompt(scene),
+        "seed": scene_seed,
+        "guidance_scale": max(
+            0.0,
+            min(
+                20.0,
+                _safe_float(
+                    os.getenv("FAL_FLUX_PULID_GUIDANCE_SCALE"),
+                    4.0,
+                ),
+            ),
+        ),
+        "num_inference_steps": max(
+            1,
+            min(
+                50,
+                _safe_int(
+                    os.getenv("FAL_FLUX_PULID_INFERENCE_STEPS"),
+                    20,
+                ),
+            ),
+        ),
+        "true_cfg": max(
+            0.0,
+            min(
+                20.0,
+                _safe_float(os.getenv("FAL_FLUX_PULID_TRUE_CFG"), 1.0),
+            ),
+        ),
+        "id_weight": max(
+            0.0,
+            min(
+                3.0,
+                _safe_float(os.getenv("FAL_FLUX_PULID_ID_WEIGHT"), 1.0),
+            ),
+        ),
+        "enable_safety_checker": True,
+        "max_sequence_length": "128",
+    }
+    try:
+        client = FalQueueClient.from_environment()
+        result = client.run(model_name, inputs)
+        output_url = extract_image_url(result.data)
+        client.download(
+            output_url,
+            image_path,
+            max_bytes=40 * 1024 * 1024,
+            allowed_content_prefixes=("image/",),
+        )
+        from PIL import Image
+
+        with Image.open(image_path) as source_image:
+            if source_image.format != "PNG":
+                normalized_path = f"{image_path}.normalized.png"
+                source_image.convert("RGB").save(normalized_path, format="PNG")
+                os.replace(normalized_path, image_path)
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_flux_pulid_error:{type(exc).__name__}:{exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, None, None
+
+    job_monitor.update(
+        {
+            "job_id": result.request_id,
+            "status": "COMPLETED",
+            "elapsed_seconds": result.elapsed_seconds,
+            "queue_seconds": result.queue_seconds,
+            "execution_seconds": result.execution_seconds,
+            "polls": list(result.status_history),
+            "image_path": image_path,
+            "output_url": output_url,
+        }
+    )
+    if not (os.path.exists(image_path) and os.path.getsize(image_path) > 1000):
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "invalid_fal_flux_pulid_image"
+        return job_monitor, None, None
+
+    generation_method = "fal_flux_pulid"
+    image_record = {
+        "scene_id": scene["scene_id"],
+        "image_path": image_path,
+        "source_url": output_url,
+        "prompt": directed_prompt,
+        "base_prompt": scene["prompt"],
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "duration": scene.get("duration", 6),
+        "camera_motion": scene.get(
+            "camera_motion",
+            _motion_plan(scene)["description"],
+        ),
+        "runpod_job_id": None,
+        "fal_request_id": result.request_id,
+        "generation_method": generation_method,
+        "controlled_workflow": True,
+        "reference_image_path": reference_image_path,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
+    }
+    technical_metrics = _probe_image_quality(image_path, scene=scene)
+    semantic_metrics = _evaluate_image_semantics(
+        image_path,
+        scene,
+        directed_prompt,
+        image_style,
+        visual_bible,
+    )
+    combined_metrics = _combine_image_quality(technical_metrics, semantic_metrics)
+    image_metric = {
+        "scene_id": scene["scene_id"],
+        "path": image_path,
+        "generation_method": generation_method,
+        "attempt": attempt,
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": model_name,
+        "seed": scene_seed,
+        "fal_request_id": result.request_id,
+        "controlled_workflow": True,
+        "reference_image_path": reference_image_path,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
         **combined_metrics,
     }
     job_monitor["semantic_score"] = combined_metrics.get("semantic_score")
@@ -3561,6 +6801,45 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _build_google_genai_client(
+    api_key: str,
+    *,
+    timeout_env: str,
+    default_timeout_seconds: int,
+) -> Any:
+    from google import genai
+    from google.genai import types
+
+    timeout_seconds = max(
+        15,
+        min(
+            300,
+            _safe_int(
+                os.getenv(timeout_env),
+                default_timeout_seconds,
+            ),
+        ),
+    )
+    retry_attempts = max(
+        1,
+        min(3, _safe_int(os.getenv("GEMINI_REQUEST_RETRY_ATTEMPTS"), 2)),
+    )
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=timeout_seconds * 1000,
+            retry_options=types.HttpRetryOptions(
+                attempts=retry_attempts,
+                initial_delay=1.0,
+                max_delay=5.0,
+                exp_base=2.0,
+                jitter=0.25,
+                http_status_codes=[408, 429, 500, 502, 503, 504],
+            ),
+        ),
+    )
 
 
 def _runway_error_types(runway_module: Any) -> tuple[type[BaseException], ...]:
@@ -3721,6 +7000,296 @@ def _generate_runway_clip(
     return job_monitor, False
 
 
+def _fal_kling_elements(
+    scene_image: Dict[str, Any],
+    visual_bible: Dict[str, Any] | None,
+) -> List[Dict[str, Any]]:
+    if not visual_bible:
+        return []
+    elements: List[Dict[str, Any]] = []
+    for character in _scene_cast_characters(scene_image, visual_bible)[:2]:
+        front_path = _approved_cast_reference_path(character)
+        if not front_path:
+            continue
+        reference_urls: List[str] = []
+        views = (character.get("reference") or {}).get("views") or {}
+        for view_id in ("three_quarter", "profile"):
+            view = views.get(view_id) or {}
+            view_path = str(view.get("path") or "")
+            if (
+                view.get("automatic_approved") is True
+                and view_path
+                and Path(view_path).is_file()
+            ):
+                reference_urls.append(
+                    file_to_data_uri(
+                        view_path,
+                        max_bytes=15 * 1024 * 1024,
+                        allowed_mime_types=(
+                            "image/png",
+                            "image/jpeg",
+                            "image/webp",
+                        ),
+                    )
+                )
+        elements.append(
+            {
+                "frontal_image_url": file_to_data_uri(
+                    front_path,
+                    max_bytes=15 * 1024 * 1024,
+                    allowed_mime_types=(
+                        "image/png",
+                        "image/jpeg",
+                        "image/webp",
+                    ),
+                ),
+                "reference_image_urls": reference_urls,
+            }
+        )
+    return elements
+
+
+def _fal_kling_duration(duration_seconds: float, *, lipsync_enabled: bool) -> int:
+    maximum = 10 if lipsync_enabled else 15
+    return max(3, min(maximum, int(math.ceil(max(0.0, duration_seconds)))))
+
+
+def _generate_fal_kling_clip(
+    scene_image: Dict[str, Any],
+    clip_path: str,
+    duration_seconds: float,
+    *,
+    audio_path: str | None = None,
+    visual_bible: Dict[str, Any] | None = None,
+) -> tuple[Dict[str, Any], bool]:
+    started_at = time.monotonic()
+    scene_id = scene_image.get("scene_id")
+    lipsync_enabled = _fal_lipsync_enabled()
+    duration = _fal_kling_duration(
+        duration_seconds,
+        lipsync_enabled=lipsync_enabled,
+    )
+    animation_model = _fal_kling_model()
+    lipsync_model = _fal_kling_lipsync_model()
+    job_monitor: Dict[str, Any] = {
+        "provider": "fal",
+        "service": "kling",
+        "scene_id": scene_id,
+        "job_id": None,
+        "status": "SUBMITTING",
+        "elapsed_seconds": 0.0,
+        "queue_seconds": 0.0,
+        "execution_seconds": 0.0,
+        "estimated_cost_usd": kling_video_cost_estimate_usd(duration),
+        "cost_estimate_status": "configured_model_rate",
+        "model": animation_model,
+        "lipsync_model": lipsync_model if lipsync_enabled else None,
+        "duration_seconds": duration,
+        "output_path": clip_path,
+        "output_url": None,
+        "animation_output_url": None,
+        "error": "",
+        "stages": [],
+    }
+    image_path = str(scene_image.get("image_path") or "")
+    if not image_path or not Path(image_path).is_file():
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = "source_image_missing"
+        return job_monitor, False
+
+    source_url = str(scene_image.get("source_url") or "").strip()
+    if source_url:
+        try:
+            source_url = validate_external_url(source_url)
+        except FalProviderError:
+            source_url = ""
+    if not source_url:
+        try:
+            source_url = file_to_data_uri(
+                image_path,
+                max_bytes=20 * 1024 * 1024,
+                allowed_mime_types=(
+                    "image/png",
+                    "image/jpeg",
+                    "image/webp",
+                ),
+            )
+        except (FalProviderError, OSError, ValueError) as exc:
+            job_monitor["status"] = "FAILED"
+            job_monitor["error"] = f"fal_kling_input_error:{type(exc).__name__}:{exc}"
+            return job_monitor, False
+
+    audio_duration = 0.0
+    if lipsync_enabled:
+        if not audio_path or not Path(audio_path).is_file():
+            job_monitor["status"] = "FAILED"
+            job_monitor["error"] = "fal_lipsync_audio_missing"
+            return job_monitor, False
+        audio_quality = _probe_media_quality(audio_path, "audio")
+        audio_duration = _safe_float(audio_quality.get("duration_seconds"))
+        if not bool(audio_quality.get("valid")):
+            job_monitor["status"] = "FAILED"
+            job_monitor["error"] = "fal_lipsync_audio_invalid"
+            return job_monitor, False
+        if not 2.0 <= audio_duration <= 10.0:
+            job_monitor["status"] = "FAILED"
+            job_monitor["error"] = (
+                f"fal_lipsync_scene_audio_duration_unsupported:{audio_duration:.3f}s"
+            )
+            return job_monitor, False
+
+    prompt = _build_runway_motion_prompt(scene_image)
+    try:
+        elements = _fal_kling_elements(scene_image, visual_bible)
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_kling_element_error:{type(exc).__name__}:{exc}"
+        return job_monitor, False
+    if elements:
+        element_bindings = ", ".join(
+            f"@Element{index}" for index in range(1, len(elements) + 1)
+        )
+        prompt = (
+            f"{prompt}\nPreserve the exact identity of {element_bindings}; "
+            "do not merge, replace, age-shift, or redesign these characters."
+        )[:2400]
+    animation_inputs: Dict[str, Any] = {
+        "prompt": prompt,
+        "start_image_url": source_url,
+        "duration": str(duration),
+        "generate_audio": False,
+        "shot_type": "customize",
+        "negative_prompt": (
+            "identity drift, face morphing, age change, wardrobe change, extra limbs, "
+            "extra fingers, duplicated characters, blur, distortion, low quality, "
+            "text, captions, logos"
+        ),
+        "cfg_scale": max(
+            0.0,
+            min(1.0, _safe_float(os.getenv("FAL_KLING_CFG_SCALE"), 0.5)),
+        ),
+    }
+    if elements:
+        animation_inputs["elements"] = elements
+
+    try:
+        client = FalQueueClient.from_environment()
+        animation = client.run(animation_model, animation_inputs)
+        animation_url = extract_video_url(animation.data)
+        job_monitor["stages"].append(
+            {
+                "name": "image_to_video",
+                "request_id": animation.request_id,
+                "status": "COMPLETED",
+                "model": animation_model,
+                "elapsed_seconds": animation.elapsed_seconds,
+                "queue_seconds": animation.queue_seconds,
+                "execution_seconds": animation.execution_seconds,
+            }
+        )
+        final_result = animation
+        final_url = animation_url
+        if lipsync_enabled:
+            audio_url = file_to_data_uri(
+                str(audio_path),
+                max_bytes=5 * 1024 * 1024,
+                allowed_mime_types=(
+                    "audio/mpeg",
+                    "audio/wav",
+                    "audio/x-wav",
+                    "audio/mp4",
+                    "audio/x-m4a",
+                    "audio/aac",
+                    "audio/ogg",
+                ),
+            )
+            lipsync = client.run(
+                lipsync_model,
+                {
+                    "video_url": animation_url,
+                    "audio_url": audio_url,
+                },
+            )
+            final_result = lipsync
+            final_url = extract_video_url(lipsync.data)
+            job_monitor["stages"].append(
+                {
+                    "name": "audio_to_video",
+                    "request_id": lipsync.request_id,
+                    "status": "COMPLETED",
+                    "model": lipsync_model,
+                    "elapsed_seconds": lipsync.elapsed_seconds,
+                    "queue_seconds": lipsync.queue_seconds,
+                    "execution_seconds": lipsync.execution_seconds,
+                }
+            )
+            job_monitor["estimated_cost_usd"] = round(
+                _safe_float(job_monitor["estimated_cost_usd"])
+                + kling_lipsync_cost_estimate_usd(audio_duration),
+                6,
+            )
+        client.download(
+            final_url,
+            clip_path,
+            max_bytes=150 * 1024 * 1024,
+            allowed_content_prefixes=("video/", "application/octet-stream"),
+        )
+    except (FalProviderError, OSError, ValueError) as exc:
+        job_monitor["status"] = "FAILED"
+        job_monitor["error"] = f"fal_kling_error:{type(exc).__name__}:{exc}"
+        job_monitor["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        return job_monitor, False
+
+    media_quality = _probe_media_quality(clip_path, "video")
+    total_queue = sum(
+        _safe_float(stage.get("queue_seconds"))
+        for stage in job_monitor["stages"]
+        if isinstance(stage, dict)
+    )
+    total_execution = sum(
+        _safe_float(stage.get("execution_seconds"))
+        for stage in job_monitor["stages"]
+        if isinstance(stage, dict)
+    )
+    job_monitor.update(
+        {
+            "job_id": final_result.request_id,
+            "animation_job_id": animation.request_id,
+            "lipsync_job_id": (final_result.request_id if lipsync_enabled else None),
+            "status": "COMPLETED",
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "queue_seconds": round(total_queue, 3),
+            "execution_seconds": round(total_execution, 3),
+            "animation_output_url": animation_url,
+            "output_url": final_url,
+            "quality_score": media_quality.get("quality_score", 0),
+            "quality_issues": media_quality.get("issues", []),
+            "lipsync_status": "COMPLETED" if lipsync_enabled else "DISABLED",
+        }
+    )
+    return job_monitor, bool(media_quality.get("valid"))
+
+
+def _generate_real_video_clip(
+    scene_image: Dict[str, Any],
+    clip_path: str,
+    duration_seconds: float,
+    *,
+    audio_path: str | None = None,
+    visual_bible: Dict[str, Any] | None = None,
+) -> tuple[Dict[str, Any], bool]:
+    provider = _video_generation_provider()
+    if provider == "fal_kling":
+        return _generate_fal_kling_clip(
+            scene_image,
+            clip_path,
+            duration_seconds,
+            audio_path=audio_path,
+            visual_bible=visual_bible,
+        )
+    return _generate_runway_clip(scene_image, clip_path, duration_seconds)
+
+
 def _extract_json_object(raw_text: str) -> Dict[str, Any]:
     text = raw_text.replace("```json", "").replace("```", "").strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -3799,11 +7368,21 @@ def _semantic_qa_model(provider: str) -> str:
     )
 
 
+def _local_identity_qa_enabled() -> bool:
+    return os.getenv("LOCAL_IDENTITY_QA_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 SEMANTIC_QA_RESPONSE_JSON_SCHEMA = {
     "type": "object",
     "properties": {
         "semantic_score": {"type": "integer", "minimum": 0, "maximum": 100},
         "accepted": {"type": "boolean"},
+        "style_score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "style_accepted": {"type": "boolean"},
         "hero_object_legibility": {"type": "boolean"},
         "hero_object_notes": {"type": "string"},
         "issues": {"type": "array", "items": {"type": "string"}},
@@ -3813,6 +7392,8 @@ SEMANTIC_QA_RESPONSE_JSON_SCHEMA = {
     "required": [
         "semantic_score",
         "accepted",
+        "style_score",
+        "style_accepted",
         "hero_object_legibility",
         "hero_object_notes",
         "issues",
@@ -3839,6 +7420,41 @@ class SemanticQAProviderError(RuntimeError):
 
 def _local_required_visual_question(requirement: str) -> str:
     normalized = requirement.lower()
+    if any(
+        term in normalized
+        for term in (
+            "strict left-profile",
+            "strict left-side profile",
+            "exact 90-degree profile",
+        )
+    ):
+        return (
+            "Is the character shown in a strict left-facing side profile, with only one "
+            "eye visible and the nose and lips forming a clear silhouette?"
+        )
+    if "three-quarter" in normalized or "3/4" in normalized:
+        return (
+            "Is the character visibly turned to a three-quarter view, with both eyes "
+            "visible and the head and shoulders rotated away from a frontal pose?"
+        )
+    if "full-body turnaround" in normalized or "head to both feet" in normalized:
+        if any(
+            term in normalized
+            for term in ("species-correct", "natural paws", "no human hands")
+        ):
+            return (
+                "Is exactly one complete animal visible from head through all natural "
+                "species-correct paws or feet, with the entire body and tail inside the frame?"
+            )
+        return (
+            "Is exactly one complete human character visible from head to both shoes, "
+            "with both shoes fully inside the frame and clear background below them?"
+        )
+    if "plain neutral backdrop" in normalized:
+        return (
+            "Is the background a plain single-color neutral studio backdrop, "
+            "without a room, landscape or decorative scenery?"
+        )
     if any(term in normalized for term in ("teaspoon", "colher")):
         return "Is exactly one metal spoon clearly visible anywhere on the table?"
     if any(term in normalized for term in ("separate sugar bowl lid", "tampa")):
@@ -3853,6 +7469,11 @@ def _local_required_visual_question(requirement: str) -> str:
             "Is one compact porcelain sugar bowl clearly visible without "
             "protruding side handles?"
         )
+    if any(
+        term in normalized
+        for term in ("preteen proportions", "older and taller", "younger and shorter")
+    ):
+        return f"Does the only subject clearly satisfy this body-age contract: {requirement[:220]}?"
     if any(term in normalized for term in ("professor", "ludovico")):
         return (
             "Does the adult man on the right clearly look middle-aged, "
@@ -3860,14 +7481,114 @@ def _local_required_visual_question(requirement: str) -> str:
         )
     if "alice" in normalized:
         return (
-            "Is exactly one clearly preteen child Alice visible, looking about "
+            "Is exactly one clearly preteen girl Alice visible, looking about "
             "ten years old rather than teenage or adult?"
         )
+    if "shoulder-length hair" in normalized:
+        return (
+            "Does the only subject have chestnut-brown shoulder-length hair, "
+            "rather than short, cropped or masculine-styled hair?"
+        )
+    if any(
+        term in normalized
+        for term in (
+            "victorian day dress",
+            "victorian child dress",
+            "frock coat",
+            "waistcoat",
+        )
+    ):
+        return f"Does the only subject clearly wear this exact wardrobe: {requirement[:220]}?"
     return f"Is this requirement clearly satisfied in the image: {requirement[:260]}?"
+
+
+def _local_forbidden_visual_question(exclusion: str) -> str:
+    normalized = exclusion.lower()
+    if "second subject" in normalized:
+        return "Are two or more distinct people or animals visible in this image?"
+    if "two eyes" in normalized or "two eyebrows" in normalized:
+        return (
+            "Are both eyes, any part of a second eye, or both eyebrows visible on the "
+            "character? Answer yes for frontal or three-quarter views."
+        )
+    if "props" in normalized or "story action" in normalized:
+        return (
+            "Is the subject interacting with a separate prop or performing a narrative "
+            "story action instead of posing as a studio reference?"
+        )
+    if any(term in normalized for term in ("text", "logo", "watermark")):
+        return "Is any readable text, logo or watermark visible in the image?"
+    return f"Is this forbidden element visible in the image: {exclusion[:260]}?"
+
+
+def _local_forbidden_visual_code(exclusion: str, index: int) -> str:
+    normalized = exclusion.lower()
+    if "two eyes" in normalized or "two eyebrows" in normalized:
+        return "cast_profile_second_eye_visible"
+    if any(term in normalized for term in ("mole", "beauty mark", "facial spot")):
+        return "cast_identity_unapproved_facial_mark"
+    if any(term in normalized for term in ("paws", "claws", "talons", "hooves")):
+        return "cast_human_animal_anatomy"
+    if "malformed hands or feet" in normalized:
+        return "cast_malformed_hands_or_feet"
+    return f"forbidden_{index}"
+
+
+def _detect_profile_eye_count(image_path: Path) -> int | None:
+    """Count distinct eye regions as a deterministic profile-pose safeguard."""
+    try:
+        import cv2
+    except (ImportError, OSError):
+        return None
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return None
+    grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    classifier = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+    if classifier.empty():
+        return None
+
+    height, width = grayscale.shape[:2]
+    minimum_eye_size = max(20, int(min(height, width) * 0.025))
+    detections = classifier.detectMultiScale(
+        grayscale,
+        scaleFactor=1.05,
+        minNeighbors=8,
+        minSize=(minimum_eye_size, minimum_eye_size),
+        maxSize=(max(minimum_eye_size, width // 3), max(minimum_eye_size, height // 3)),
+    )
+    centers: List[tuple[float, float]] = []
+    minimum_center_distance = max(12.0, width * 0.06)
+    for x, y, eye_width, eye_height in detections:
+        center = (float(x + eye_width / 2), float(y + eye_height / 2))
+        if center[1] > height * 0.65:
+            continue
+        if any(
+            ((center[0] - existing[0]) ** 2 + (center[1] - existing[1]) ** 2) ** 0.5
+            < minimum_center_distance
+            for existing in centers
+        ):
+            continue
+        centers.append(center)
+    return len(centers)
 
 
 def _local_required_visual_code(requirement: str, index: int) -> str:
     normalized = requirement.lower()
+    if any(
+        term in normalized
+        for term in (
+            "strict left-profile",
+            "strict left-side profile",
+            "exact 90-degree profile",
+        )
+    ):
+        return "cast_profile_pose_missing"
+    if "three-quarter" in normalized or "3/4" in normalized:
+        return "cast_three_quarter_pose_missing"
+    if "full-body turnaround" in normalized or "head to both feet" in normalized:
+        return "cast_full_body_pose_missing"
     if any(term in normalized for term in ("teaspoon", "colher")):
         return "hero_teaspoon_missing"
     if any(term in normalized for term in ("separate sugar bowl lid", "tampa")):
@@ -3876,10 +7597,27 @@ def _local_required_visual_code(requirement: str, index: int) -> str:
         return "hero_mouse_missing_or_wrong"
     if any(term in normalized for term in ("sugar bowl", "açucareiro", "acucareiro")):
         return "hero_sugar_bowl_missing_or_wrong"
+    if any(
+        term in normalized
+        for term in ("proportions", "older and taller", "younger and shorter")
+    ):
+        return "cast_identity_proportions_mismatch"
     if any(term in normalized for term in ("professor", "ludovico")):
         return "wrong_ludovico_age"
     if "alice" in normalized:
         return "wrong_alice_age"
+    if "hair" in normalized or "coat pattern" in normalized:
+        return "cast_identity_hair_mismatch"
+    if any(
+        term in normalized
+        for term in (
+            "victorian day dress",
+            "victorian child dress",
+            "frock coat",
+            "waistcoat",
+        )
+    ):
+        return "cast_identity_wardrobe_mismatch"
     return f"required_{index}"
 
 
@@ -3889,12 +7627,14 @@ def _evaluate_semantic_qa_with_local_vlm(
     scene: Dict[str, Any],
     style_key: str,
     model: str,
+    visual_bible: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     try:
         from open3d_implementation.core.local_visual_qa import (
             LocalVisualCriterion,
             LocalVisualQAError,
             evaluate_local_age_classification,
+            evaluate_local_narrative_identity,
             evaluate_local_visual_checklist,
         )
     except ImportError as exc:
@@ -3923,6 +7663,7 @@ def _evaluate_semantic_qa_with_local_vlm(
         "teaspoon",
         "colher",
     }
+    is_character_reference = scene.get("scene_role") == "character_reference"
     criteria = []
     for index, requirement in enumerate(required, start=1):
         normalized = requirement.lower()
@@ -3939,27 +7680,26 @@ def _evaluate_semantic_qa_with_local_vlm(
     for index, exclusion in enumerate(forbidden, start=1):
         criteria.append(
             LocalVisualCriterion(
-                code=f"forbidden_{index}",
-                question=(
-                    "Is this forbidden element visible in the image: "
-                    f"{exclusion[:260]}?"
-                ),
+                code=_local_forbidden_visual_code(exclusion, index),
+                question=_local_forbidden_visual_question(exclusion),
                 expected="no",
                 weight=1.5,
                 critical=True,
             )
         )
-    criteria.append(
-        LocalVisualCriterion(
-            code="style_match",
-            question=(
-                "Does the image consistently use this visual style: "
-                f"{_resolve_image_style(style_key)['label']}?"
-            ),
-            expected="yes",
-            weight=1.5,
+    if not is_character_reference:
+        criteria.append(
+            LocalVisualCriterion(
+                code="style_match",
+                question=(
+                    "Does the image consistently use this visual style: "
+                    f"{_resolve_image_style(style_key)['label']}?"
+                ),
+                expected="yes",
+                weight=1.5,
+                critical=True,
+            )
         )
-    )
 
     try:
         answers = evaluate_local_visual_checklist(
@@ -3977,16 +7717,42 @@ def _evaluate_semantic_qa_with_local_vlm(
         (
             answer.criterion.weight
             if answer.matched
-            else answer.criterion.weight * 0.5 if answer.answer == "uncertain" else 0.0
+            else (
+                answer.criterion.weight
+                if is_character_reference
+                and answer.criterion.expected == "no"
+                and answer.criterion.code.startswith("forbidden_")
+                and answer.answer == "uncertain"
+                else (
+                    answer.criterion.weight * 0.5
+                    if answer.answer == "uncertain"
+                    else 0.0
+                )
+            )
         )
         for answer in answers
     )
     failed = [answer for answer in answers if not answer.matched]
     critical_failures = [
-        answer.criterion.code for answer in failed if answer.criterion.critical
+        answer.criterion.code
+        for answer in failed
+        if answer.criterion.critical
+        and not (
+            is_character_reference
+            and answer.criterion.expected == "no"
+            and answer.criterion.code.startswith("forbidden_")
+            and answer.answer == "uncertain"
+        )
     ]
     hero_answers = [answer for answer in answers if answer.criterion.hero_object]
     hero_legible = bool(hero_answers) and all(answer.matched for answer in hero_answers)
+    style_answers = [
+        answer for answer in answers if answer.criterion.code == "style_match"
+    ]
+    style_accepted = is_character_reference or (
+        bool(style_answers) and all(answer.matched for answer in style_answers)
+    )
+    style_score = 100 if style_accepted else 0
     evidence = [
         {
             "code": answer.criterion.code,
@@ -3999,7 +7765,33 @@ def _evaluate_semantic_qa_with_local_vlm(
         for answer in answers
     ]
     failed_questions = [answer.criterion.question for answer in failed]
+    if (
+        is_character_reference
+        and str(scene.get("reference_view_id") or "") == "profile"
+        and str(scene.get("character_kind") or "human").lower() == "human"
+    ):
+        detected_eye_count = _detect_profile_eye_count(image_path)
+        if detected_eye_count is not None:
+            profile_eye_gate_matched = detected_eye_count <= 1
+            total_weight += 3.0
+            if profile_eye_gate_matched:
+                earned_weight += 3.0
+            else:
+                critical_failures.append("cast_profile_second_eye_visible")
+                failed_questions.append(
+                    "Show a strict 90-degree profile with no visible second eye."
+                )
+            evidence.append(
+                {
+                    "code": "cast_profile_second_eye_visible",
+                    "answer": detected_eye_count,
+                    "expected": "at_most_one_detected_eye",
+                    "matched": profile_eye_gate_matched,
+                    "provider": "opencv_haar_eye_detector",
+                }
+            )
     configured_age_checks = scene.get("local_age_checks", [])
+    age_failure_codes: List[str] = []
     if configured_age_checks:
         if not isinstance(configured_age_checks, list):
             raise SemanticQAProviderError("local_age:invalid_checks")
@@ -4066,6 +7858,7 @@ def _evaluate_semantic_qa_with_local_vlm(
                 earned_weight += 3.0
             else:
                 critical_failures.append(code)
+                age_failure_codes.append(code)
                 failed_questions.append(
                     f"Character age must classify as one of: {', '.join(accepted_labels)}."
                 )
@@ -4083,17 +7876,117 @@ def _evaluate_semantic_qa_with_local_vlm(
                     "model": estimate.model_name,
                 }
             )
+    identity_assessments: List[Dict[str, Any]] = []
+    if (
+        visual_bible
+        and _local_identity_qa_enabled()
+        and scene.get("scene_role") != "character_reference"
+    ):
+        for character in _scene_cast_characters(scene, visual_bible):
+            character_id = str(character["id"])
+            reference_paths = _character_identity_reference_paths(character)
+            if not reference_paths:
+                critical_failures.append(f"identity_reference_missing_{character_id}")
+                identity_assessments.append(
+                    {
+                        "character_id": character_id,
+                        "character_name": character["name"],
+                        "score": 0.0,
+                        "dimensions": {},
+                        "accepted": False,
+                        "issues": ["identity_reference_missing"],
+                        "evidence": [],
+                    }
+                )
+                continue
+            try:
+                assessment = evaluate_local_narrative_identity(
+                    reference_paths=[Path(path) for path in reference_paths],
+                    candidate_path=image_path,
+                    character_id=character_id,
+                    negative_reference_paths=[
+                        Path(path)
+                        for path in _contrastive_identity_reference_paths(
+                            visual_bible,
+                            excluded_character_id=character_id,
+                        )
+                    ],
+                )
+            except LocalVisualQAError as exc:
+                critical_failures.append(f"identity_qa_failed_{character_id}")
+                identity_assessments.append(
+                    {
+                        "character_id": character_id,
+                        "character_name": character["name"],
+                        "score": 0.0,
+                        "dimensions": {},
+                        "accepted": False,
+                        "issues": [f"identity_qa_failed:{type(exc).__name__}"],
+                        "evidence": [],
+                    }
+                )
+                continue
+            assessment_evidence = [
+                {
+                    "code": f"identity_face_embedding_{character_id}",
+                    "face_similarity": assessment.face_similarity,
+                    "face_threshold": assessment.face_threshold,
+                    "closest_negative_similarity": (
+                        assessment.closest_negative_similarity
+                    ),
+                    "similarity_margin": assessment.similarity_margin,
+                    "margin_threshold": assessment.margin_threshold,
+                    "reference_boxes": [
+                        list(box) for box in assessment.reference_boxes
+                    ],
+                    "candidate_box": list(assessment.candidate_box),
+                    "matched": assessment.accepted,
+                }
+            ]
+            identity_dimensions = {
+                "face": assessment.score,
+                "contrastive_margin": (
+                    round(
+                        min(
+                            100.0,
+                            max(0.0, assessment.similarity_margin) * 200,
+                        ),
+                        1,
+                    )
+                    if assessment.similarity_margin is not None
+                    else 100.0
+                ),
+            }
+            failed_identity_codes = list(assessment.issues)
+            if not assessment.accepted:
+                critical_failures.append(f"identity_mismatch_{character_id}")
+                failed_questions.append(
+                    f"Restore {character['name']} from the approved identity reference."
+                )
+            identity_assessments.append(
+                {
+                    "character_id": character_id,
+                    "character_name": character["name"],
+                    "score": assessment.score,
+                    "dimensions": identity_dimensions,
+                    "accepted": assessment.accepted,
+                    "issues": failed_identity_codes,
+                    "evidence": assessment_evidence,
+                    "provider": "local_reference_comparison",
+                    "model": assessment.model_name,
+                }
+            )
+
     critical_failures = list(dict.fromkeys(critical_failures))
     score = round((earned_weight / total_weight) * 100) if total_weight else 0
     issues = [f"{answer.criterion.code}_{answer.answer}" for answer in failed]
-    issues.extend(
-        f"{code}_age_classifier"
-        for code in critical_failures
-        if code not in {answer.criterion.code for answer in failed}
-    )
+    issues.extend(f"{code}_age_classifier" for code in age_failure_codes)
+    issues.extend(code for code in critical_failures if code.startswith("identity_"))
     return {
         "semantic_score": score,
         "accepted": score >= _image_semantic_min_score() and not critical_failures,
+        "style_score": style_score,
+        "style_accepted": style_accepted,
         "hero_object_legibility": hero_legible,
         "hero_object_notes": (
             "All locally checked hero-object requirements passed."
@@ -4106,6 +7999,7 @@ def _evaluate_semantic_qa_with_local_vlm(
             "Correct these failed visual checks: " + " | ".join(failed_questions)
         )[:1000],
         "evidence": evidence,
+        "character_identity": identity_assessments,
     }
 
 
@@ -4118,13 +8012,16 @@ def _evaluate_semantic_qa_with_gemini(
     api_key: str,
 ) -> Dict[str, Any]:
     try:
-        from google import genai
         from google.genai import errors, types
     except ImportError as exc:
         raise SemanticQAProviderError("gemini:sdk_unavailable") from exc
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = _build_google_genai_client(
+            api_key,
+            timeout_env="GEMINI_VISION_QA_TIMEOUT_SECONDS",
+            default_timeout_seconds=90,
+        )
         image_part = types.Part.from_bytes(
             data=image_path.read_bytes(),
             mime_type="image/png",
@@ -4228,6 +8125,13 @@ def _apply_semantic_qa_result(
     critical_codes = [str(issue) for issue in critical_failures if issue]
     hero_object_legibility = parsed.get("hero_object_legibility")
     hero_object_notes = str(parsed.get("hero_object_notes", ""))[:500]
+    style_score = max(
+        0,
+        min(100, _safe_int(parsed.get("style_score"), score)),
+    )
+    style_accepted = bool(parsed.get("style_accepted", parsed.get("accepted")))
+    if not style_accepted and "style_mismatch" not in critical_codes:
+        critical_codes.append("style_mismatch")
     if hero_objects and hero_object_legibility is False:
         if "hero_object_illegible" not in critical_codes:
             critical_codes.append("hero_object_illegible")
@@ -4244,8 +8148,11 @@ def _apply_semantic_qa_result(
         {
             "semantic_score": score,
             "accepted": bool(parsed.get("accepted"))
+            and style_accepted
             and not critical_codes
             and score >= _image_semantic_min_score(),
+            "style_score": style_score,
+            "style_accepted": style_accepted,
             "issues": [*issue_codes, *critical_codes],
             "critical_failures": critical_codes,
             "hero_objects": hero_objects,
@@ -4279,7 +8186,14 @@ def _evaluate_image_semantics(
         "model": _semantic_qa_model(primary_provider),
     }
     if not metrics["semantic_qa_enabled"]:
-        metrics.update({"semantic_score": 100, "accepted": True})
+        metrics.update(
+            {
+                "semantic_score": 100,
+                "accepted": True,
+                "style_score": 100,
+                "style_accepted": True,
+            }
+        )
         return metrics
 
     path = Path(image_path)
@@ -4346,6 +8260,8 @@ Retorne somente JSON válido, sem markdown:
 {{
   "semantic_score": 0-100,
   "accepted": true/false,
+  "style_score": 0-100,
+  "style_accepted": true/false,
   "hero_object_legibility": true/false,
   "hero_object_notes": "descrição curta do que está legível ou falhou",
   "issues": ["issue_code"],
@@ -4375,6 +8291,8 @@ JSON schema:
 {{
   "semantic_score": 0-100,
   "accepted": true/false,
+  "style_score": 0-100,
+  "style_accepted": true/false,
   "hero_object_legibility": true/false,
   "hero_object_notes": "short note",
   "issues": ["issue_code"],
@@ -4392,6 +8310,7 @@ JSON schema:
                 scene=scene,
                 style_key=style_key,
                 model=str(metrics["model"]),
+                visual_bible=visual_bible,
             )
         except SemanticQAProviderError as exc:
             provider_errors.append(str(exc))
@@ -4529,6 +8448,25 @@ def _combine_image_quality(
     if controlled_guidance.get("control_workflow_required"):
         issues.append("control_workflow_required")
 
+    identity_assessments = list(semantic_metrics.get("character_identity", []))
+    identity_score = (
+        round(
+            sum(_safe_float(item.get("score")) for item in identity_assessments)
+            / len(identity_assessments),
+            1,
+        )
+        if identity_assessments
+        else None
+    )
+    identity_accepted = (
+        all(item.get("accepted") is True for item in identity_assessments)
+        if identity_assessments
+        else None
+    )
+    hero_objects = list(semantic_metrics.get("hero_objects", []))
+    objects_accepted = (
+        semantic_metrics.get("hero_object_legibility") is True if hero_objects else None
+    )
     return {
         **technical_metrics,
         "technical_score": round(technical_score, 1),
@@ -4544,7 +8482,16 @@ def _combine_image_quality(
         "semantic_qa_provider_warnings": semantic_metrics.get("provider_warnings", []),
         "semantic_qa_error": semantic_metrics.get("error", ""),
         "semantic_qa_evidence": semantic_metrics.get("evidence", []),
-        "hero_objects": semantic_metrics.get("hero_objects", []),
+        "style_score": _safe_float(semantic_metrics.get("style_score"), 0.0),
+        "style_accepted": semantic_metrics.get("style_accepted") is True,
+        "identity_score": identity_score,
+        "identity_accepted": identity_accepted,
+        "character_identity": identity_assessments,
+        "objects_score": (
+            100.0 if objects_accepted is True else 0.0 if hero_objects else None
+        ),
+        "objects_accepted": objects_accepted,
+        "hero_objects": hero_objects,
         "hero_object_legibility": semantic_metrics.get("hero_object_legibility"),
         "hero_object_notes": semantic_metrics.get("hero_object_notes", ""),
         **controlled_guidance,
@@ -4597,7 +8544,7 @@ def _controlled_image_workflow_guidance(
             "wrong_ludovico_age",
         }
         & issue_codes
-    )
+    ) or any(code.startswith("identity_") for code in issue_codes)
     object_geometry_failed = bool(
         {
             "bowl_has_handle",
@@ -4736,14 +8683,17 @@ def _evaluate_image_set_consistency(
         return metrics
 
     try:
-        from google import genai
         from google.genai import errors, types
     except ImportError as exc:
         metrics["issues"].append(f"consistency_qa_failed:{type(exc).__name__}")
         return metrics
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = _build_google_genai_client(
+            api_key,
+            timeout_env="GEMINI_VISION_QA_TIMEOUT_SECONDS",
+            default_timeout_seconds=90,
+        )
         prompt = f"""
 Avalie se estas imagens pertencem ao mesmo filme.
 Use a bíblia visual abaixo como fonte da verdade:
@@ -4856,8 +8806,33 @@ def _probe_image_quality(
             edge_stat = ImageStat.Stat(grayscale.filter(ImageFilter.FIND_EDGES))
             edge_sharpness = edge_stat.stddev[0] if edge_stat.stddev else 0.0
             sharpness_for_gate = edge_sharpness
+            inner_edge_source = (
+                grayscale.crop((4, 4, image.width - 4, image.height - 4))
+                if image.width > 8 and image.height > 8
+                else grayscale
+            )
+            inner_edges = inner_edge_source.filter(ImageFilter.FIND_EDGES)
+            edge_histogram = inner_edges.histogram()
+            active_edge_threshold = 12
+            active_edge_pixels = sum(edge_histogram[active_edge_threshold:])
+            active_edge_strength = (
+                sum(
+                    value * count
+                    for value, count in enumerate(edge_histogram)
+                    if value >= active_edge_threshold
+                )
+                / active_edge_pixels
+                if active_edge_pixels
+                else 0.0
+            )
+            active_edge_density = active_edge_pixels / max(
+                1,
+                inner_edges.width * inner_edges.height,
+            )
             metrics["contrast"] = round(contrast, 2)
             metrics["edge_sharpness"] = round(edge_sharpness, 2)
+            metrics["active_edge_density"] = round(active_edge_density, 4)
+            metrics["active_edge_strength"] = round(active_edge_strength, 2)
             metrics["sharpness_gate_scope"] = "global"
             if scene and _hero_object_requirements(scene):
                 left, top, right, bottom = _hero_object_quality_box(scene)
@@ -4879,6 +8854,44 @@ def _probe_image_quality(
 
         pixel_count = int(metrics["width"]) * int(metrics["height"])
         min_edge_sharpness = _image_min_edge_sharpness()
+        if scene and scene.get("scene_role") == "character_reference":
+            min_edge_sharpness = max(
+                8.0,
+                min(
+                    min_edge_sharpness,
+                    _safe_float(
+                        os.getenv(
+                            "LOCAL_CAST_REFERENCE_MIN_EDGE_SHARPNESS",
+                            "20",
+                        ),
+                        20.0,
+                    ),
+                ),
+            )
+        metrics["min_edge_sharpness"] = round(min_edge_sharpness, 2)
+        cast_active_edge_fallback = bool(
+            scene
+            and scene.get("scene_role") == "character_reference"
+            and active_edge_density
+            >= _safe_float(
+                os.getenv(
+                    "LOCAL_CAST_REFERENCE_MIN_ACTIVE_EDGE_DENSITY",
+                    "0.005",
+                ),
+                0.005,
+            )
+            and active_edge_strength
+            >= _safe_float(
+                os.getenv(
+                    "LOCAL_CAST_REFERENCE_MIN_ACTIVE_EDGE_STRENGTH",
+                    "30",
+                ),
+                30.0,
+            )
+        )
+        metrics["active_edge_fallback_used"] = bool(
+            sharpness_for_gate < min_edge_sharpness and cast_active_edge_fallback
+        )
         size_score = min(25, metrics["size_bytes"] / 16000)
         resolution_score = min(30, pixel_count / (512 * 512) * 30)
         contrast_score = min(25, contrast / 64 * 25)
@@ -4892,7 +8905,7 @@ def _probe_image_quality(
             metrics["issues"].append("low_resolution")
         if contrast < 8:
             metrics["issues"].append("low_contrast")
-        if sharpness_for_gate < min_edge_sharpness:
+        if sharpness_for_gate < min_edge_sharpness and not cast_active_edge_fallback:
             metrics["issues"].append("blurry_image")
             metrics["quality_score"] = min(_safe_float(metrics["quality_score"]), 76.0)
     except (OSError, ValueError) as exc:
@@ -5601,6 +9614,21 @@ def _aggregate_quality(
         "audio": average(audio_metrics),
         "video": float(video_metrics.get("quality_score", 0) or 0),
     }
+
+    def gate_average(key: str) -> float | None:
+        scores = [
+            float(item[key]) for item in image_metrics if item.get(key) is not None
+        ]
+        return round(sum(scores) / len(scores), 1) if scores else None
+
+    image_gates = {
+        "technical": gate_average("technical_score"),
+        "semantic": gate_average("semantic_score"),
+        "identity": gate_average("identity_score"),
+        "style": gate_average("style_score"),
+        "objects": gate_average("objects_score"),
+    }
+    minimum_gate_score = float(_image_semantic_min_score())
     if categories["images"] > 0:
         overall = round(
             (categories["images"] * 0.6)
@@ -5615,12 +9643,29 @@ def _aggregate_quality(
         item
         for item in image_metrics
         if "semantic_gate_blocked" in item.get("issues", [])
+        or item.get("technical_accepted") is False
+        or (
+            item.get("technical_score") is not None
+            and _safe_float(item.get("technical_score"), 0.0) < minimum_gate_score
+        )
         or (
             item.get("semantic_accepted") is False
-            and (
-                item.get("generation_method") in {"gemini_image", "mock"}
-                or str(item.get("generation_method", "")).startswith("comfyui")
-            )
+            or _safe_float(item.get("semantic_score"), 0.0) < minimum_gate_score
+        )
+        or item.get("style_accepted") is False
+        or (
+            item.get("style_score") is not None
+            and _safe_float(item.get("style_score"), 0.0) < minimum_gate_score
+        )
+        or item.get("identity_accepted") is False
+        or (
+            item.get("identity_score") is not None
+            and _safe_float(item.get("identity_score"), 0.0) < minimum_gate_score
+        )
+        or item.get("objects_accepted") is False
+        or (
+            item.get("objects_score") is not None
+            and _safe_float(item.get("objects_score"), 0.0) < minimum_gate_score
         )
     ]
     gate_status = "blocked" if blocked_images else "passed"
@@ -5629,6 +9674,7 @@ def _aggregate_quality(
     return {
         "overall_score": overall,
         "categories": categories,
+        "image_gates": image_gates,
         "gate_status": gate_status,
         "blocked_image_count": len(blocked_images),
         "blocking_issues": [
@@ -5636,6 +9682,10 @@ def _aggregate_quality(
                 "scene_id": item.get("scene_id"),
                 "generation_method": item.get("generation_method"),
                 "semantic_score": item.get("semantic_score"),
+                "technical_score": item.get("technical_score"),
+                "identity_score": item.get("identity_score"),
+                "style_score": item.get("style_score"),
+                "objects_score": item.get("objects_score"),
                 "control_workflow_required": item.get(
                     "control_workflow_required", False
                 ),
@@ -5804,110 +9854,26 @@ Regras visuais obrigatórias:
 - Se a história pedir gatos/gatinhos, não inclua cachorro.
 - Evite inserir pessoas extras que não existem na cena.
 - Evite close-ups extremos, corpo cortado, mãos em destaque e rostos parcialmente ocultos.
-
-Retorne em formato JSON:
-[
-  {{
-    "scene_id": 1,
-    "description": "...",
-    "prompt": "...",
-    "duration": 6,
-    "must_include": ["..."],
-    "must_not_include": ["..."],
-    "source_excerpt": "trecho literal curto da história",
-    "camera_motion": "slow cinematic push-in toward the main subject"
-  }},
-  ...
-]
+- Preencha exatamente {max_scenes} itens no array estruturado solicitado.
 """
-
-                    response = llm.invoke(scene_prompt)
-
-                    # Parse response
-                    # Extrair conteúdo da resposta - tratar diferentes formatos
-                    raw_content = (
-                        response.content
-                        if hasattr(response, "content")
-                        else str(response)
+                    response = llm.invoke_json(
+                        scene_prompt,
+                        _scene_response_json_schema(max_scenes),
+                        max_output_tokens=8192,
                     )
-
-                    # Debug: ver tipo e conteúdo original
-                    print(f"🔍 DEBUG - Tipo de raw_content: {type(raw_content)}")
-                    print(
-                        f"🔍 DEBUG - raw_content (primeiros 200 chars): {str(raw_content)[:200]}"
+                    scenes = _validate_structured_scenes(
+                        response.parsed,
+                        max_scenes,
                     )
-
-                    # Verificar se é um dicionário real ou string que parece dict
-                    if isinstance(raw_content, dict):
-                        content = raw_content.get("text", str(raw_content))
-                    elif isinstance(raw_content, list):
-                        content = " ".join(str(item) for item in raw_content)
-                    else:
-                        # É string - verificar se parece um dict
-                        content_str = str(raw_content)
-
-                        # Tentar extrair valor de 'text' se a string parecer um dict
-                        if (
-                            "{'type': 'text', 'text':" in content_str
-                            or '{"type": "text", "text":' in content_str
-                        ):
-                            try:
-                                # Tentar parse como dict Python
-                                parsed = ast.literal_eval(content_str)
-                                if isinstance(parsed, dict) and "text" in parsed:
-                                    content = parsed["text"]
-                                    print("✅ Extraído campo 'text' do dict")
-                                else:
-                                    content = content_str
-                            except (SyntaxError, ValueError):
-                                # Fallback: regex para extrair texto
-                                text_match = re.search(
-                                    r"'text':\s*['\"](.+?)['\"]", content_str, re.DOTALL
-                                )
-                                if text_match:
-                                    content = text_match.group(1)
-                                    print("✅ Extraído campo 'text' via regex")
-                                else:
-                                    content = content_str
-                        else:
-                            content = content_str
-
-                    # Debug: ver resposta do LLM processada
-                    print(
-                        f"🔍 DEBUG - Resposta LLM processada (primeiros 500 chars): {content[:500]}"
+                    scenes = _merge_canonical_scenes(
+                        scenes,
+                        story_text,
+                        image_style,
+                        max_scenes,
                     )
-
-                    # Extract JSON from response - melhorar regex para markdown
-                    # Remover markdown se presente
-                    content = content.replace("```json", "").replace("```", "").strip()
-
-                    # Procurar por array JSON
-                    json_match = re.search(r"\[\s*\{.*?\}\s*\]", content, re.DOTALL)
-                    if json_match:
-                        json_str = json_match.group()
-                        # Limpar possíveis problemas
-                        json_str = json_str.replace("{{", "{").replace("}}", "}")
-                        # Remover aspas extras se presentes
-                        json_str = json_str.replace('"[{', "[{").replace('}]"', "}]")
-
-                        try:
-                            scenes = json.loads(json_str)
-                            scenes = _merge_canonical_scenes(
-                                scenes,
-                                story_text,
-                                image_style,
-                                max_scenes,
-                            )
-                            print(f"✅ {len(scenes)} cenas geradas com LLM")
-                        except json.JSONDecodeError as e:
-                            print(f"⚠️ Erro no JSON: {e}")
-                            print(f"🔍 JSON tentado: {json_str[:200]}...")
-                            raise ValueError("JSON inválido mesmo após limpeza")
-                    else:
-                        print(
-                            f"🔍 Conteúdo completo (primeiros 1000 chars): {content[:1000]}"
-                        )
-                        raise ValueError("Não foi possível extrair JSON da resposta")
+                    if len(scenes) != max_scenes:
+                        raise ValueError("canonical_scene_merge_count_mismatch")
+                    print(f"✅ {len(scenes)} cenas estruturadas geradas com LLM")
 
                 except (
                     AttributeError,
@@ -5965,6 +9931,7 @@ Retorne em formato JSON:
             runpod_endpoint_id = os.getenv("RUNPOD_ENDPOINT_ID", "")
             image_style = state.get("image_style", DEFAULT_IMAGE_STYLE)
             quality_preset_key = state.get("image_quality_preset", "high")
+            cast_resume_local_only = bool(state.get("cast_resume_local_only", False))
             quality_preset = _resolve_quality_preset(quality_preset_key)
             session_id = state.get("session_id", "default")
             style_label = _resolve_image_style(image_style)["label"]
@@ -5972,9 +9939,13 @@ Retorne em formato JSON:
             image_provider = _image_generation_provider()
             model_family = _comfyui_model_family()
             active_image_model = (
-                _comfyui_flux2_model_names()[0]
-                if image_provider == "comfyui" and model_family == "flux2_klein"
-                else checkpoint_name
+                _fal_flux_model()
+                if image_provider == "fal"
+                else (
+                    _comfyui_flux2_model_names()[0]
+                    if image_provider == "comfyui" and model_family == "flux2_klein"
+                    else checkpoint_name
+                )
             )
             visual_bible = state.get("visual_bible") or _build_visual_bible(
                 state.get("story_text", ""),
@@ -5991,143 +9962,589 @@ Retorne em formato JSON:
             scene_images = []
             runpod_jobs = []
             image_metrics = []
-            configured_reference_path = str(
-                visual_bible.get("character_reference_image_path") or ""
-            ).strip()
-            reference_image_path: str | None = (
-                configured_reference_path
-                if configured_reference_path
-                and os.path.isfile(configured_reference_path)
-                and os.path.getsize(configured_reference_path) > 1000
-                else None
-            )
             runpod_gpu_usd_per_second = _safe_float(
                 os.getenv("RUNPOD_GPU_USD_PER_SECOND", "0.00044")
             )
             max_attempts = _image_generation_max_attempts()
+            required_characters = _required_production_cast(scenes, visual_bible)
 
-            if (
-                image_provider == "gemini"
-                and reference_image_path is None
-                and _character_reference_enabled()
-                and _story_has_any(state.get("story_text", ""), ["alice"])
-            ):
-                print("🎭 Gerando referência fixa da personagem Alice...")
-                reference_scene = _build_character_reference_scene(visual_bible)
-                reference_path = "output/alice_character_reference.png"
-                reference_seed = _scene_seed(
-                    session_id,
-                    image_style,
-                    "alice_character_reference",
-                )
-                reference_prompt = _build_image_prompt(
-                    reference_scene,
-                    image_style,
-                    visual_bible,
-                    "Create a neutral production character sheet. Preserve identity, avoid story action, keep plain backdrop.",
-                )
-                job_monitor, _image_record, image_metric = _run_gemini_image_attempt(
-                    scene=reference_scene,
-                    image_path=reference_path,
-                    directed_prompt=reference_prompt,
-                    image_style=image_style,
-                    style_label=style_label,
-                    quality_preset_key=quality_preset_key,
-                    scene_seed=reference_seed,
-                    visual_bible=visual_bible,
-                    attempt=0,
-                    reference_image_path=None,
-                )
-                runpod_jobs.append(job_monitor)
-                if _character_reference_accepted(image_metric) and os.path.exists(
-                    reference_path
-                ):
-                    reference_image_path = reference_path
-                    visual_bible["character_reference_image_path"] = reference_path
-                    visual_bible["character_reference_quality"] = {
-                        "quality_score": (
-                            image_metric.get("quality_score") if image_metric else None
-                        ),
-                        "semantic_score": (
-                            image_metric.get("semantic_score") if image_metric else None
-                        ),
-                    }
-                    print("✅ Referência fixa da Alice criada e será usada nas cenas.")
-                else:
-                    print(
-                        "⚠️ Referência fixa da Alice não passou no QA; usando fallback por cena."
-                    )
-
-            if (
-                image_provider == "comfyui"
-                and reference_image_path is None
-                and runpod_api_key
-                and runpod_endpoint_id
-                and _character_reference_enabled()
-                and _story_has_any(state.get("story_text", ""), ["alice"])
-            ):
-                print("🎭 Gerando referência fixa da Alice no ComfyUI...")
+            if _character_reference_enabled():
                 os.makedirs("output", exist_ok=True)
-                reference_scene = _build_character_reference_scene(visual_bible)
-                reference_path = "output/alice_character_reference.png"
-                reference_seed = _scene_seed(
-                    session_id,
-                    image_style,
-                    "alice_character_reference_comfyui",
-                )
-                reference_prompt_builder = (
-                    _build_flux2_image_prompt
-                    if model_family == "flux2_klein"
-                    else _build_image_prompt
-                )
-                reference_prompt = reference_prompt_builder(
-                    reference_scene,
-                    image_style,
-                    visual_bible,
-                    "Production character reference only. One ten-year-old Alice, neutral pose, plain backdrop, no props and no other people.",
-                )
-                job_monitor, _image_record, image_metric = _run_comfyui_image_attempt(
-                    scene=reference_scene,
-                    image_path=reference_path,
-                    directed_prompt=reference_prompt,
-                    image_style=image_style,
-                    style_label=style_label,
-                    quality_preset_key=quality_preset_key,
-                    quality_preset=quality_preset,
-                    checkpoint_name=checkpoint_name,
-                    scene_seed=reference_seed,
-                    visual_bible=visual_bible,
-                    runpod_endpoint_id=runpod_endpoint_id,
-                    runpod_api_key=runpod_api_key,
-                    runpod_gpu_usd_per_second=runpod_gpu_usd_per_second,
-                    attempt=0,
-                )
-                runpod_jobs.append(job_monitor)
-                if _character_reference_accepted(image_metric) and os.path.isfile(
-                    reference_path
-                ):
-                    reference_image_path = reference_path
-                    visual_bible["character_reference_image_path"] = reference_path
-                    visual_bible["character_reference_quality"] = {
-                        "quality_score": image_metric.get("quality_score"),
-                        "semantic_score": image_metric.get("semantic_score"),
-                    }
-                    print("✅ Referência ComfyUI da Alice aprovada para IP-Adapter.")
-                else:
-                    print(
-                        "⛔ Referência ComfyUI da Alice reprovada; retries de identidade "
-                        "não usarão uma âncora não aprovada."
-                    )
+                cast_pose_circuit_open = False
+                for character in required_characters:
+                    if cast_pose_circuit_open:
+                        break
+                    if _approved_cast_reference_path(character):
+                        continue
+                    character_id = str(character["id"])
+                    character_name = str(character["name"])
+                    print(f"🎭 Gerando Cast Bible v2: {character_name}...")
+                    _begin_cast_reference_revision(character)
+                    reference_anchor_path: str | None = None
 
-            for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
+                    def generate_reference_attempt(
+                        view_id: str,
+                        attempt: int,
+                        anchor_path: str | None,
+                        retry_issues: Sequence[str] = (),
+                    ) -> tuple[
+                        Dict[str, Any],
+                        Dict[str, Any] | None,
+                        Dict[str, Any] | None,
+                        str,
+                    ]:
+                        reference_scene = _build_character_reference_scene(
+                            visual_bible, character_id, view_id
+                        )
+                        reference_path = _cast_reference_attempt_path(
+                            character_id,
+                            view_id,
+                            attempt,
+                        )
+                        reference_seed = _scene_seed(
+                            session_id,
+                            image_style,
+                            f"{character_id}_character_reference:{view_id}:{image_provider}:{attempt}",
+                        )
+                        reference_prompt_builder = (
+                            _build_flux2_image_prompt
+                            if image_provider == "comfyui"
+                            and model_family == "flux2_klein"
+                            else _build_image_prompt
+                        )
+                        reference_prompt = reference_prompt_builder(
+                            reference_scene,
+                            image_style,
+                            visual_bible,
+                            "Create exactly one production identity reference view. Preserve exact age, face, hair, wardrobe and body proportions. No contact sheet, story action, props, extra subjects or text.",
+                        )
+                        if attempt > 0:
+                            issue_text = (
+                                ", ".join(retry_issues) or "previous gate failure"
+                            )
+                            reference_prompt += (
+                                f" Retry {attempt + 1}: correct these failures: {issue_text}. "
+                                f"The mandatory camera contract is: {CAST_REFERENCE_VIEWS[view_id]}."
+                            )
+                        reference_quality_preset = _cast_reference_quality_preset(
+                            quality_preset,
+                            view_id,
+                        )
+                        derived_reference_view = bool(
+                            view_id != "front" and anchor_path
+                        )
+                        if _cast_reference_attempt_reusable(reference_path):
+                            print(
+                                f"♻️ Reavaliando referência existente: "
+                                f"{character_name} · {view_id}."
+                            )
+                            reused_started_at = time.monotonic()
+                            technical_metrics = _probe_image_quality(
+                                reference_path,
+                                scene=reference_scene,
+                            )
+                            if _trusted_resumed_cast_reference(reference_path):
+                                semantic_metrics = {
+                                    "semantic_score": 100.0,
+                                    "semantic_qa_enabled": True,
+                                    "accepted": True,
+                                    "critical_failures": [],
+                                    "issues": [],
+                                    "provider": "local_resume_cache",
+                                    "model": "sha256_verified_prior_gate",
+                                    "style_score": 100.0,
+                                    "style_accepted": True,
+                                }
+                            else:
+                                with _LOCAL_SEMANTIC_QA_LOCK:
+                                    semantic_metrics = _evaluate_image_semantics(
+                                        reference_path,
+                                        reference_scene,
+                                        reference_prompt,
+                                        image_style,
+                                        visual_bible,
+                                    )
+                            combined_metrics = _combine_image_quality(
+                                technical_metrics,
+                                semantic_metrics,
+                            )
+                            reused_metric = {
+                                "scene_id": reference_scene["scene_id"],
+                                "generation_method": "resumed_cast_reference",
+                                "attempt": attempt,
+                                "style": image_style,
+                                "quality_preset": quality_preset_key,
+                                "checkpoint": checkpoint_name,
+                                "model_family": model_family,
+                                "seed": reference_seed,
+                                "controlled_workflow": derived_reference_view,
+                                **combined_metrics,
+                            }
+                            reused_monitor = {
+                                "scene_id": reference_scene["scene_id"],
+                                "endpoint_id": None,
+                                "job_id": None,
+                                "status": "RESUMED_LOCAL_QA",
+                                "attempt": attempt,
+                                "image_path": reference_path,
+                                "elapsed_seconds": round(
+                                    time.monotonic() - reused_started_at,
+                                    3,
+                                ),
+                                "estimated_cost_usd": 0.0,
+                                "cost_estimate_status": "reused_local_asset",
+                            }
+                            return (
+                                reused_monitor,
+                                {
+                                    "scene_id": reference_scene["scene_id"],
+                                    "image_path": reference_path,
+                                    "generation_method": "resumed_cast_reference",
+                                },
+                                reused_metric,
+                                reference_path,
+                            )
+                        if cast_resume_local_only:
+                            return (
+                                {
+                                    "scene_id": reference_scene["scene_id"],
+                                    "endpoint_id": None,
+                                    "job_id": None,
+                                    "status": "LOCAL_ASSET_MISSING",
+                                    "attempt": attempt,
+                                    "image_path": None,
+                                    "elapsed_seconds": 0.0,
+                                    "estimated_cost_usd": 0.0,
+                                    "cost_estimate_status": "external_generation_disabled",
+                                    "error": "cast_reference_local_asset_missing",
+                                },
+                                None,
+                                {
+                                    "scene_id": reference_scene["scene_id"],
+                                    "generation_method": "local_resume_missing_asset",
+                                    "attempt": attempt,
+                                    "style": image_style,
+                                    "quality_preset": quality_preset_key,
+                                    "checkpoint": checkpoint_name,
+                                    "model_family": model_family,
+                                    "quality_score": 0.0,
+                                    "semantic_score": 0.0,
+                                    "valid": False,
+                                    "semantic_accepted": False,
+                                    "issues": ["cast_reference_local_asset_missing"],
+                                },
+                                reference_path,
+                            )
+                        control_source_path = anchor_path
+                        secondary_reference_path = anchor_path
+                        pose_guide_path: str | None = None
+                        if (
+                            derived_reference_view
+                            and view_id in CAST_REFERENCE_POSE_VIEWS
+                        ):
+                            if view_id == "profile":
+                                reference_scene["qwen_source_role"] = (
+                                    "identity_anchor_only"
+                                )
+                                control_source_path = anchor_path
+                                secondary_reference_path = None
+                            else:
+                                pose_guide_path = _create_cast_reference_pose_guide(
+                                    character_id=character_id,
+                                    view_id=view_id,
+                                    width=int(reference_quality_preset["width"]),
+                                    height=int(reference_quality_preset["height"]),
+                                )
+                                reference_scene["qwen_source_role"] = "pose_guide"
+                                control_source_path = pose_guide_path
+                        if image_provider == "gemini":
+                            job_monitor, _image_record, image_metric = (
+                                _run_gemini_image_attempt(
+                                    scene=reference_scene,
+                                    image_path=reference_path,
+                                    directed_prompt=reference_prompt,
+                                    image_style=image_style,
+                                    style_label=style_label,
+                                    quality_preset_key=quality_preset_key,
+                                    scene_seed=reference_seed,
+                                    visual_bible=visual_bible,
+                                    attempt=attempt,
+                                    reference_image_path=(
+                                        anchor_path if derived_reference_view else None
+                                    ),
+                                )
+                            )
+                        elif image_provider == "fal":
+                            fal_reference_strategy = _fal_cast_reference_strategy(
+                                character_kind=str(character.get("kind") or ""),
+                                derived_reference_view=derived_reference_view,
+                                has_anchor=bool(anchor_path),
+                            )
+                            if fal_reference_strategy == "nano_banana_edit":
+                                fal_reference_runner = _run_fal_reference_edit_attempt
+                            else:
+                                fal_reference_runner = _run_fal_flux_image_attempt
+                            fal_reference_kwargs: Dict[str, Any] = {
+                                "scene": reference_scene,
+                                "image_path": reference_path,
+                                "directed_prompt": reference_prompt,
+                                "image_style": image_style,
+                                "style_label": style_label,
+                                "quality_preset_key": quality_preset_key,
+                                "quality_preset": reference_quality_preset,
+                                "scene_seed": reference_seed,
+                                "visual_bible": visual_bible,
+                                "attempt": attempt,
+                            }
+                            if derived_reference_view and anchor_path:
+                                fal_reference_paths = [anchor_path]
+                                if view_id == "three_quarter":
+                                    profile_path = f"output/{character_id}_character_reference_profile.png"
+                                    if _trusted_resumed_cast_reference(profile_path):
+                                        fal_reference_paths.append(profile_path)
+                                elif pose_guide_path:
+                                    fal_reference_paths.append(pose_guide_path)
+                                fal_reference_kwargs["reference_image_paths"] = (
+                                    fal_reference_paths
+                                )
+                            job_monitor, _image_record, image_metric = (
+                                fal_reference_runner(
+                                    **fal_reference_kwargs,
+                                )
+                            )
+                        elif runpod_api_key and runpod_endpoint_id:
+                            job_monitor, _image_record, image_metric = (
+                                _run_comfyui_image_attempt(
+                                    scene=reference_scene,
+                                    image_path=reference_path,
+                                    directed_prompt=reference_prompt,
+                                    image_style=image_style,
+                                    style_label=style_label,
+                                    quality_preset_key=quality_preset_key,
+                                    quality_preset=reference_quality_preset,
+                                    checkpoint_name=checkpoint_name,
+                                    scene_seed=reference_seed,
+                                    visual_bible=visual_bible,
+                                    runpod_endpoint_id=runpod_endpoint_id,
+                                    runpod_api_key=runpod_api_key,
+                                    runpod_gpu_usd_per_second=runpod_gpu_usd_per_second,
+                                    attempt=attempt,
+                                    controlled_workflow=derived_reference_view,
+                                    control_strategy="controlled_inpaint",
+                                    control_image_path=(
+                                        control_source_path
+                                        if derived_reference_view
+                                        else None
+                                    ),
+                                    reference_image_path=(
+                                        secondary_reference_path
+                                        if derived_reference_view
+                                        else None
+                                    ),
+                                    semantic_repair_backend_override=(
+                                        "qwen_image_edit_2511"
+                                        if derived_reference_view
+                                        else None
+                                    ),
+                                    qwen_edit_denoise_override=(
+                                        _cast_reference_qwen_denoise(view_id)
+                                        if derived_reference_view
+                                        else None
+                                    ),
+                                )
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"cast_reference_provider_unavailable:{character_id}"
+                            )
+                        return (
+                            job_monitor,
+                            _image_record,
+                            image_metric,
+                            reference_path,
+                        )
+
+                    def record_reference_attempt(
+                        view_id: str,
+                        result: tuple[
+                            Dict[str, Any],
+                            Dict[str, Any] | None,
+                            Dict[str, Any] | None,
+                            str,
+                        ],
+                        anchor_path: str | None,
+                    ) -> bool:
+                        job_monitor, _image_record, image_metric, reference_path = (
+                            result
+                        )
+                        runpod_jobs.append(job_monitor)
+                        if view_id != "front" and anchor_path:
+                            _apply_cast_reference_identity_gate(
+                                character=character,
+                                anchor_path=anchor_path,
+                                candidate_path=reference_path,
+                                view_id=view_id,
+                                image_metric=image_metric,
+                            )
+                        _update_cast_reference(
+                            character,
+                            reference_path,
+                            image_metric,
+                            view_id,
+                        )
+                        view_status = character["reference"]["views"][view_id]["status"]
+                        print(
+                            f"{'✅' if view_status == 'approved' else '⛔'} "
+                            f"{character_name} · {view_id}: {view_status}."
+                        )
+                        return bool(
+                            character["reference"]["views"][view_id].get(
+                                "automatic_approved"
+                            )
+                        )
+
+                    front_issues: Sequence[str] = ()
+                    for attempt in range(_cast_reference_max_attempts()):
+                        front_result = generate_reference_attempt(
+                            "front",
+                            attempt,
+                            None,
+                            front_issues,
+                        )
+                        if record_reference_attempt("front", front_result, None):
+                            reference_anchor_path = front_result[3]
+                            break
+                        if not _cast_reference_job_retryable(front_result[0]):
+                            break
+                        front_issues = tuple(
+                            character["reference"]["views"]["front"]
+                            .get("quality", {})
+                            .get("issues", [])
+                        )
+
+                    derived_view_ids = [
+                        view_id
+                        for view_id in CAST_REFERENCE_VIEWS
+                        if view_id != "front"
+                    ]
+                    if reference_anchor_path is None:
+                        for view_id in derived_view_ids:
+                            character["reference"]["views"][view_id].update(
+                                {
+                                    "status": "blocked_by_anchor",
+                                    "quality": {
+                                        "issues": ["cast_reference_anchor_rejected"]
+                                    },
+                                }
+                            )
+                    else:
+                        pending_views = list(derived_view_ids)
+                        consecutive_pose_failures = 0
+                        retry_issues_by_view: Dict[str, Sequence[str]] = {
+                            view_id: () for view_id in pending_views
+                        }
+                        for attempt in range(_cast_reference_max_attempts()):
+                            if not pending_views:
+                                break
+                            results_by_view: Dict[
+                                str,
+                                tuple[
+                                    Dict[str, Any],
+                                    Dict[str, Any] | None,
+                                    Dict[str, Any] | None,
+                                    str,
+                                ],
+                            ] = {}
+                            max_workers = min(
+                                _cast_reference_derived_concurrency(),
+                                len(pending_views),
+                            )
+                            if any(
+                                view_id in CAST_REFERENCE_POSE_VIEWS
+                                for view_id in pending_views
+                            ):
+                                max_workers = 1
+                            if image_provider == "comfyui" and max_workers > 1:
+                                with concurrent.futures.ThreadPoolExecutor(
+                                    max_workers=max_workers,
+                                    thread_name_prefix=f"cast-{character_id}",
+                                ) as executor:
+                                    futures = {
+                                        executor.submit(
+                                            generate_reference_attempt,
+                                            view_id,
+                                            attempt,
+                                            reference_anchor_path,
+                                            retry_issues_by_view[view_id],
+                                        ): view_id
+                                        for view_id in pending_views
+                                    }
+                                    for future in concurrent.futures.as_completed(
+                                        futures
+                                    ):
+                                        results_by_view[futures[future]] = (
+                                            future.result()
+                                        )
+                            else:
+                                next_pending_views: List[str] = []
+                                for view_index, view_id in enumerate(pending_views):
+                                    result = generate_reference_attempt(
+                                        view_id,
+                                        attempt,
+                                        reference_anchor_path,
+                                        retry_issues_by_view[view_id],
+                                    )
+                                    accepted = record_reference_attempt(
+                                        view_id,
+                                        result,
+                                        reference_anchor_path,
+                                    )
+                                    if not accepted:
+                                        if _cast_reference_job_retryable(result[0]):
+                                            next_pending_views.append(view_id)
+                                        retry_issues_by_view[view_id] = tuple(
+                                            character["reference"]["views"][view_id]
+                                            .get("quality", {})
+                                            .get("issues", [])
+                                        )
+                                    if (
+                                        view_id in CAST_REFERENCE_POSE_VIEWS
+                                        and result[2] is not None
+                                    ):
+                                        consecutive_pose_failures = (
+                                            0
+                                            if accepted
+                                            else consecutive_pose_failures + 1
+                                        )
+                                        if (
+                                            consecutive_pose_failures
+                                            >= _cast_reference_pose_failure_limit()
+                                        ):
+                                            remaining_views = pending_views[
+                                                view_index + 1 :
+                                            ]
+                                            _block_cast_reference_views_for_pose_circuit(
+                                                character,
+                                                remaining_views,
+                                            )
+                                            cast_pose_circuit_open = True
+                                            print(
+                                                "⛔ Circuit breaker de pose aberto após "
+                                                f"{consecutive_pose_failures} falhas "
+                                                f"consecutivas em {character_name}."
+                                            )
+                                            break
+                                pending_views = next_pending_views
+                                if cast_pose_circuit_open:
+                                    break
+                                continue
+
+                            next_pending_views: List[str] = []
+                            for view_id in pending_views:
+                                accepted = record_reference_attempt(
+                                    view_id,
+                                    results_by_view[view_id],
+                                    reference_anchor_path,
+                                )
+                                if not accepted:
+                                    if _cast_reference_job_retryable(
+                                        results_by_view[view_id][0]
+                                    ):
+                                        next_pending_views.append(view_id)
+                                    retry_issues_by_view[view_id] = tuple(
+                                        character["reference"]["views"][view_id]
+                                        .get("quality", {})
+                                        .get("issues", [])
+                                    )
+                            pending_views = next_pending_views
+
+                    if _approved_cast_reference_path(character):
+                        print(
+                            f"✅ Pacote canônico aprovado: {character_name} "
+                            f"v{character['reference']['version']}."
+                        )
+                    else:
+                        print(f"⛔ Pacote canônico bloqueado: {character_name}.")
+                    if cast_pose_circuit_open:
+                        break
+
+            cast_status = _refresh_cast_bible_status(visual_bible, required_characters)
+            if _character_reference_enabled() and cast_status["status"] == "blocked":
+                stage = _cast_reference_waiting_stage(required_characters)
+                state.update(
+                    {
+                        "visual_bible": visual_bible,
+                        "scene_images": [],
+                        "images_count": 0,
+                        "runpod_jobs": runpod_jobs,
+                        "quality_metrics": {
+                            **state.get("quality_metrics", {}),
+                            "images": [],
+                            "cast_reference_status": (
+                                "pending_human_review"
+                                if stage == "awaiting_cast_reference_approval"
+                                else "regeneration_required"
+                            ),
+                            "cast_reference_blockers": cast_status.get(
+                                "missing_reference_ids", []
+                            ),
+                        },
+                        "current_step": stage,
+                        "status": stage,
+                    }
+                )
+                return state
+
+            if image_provider == "comfyui" and model_family == "flux2_klein":
+                lora_gate = _flux2_lora_gate(scenes, visual_bible)
+                visual_bible["lora_gate"] = lora_gate
+                if lora_gate["status"] == "blocked":
+                    state.update(
+                        {
+                            "visual_bible": visual_bible,
+                            "scene_images": [],
+                            "images_count": 0,
+                            "runpod_jobs": runpod_jobs,
+                            "quality_metrics": {
+                                **state.get("quality_metrics", {}),
+                                "images": [],
+                                "cast_reference_status": "approved",
+                                "lora_gate": lora_gate,
+                            },
+                            "current_step": "awaiting_character_lora_training",
+                            "status": "awaiting_character_lora_training",
+                        }
+                    )
+                    return state
+
+            reference_image_path = (
+                _scene_reference_image_path(scenes[0], visual_bible) if scenes else None
+            )
+            alice_reference = _cast_character(visual_bible, "alice")
+            if alice_reference:
+                approved_alice_path = _approved_cast_reference_path(alice_reference)
+                if approved_alice_path:
+                    visual_bible["character_reference_image_path"] = approved_alice_path
+                    visual_bible["character_reference_quality"] = alice_reference[
+                        "reference"
+                    ]["quality"]
+
+            for i, scene in enumerate(scenes):
                 try:
                     print(f"🎨 Gerando imagem para cena {scene['scene_id']}...")
+                    reference_image_path = _scene_reference_image_path(
+                        scene, visual_bible
+                    )
+                    reference_image_paths = _scene_reference_image_paths(
+                        scene,
+                        visual_bible,
+                    )
 
                     # Create output directory
                     os.makedirs("output", exist_ok=True)
                     image_path = f"output/scene_{scene['scene_id']}_image.png"
 
-                    if image_provider == "gemini":
+                    if image_provider in {"gemini", "fal"}:
                         retry_instruction = ""
                         best_candidate: (
                             tuple[
@@ -6143,7 +10560,7 @@ Retorne em formato JSON:
                             attempt_seed = _scene_seed(
                                 session_id,
                                 image_style,
-                                f"gemini:{scene['scene_id']}:{attempt}",
+                                f"{image_provider}:{scene['scene_id']}:{attempt}",
                             )
                             directed_prompt = _build_image_prompt(
                                 scene,
@@ -6154,22 +10571,55 @@ Retorne em formato JSON:
                             attempt_path = (
                                 image_path
                                 if attempt == max_attempts
-                                else f"output/scene_{scene['scene_id']}_gemini_attempt_{attempt}.png"
+                                else f"output/scene_{scene['scene_id']}_{image_provider}_attempt_{attempt}.png"
                             )
-                            job_monitor, image_record, image_metric = (
-                                _run_gemini_image_attempt(
-                                    scene=scene,
-                                    image_path=attempt_path,
-                                    directed_prompt=directed_prompt,
-                                    image_style=image_style,
-                                    style_label=style_label,
-                                    quality_preset_key=quality_preset_key,
-                                    scene_seed=attempt_seed,
-                                    visual_bible=visual_bible,
-                                    attempt=attempt,
-                                    reference_image_path=reference_image_path,
+                            if image_provider == "fal":
+                                if reference_image_paths:
+                                    job_monitor, image_record, image_metric = (
+                                        _run_fal_reference_edit_attempt(
+                                            scene=scene,
+                                            image_path=attempt_path,
+                                            directed_prompt=directed_prompt,
+                                            image_style=image_style,
+                                            style_label=style_label,
+                                            quality_preset_key=quality_preset_key,
+                                            quality_preset=quality_preset,
+                                            scene_seed=attempt_seed,
+                                            visual_bible=visual_bible,
+                                            attempt=attempt,
+                                            reference_image_paths=reference_image_paths,
+                                        )
+                                    )
+                                else:
+                                    job_monitor, image_record, image_metric = (
+                                        _run_fal_flux_image_attempt(
+                                            scene=scene,
+                                            image_path=attempt_path,
+                                            directed_prompt=directed_prompt,
+                                            image_style=image_style,
+                                            style_label=style_label,
+                                            quality_preset_key=quality_preset_key,
+                                            quality_preset=quality_preset,
+                                            scene_seed=attempt_seed,
+                                            visual_bible=visual_bible,
+                                            attempt=attempt,
+                                        )
+                                    )
+                            else:
+                                job_monitor, image_record, image_metric = (
+                                    _run_gemini_image_attempt(
+                                        scene=scene,
+                                        image_path=attempt_path,
+                                        directed_prompt=directed_prompt,
+                                        image_style=image_style,
+                                        style_label=style_label,
+                                        quality_preset_key=quality_preset_key,
+                                        scene_seed=attempt_seed,
+                                        visual_bible=visual_bible,
+                                        attempt=attempt,
+                                        reference_image_path=reference_image_path,
+                                    )
                                 )
-                            )
                             runpod_jobs.append(job_monitor)
                             if not image_record or not image_metric:
                                 continue
@@ -6200,7 +10650,7 @@ Retorne em formato JSON:
                                 if reference_image_path is None:
                                     reference_image_path = image_path
                                 print(
-                                    "✅ Imagem Gemini/Nano Banana "
+                                    f"✅ Imagem {image_provider} "
                                     f"aceita: cena {scene['scene_id']} "
                                     f"(tentativa {attempt}, score={image_metric.get('quality_score')})"
                                 )
@@ -6213,7 +10663,8 @@ Retorne em formato JSON:
                             )
                             print(
                                 "🔁 QA visual reprovou a cena "
-                                f"{scene['scene_id']} no Gemini na tentativa {attempt}; regenerando."
+                                f"{scene['scene_id']} no {image_provider} "
+                                f"na tentativa {attempt}; regenerando."
                             )
                         if not selected_scene and best_candidate:
                             _, best_path, image_record, image_metric = best_candidate
@@ -6223,12 +10674,21 @@ Retorne em formato JSON:
                                         scene,
                                         image_style,
                                         quality_preset_key,
-                                        "gemini_image",
+                                        (
+                                            str(
+                                                image_metric.get("generation_method")
+                                                or _fal_flux_generation_method(
+                                                    _fal_flux_model()
+                                                )
+                                            )
+                                            if image_provider == "fal"
+                                            else "gemini_image"
+                                        ),
                                         image_metric,
                                     )
                                 )
                                 print(
-                                    "⛔ Cena bloqueada pelo QA semântico Gemini: "
+                                    f"⛔ Cena bloqueada pelo QA semântico {image_provider}: "
                                     f"cena {scene['scene_id']} "
                                     f"(melhor tentativa={image_metric.get('attempt')}, "
                                     f"semantic_score={image_metric.get('semantic_score')})"
@@ -6244,7 +10704,7 @@ Retorne em formato JSON:
                                 if reference_image_path is None:
                                     reference_image_path = image_path
                                 print(
-                                    "✅ Imagem Gemini/Nano Banana mantida com melhor score: "
+                                    f"✅ Imagem {image_provider} mantida com melhor score: "
                                     f"cena {scene['scene_id']} "
                                     f"(tentativa {image_metric.get('attempt')}, "
                                     f"score={image_metric.get('quality_score')})"
@@ -6252,13 +10712,20 @@ Retorne em formato JSON:
 
                     if any(
                         img["scene_id"] == scene["scene_id"]
-                        and img["generation_method"] == "gemini_image"
+                        and (
+                            img["generation_method"] == "gemini_image"
+                            or str(img["generation_method"]).startswith("fal_")
+                        )
                         for img in scene_images
                     ):
                         continue
 
                     # Generate image using ComfyUI via RunPod Serverless
-                    if runpod_api_key and runpod_endpoint_id:
+                    if (
+                        image_provider == "comfyui"
+                        and runpod_api_key
+                        and runpod_endpoint_id
+                    ):
                         retry_instruction = ""
                         repair_source_path: str | None = None
                         previous_metric: Dict[str, Any] | None = None
@@ -6368,6 +10835,11 @@ Retorne em formato JSON:
                             if os.path.isfile(attempt_path):
                                 repair_source_path = attempt_path
                             previous_metric = image_metric
+                            reference_image_path = _identity_retry_reference_path(
+                                image_metric,
+                                visual_bible,
+                                reference_image_path,
+                            )
                             retry_instruction = _semantic_retry_instruction(
                                 scene,
                                 image_metric,
@@ -6417,6 +10889,34 @@ Retorne em formato JSON:
                         and str(img["generation_method"]).startswith("comfyui")
                         for img in scene_images
                     ):
+                        continue
+
+                    if image_provider in {"fal", "gemini"}:
+                        if not any(
+                            metric.get("scene_id") == scene["scene_id"]
+                            for metric in image_metrics
+                        ):
+                            image_metrics.append(
+                                {
+                                    "scene_id": scene["scene_id"],
+                                    "generation_method": (
+                                        _fal_flux_generation_method(_fal_flux_model())
+                                        if image_provider == "fal"
+                                        else "gemini_image"
+                                    ),
+                                    "style": image_style,
+                                    "quality_preset": quality_preset_key,
+                                    "quality_score": 0,
+                                    "semantic_score": 0,
+                                    "valid": False,
+                                    "semantic_accepted": False,
+                                    "issues": [f"{image_provider}_generation_failed"],
+                                }
+                            )
+                        print(
+                            f"⛔ Cena {scene['scene_id']} sem imagem válida no "
+                            f"provider {image_provider}; fallback sintético bloqueado."
+                        )
                         continue
 
                     # Fallback mock generation se ComfyUI falhar
@@ -6480,16 +10980,16 @@ Retorne em formato JSON:
                 visual_bible,
             )
             repair_scene = _select_consistency_repair_scene(
-                scenes[:3],
+                scenes,
                 visual_consistency,
             )
             if (
                 repair_scene
-                and image_provider in {"gemini", "comfyui"}
+                and image_provider in {"gemini", "comfyui", "fal"}
                 and scene_images
                 and _semantic_qa_enabled()
                 and (
-                    image_provider == "gemini"
+                    image_provider in {"gemini", "fal"}
                     or (runpod_api_key and runpod_endpoint_id)
                 )
             ):
@@ -6565,6 +11065,22 @@ Retorne em formato JSON:
                                 image_style=image_style,
                                 style_label=style_label,
                                 quality_preset_key=quality_preset_key,
+                                scene_seed=repair_seed,
+                                visual_bible=visual_bible,
+                                attempt=max_attempts + repair_attempt,
+                                reference_image_path=repair_reference_image_path,
+                            )
+                        )
+                    elif image_provider == "fal":
+                        job_monitor, image_record, image_metric = (
+                            _run_fal_flux_image_attempt(
+                                scene=repair_scene,
+                                image_path=repair_path,
+                                directed_prompt=directed_prompt,
+                                image_style=image_style,
+                                style_label=style_label,
+                                quality_preset_key=quality_preset_key,
+                                quality_preset=quality_preset,
                                 scene_seed=repair_seed,
                                 visual_bible=visual_bible,
                                 attempt=max_attempts + repair_attempt,
@@ -6678,6 +11194,9 @@ Retorne em formato JSON:
 
         def generate_audio(state: Open3DAgentState) -> Open3DAgentState:
             """Generate audio narration using ElevenLabs"""
+            if str(state.get("status") or "").startswith("awaiting_"):
+                state.update({"audio_files": [], "audio_count": 0})
+                return state
             scenes = state.get("scenes", [])
 
             print("🎙️ Gerando áudio com ElevenLabs...")
@@ -6702,7 +11221,7 @@ Retorne em formato JSON:
                     f"{elevenlabs_remaining_chars}"
                 )
 
-            for i, scene in enumerate(scenes[:3]):  # Limit to 3 scenes
+            for i, scene in enumerate(scenes):
                 try:
                     print(f"🎤 Gerando áudio para cena {scene['scene_id']}...")
 
@@ -7003,12 +11522,60 @@ Retorne em formato JSON:
 
         def compile_video(state: Open3DAgentState) -> Open3DAgentState:
             """Compile final video using real provider clips with FFmpeg fallback."""
+            if str(state.get("status") or "").startswith("awaiting_"):
+                state.update(
+                    {
+                        "video_path": "output/final_video.mp4",
+                        "video_size": 0,
+                        "generation_method": "pending_prerequisites",
+                        "scene_videos": [],
+                    }
+                )
+                return state
             scene_images = state.get("scene_images", [])
             audio_files = state.get("audio_files", [])
             runpod_jobs = list(state.get("runpod_jobs", []))
             scene_videos: List[Dict[str, Any]] = []
-            video_provider = os.getenv("VIDEO_GENERATION_PROVIDER", "runway").lower()
-            used_runway = False
+            video_provider = _video_generation_provider()
+
+            require_human_curation = os.getenv(
+                "VIDEO_REQUIRE_HUMAN_CURATION", "true"
+            ).strip().lower() not in {"0", "false", "no"}
+            if require_human_curation:
+                quality_metrics = state.get("quality_metrics", {})
+                aggregate_quality = _aggregate_quality(
+                    image_metrics=quality_metrics.get("images", []),
+                    audio_metrics=quality_metrics.get("audio", []),
+                    video_metrics={
+                        "quality_score": 0,
+                        "valid": False,
+                        "status": "awaiting_human_curation",
+                        "issues": ["video_waiting_for_approved_stills"],
+                    },
+                )
+                state.update(
+                    {
+                        "video_path": "output/final_video.mp4",
+                        "video_size": 0,
+                        "generation_method": "pending_human_curation",
+                        "scene_videos": [],
+                        "runpod_jobs": runpod_jobs,
+                        "quality_metrics": {
+                            **quality_metrics,
+                            **aggregate_quality,
+                            "video": {
+                                "quality_score": 0,
+                                "valid": False,
+                                "status": "awaiting_human_curation",
+                                "issues": ["video_waiting_for_approved_stills"],
+                            },
+                        },
+                        "current_step": "awaiting_human_curation",
+                        "status": "awaiting_curation",
+                    }
+                )
+                print("Curadoria humana obrigatória antes da animação real")
+                return state
 
             print("🎬 Compilando vídeo final com FFmpeg...")
 
@@ -7032,7 +11599,6 @@ Retorne em formato JSON:
                     print("🔧 Usando FFmpeg real com animação de câmera...")
 
                     clip_paths = []
-                    temporary_clip_paths = []
                     for index, img in enumerate(scene_images, 1):
                         img_path = img["image_path"]
                         if not (
@@ -7050,96 +11616,42 @@ Retorne em formato JSON:
                             audio_duration,
                             _safe_float(img.get("duration"), 5.0),
                         )
-                        if video_provider == "runway":
-                            runway_clip_path = (
-                                f"output/scene_{img['scene_id']}_runway.mp4"
-                            )
-                            job_monitor, runway_ok = _generate_runway_clip(
-                                img,
-                                runway_clip_path,
-                                duration,
-                            )
-                            runpod_jobs.append(job_monitor)
-                            if runway_ok and os.path.exists(runway_clip_path):
-                                clip_paths.append(runway_clip_path)
-                                used_runway = True
-                                scene_videos.append(
-                                    {
-                                        "scene_id": img.get("scene_id", index),
-                                        "video_path": runway_clip_path,
-                                        "provider": "runway",
-                                        "job_id": job_monitor.get("job_id"),
-                                        "duration": duration,
-                                        "quality_score": job_monitor.get(
-                                            "quality_score",
-                                            0,
-                                        ),
-                                    }
-                                )
-                                continue
-                            print(
-                                "⚠️ Runway indisponível para cena "
-                                f"{img.get('scene_id')}: {job_monitor.get('error')}"
-                            )
-
-                        clip_path = f"output/scene_{img['scene_id']}_motion.mp4"
-                        scene_for_motion = {
-                            "scene_id": img.get("scene_id", index),
-                            "camera_motion": img.get("camera_motion", ""),
-                        }
-                        motion_filter = _ffmpeg_zoompan_filter(
-                            scene_for_motion,
-                            duration,
+                        scene_audio_path = next(
+                            (
+                                str(audio.get("audio_path") or "")
+                                for audio in audio_files
+                                if str(audio.get("scene_id"))
+                                == str(img.get("scene_id"))
+                            ),
+                            "",
                         )
-                        cmd = [
-                            "ffmpeg",
-                            "-y",
-                            "-loop",
-                            "1",
-                            "-i",
-                            img_path,
-                            "-vf",
-                            motion_filter,
-                            "-t",
-                            str(duration),
-                            "-r",
-                            "30",
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "slow",
-                            "-crf",
-                            "18",
-                            "-profile:v",
-                            "high",
-                            "-pix_fmt",
-                            "yuv420p",
-                            "-movflags",
-                            "+faststart",
+                        clip_path = (
+                            f"output/scene_{img['scene_id']}_{video_provider}.mp4"
+                        )
+                        job_monitor, video_ok = _generate_real_video_clip(
+                            img,
                             clip_path,
-                        ]
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        if result.returncode == 0 and os.path.exists(clip_path):
-                            clip_paths.append(clip_path)
-                            temporary_clip_paths.append(clip_path)
-                            media_quality = _probe_media_quality(clip_path, "video")
-                            scene_videos.append(
-                                {
-                                    "scene_id": img.get("scene_id", index),
-                                    "video_path": clip_path,
-                                    "provider": "ffmpeg_camera_motion",
-                                    "duration": duration,
-                                    "quality_score": media_quality.get(
-                                        "quality_score",
-                                        0,
-                                    ),
-                                }
+                            duration,
+                            audio_path=scene_audio_path or None,
+                            visual_bible=state.get("visual_bible"),
+                        )
+                        runpod_jobs.append(job_monitor)
+                        if not video_ok or not os.path.exists(clip_path):
+                            raise RuntimeError(
+                                f"{video_provider}_scene_generation_failed:"
+                                f"{img.get('scene_id')}:{job_monitor.get('error')}"
                             )
-                        else:
-                            print(
-                                "⚠️ Erro ao animar cena "
-                                f"{img.get('scene_id')}: {result.stderr[:500]}"
-                            )
+                        clip_paths.append(clip_path)
+                        scene_videos.append(
+                            {
+                                "scene_id": img.get("scene_id", index),
+                                "video_path": clip_path,
+                                "provider": video_provider,
+                                "job_id": job_monitor.get("job_id"),
+                                "duration": duration,
+                                "quality_score": job_monitor.get("quality_score", 0),
+                            }
+                        )
 
                     filelist_path = "output/filelist.txt"
                     with open(filelist_path, "w") as f:
@@ -7225,6 +11737,10 @@ Retorne em formato JSON:
                                     temp_video,  # Video input
                                     "-i",
                                     combined_audio_path,  # Audio input
+                                    "-map",
+                                    "0:v:0",
+                                    "-map",
+                                    "1:a:0",
                                     "-c:v",
                                     "copy",  # Copy video stream
                                     "-c:a",
@@ -7240,9 +11756,6 @@ Retorne em formato JSON:
                                 if result.returncode == 0:
                                     # Clean up temp file
                                     os.remove(temp_video)
-                                    for clip_path in temporary_clip_paths:
-                                        if os.path.exists(clip_path):
-                                            os.remove(clip_path)
                                     for temp_path in (
                                         audio_list_path,
                                         "output/combined_audio.m4a",
@@ -7282,11 +11795,7 @@ Retorne em formato JSON:
                             if os.path.exists(video_path)
                             else 0
                         ),
-                        "generation_method": (
-                            "runway_image_to_video"
-                            if used_runway
-                            else "ffmpeg_camera_motion"
-                        ),
+                        "generation_method": f"{video_provider}_image_to_video",
                         "scene_videos": scene_videos,
                         "runpod_jobs": runpod_jobs,
                         "current_step": "video_compiled",
@@ -7303,30 +11812,30 @@ Retorne em formato JSON:
                 subprocess.SubprocessError,
             ) as e:
                 print(f"⚠️ FFmpeg falhou: {e}")
-                print("💡 Usando mock de vídeo")
-
-                # Fallback mock generation
-                with open(video_path, "w") as f:
-                    f.write(
-                        f"Mock video compiled from {len(scene_images)} images and {len(audio_files)} audio files"
-                    )
-
                 state.update(
                     {
-                        "video_path": video_path,
-                        "video_size": os.path.getsize(video_path),
-                        "generation_method": "mock",
+                        "video_path": "output/final_video.mp4",
+                        "video_size": 0,
+                        "generation_method": "video_generation_failed",
                         "scene_videos": scene_videos,
                         "runpod_jobs": runpod_jobs,
-                        "current_step": "video_compiled",
-                        "status": "completed",
+                        "current_step": "video_generation_failed",
+                        "status": "failed",
                     }
                 )
 
             quality_metrics = state.get("quality_metrics", {})
             image_metrics = quality_metrics.get("images", [])
             audio_metrics = quality_metrics.get("audio", [])
-            video_metrics = _probe_media_quality(video_path, "video")
+            video_metrics = (
+                _probe_media_quality(video_path, "video")
+                if state.get("video_path")
+                else {
+                    "quality_score": 0,
+                    "valid": False,
+                    "issues": ["video_generation_failed"],
+                }
+            )
             aggregate_quality = _aggregate_quality(
                 image_metrics=image_metrics,
                 audio_metrics=audio_metrics,
@@ -7338,7 +11847,7 @@ Retorne em formato JSON:
                     sum(
                         _safe_float(job.get("estimated_cost_usd"))
                         for job in runpod_jobs
-                        if job.get("provider") not in {"gemini", "runway"}
+                        if job.get("provider") not in {"gemini", "runway", "fal"}
                     ),
                     6,
                 ),
@@ -7358,13 +11867,22 @@ Retorne em formato JSON:
                     ),
                     6,
                 ),
+                "fal_usd": round(
+                    sum(
+                        _safe_float(job.get("estimated_cost_usd"))
+                        for job in runpod_jobs
+                        if job.get("provider") == "fal"
+                    ),
+                    6,
+                ),
             }
             cost_estimate["total_usd"] = round(
                 _safe_float(cost_estimate.get("llm_usd"))
                 + _safe_float(cost_estimate.get("runpod_usd"))
                 + _safe_float(cost_estimate.get("gemini_image_usd"))
                 + _safe_float(cost_estimate.get("elevenlabs_usd"))
-                + _safe_float(cost_estimate.get("runway_usd")),
+                + _safe_float(cost_estimate.get("runway_usd"))
+                + _safe_float(cost_estimate.get("fal_usd")),
                 6,
             )
             state.update(
