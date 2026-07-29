@@ -1152,6 +1152,28 @@ def test_runpod_preflight_blocks_payment_without_exposing_credentials(monkeypatc
     assert "qwen-private-endpoint" not in serialized
 
 
+def test_runpod_probe_blocks_non_success_endpoint(monkeypatch):
+    class MissingEndpointResponse:
+        status_code = 404
+
+    monkeypatch.setattr(
+        ui_server.requests,
+        "get",
+        lambda *args, **kwargs: MissingEndpointResponse(),
+    )
+
+    result = ui_server._probe_runpod_endpoint(
+        "principal",
+        "missing-endpoint",
+        "private-key",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["blocking"] is True
+    assert result["code"] == "endpoint_unavailable"
+    assert result["http_status"] == 404
+
+
 def test_create_run_stops_before_thread_when_runpod_preflight_blocks(monkeypatch):
     monkeypatch.setenv("IMAGE_GENERATION_PROVIDER", "comfyui")
     monkeypatch.setattr(
@@ -1770,6 +1792,33 @@ def test_cast_reference_gate_requires_all_characters_used_by_scenes(
     assert approved["status"] == "approved"
     assert approved["approved_reference_ids"] == ["alice", "ludovico"]
     assert scenes[0]["cast_character_ids"] == ["alice", "ludovico"]
+
+
+def test_scene_provider_lookups_do_not_replace_run_wide_cast(monkeypatch, tmp_path):
+    visual_bible = _build_visual_bible(
+        "Alice conversa com Ludovico. Ludovico responde a Alice.",
+        "comic_storybook",
+    )
+    scenes = [
+        {"scene_id": 1, "description": "Alice walks through the garden."},
+        {"scene_id": 2, "description": "Professor Ludovico opens a book."},
+    ]
+    required = _required_scene_cast(scenes, visual_bible)
+    assert [character["id"] for character in required] == ["alice", "ludovico"]
+
+    alice = next(character for character in required if character["id"] == "alice")
+    _approve_cast_reference_pack(alice, tmp_path)
+    monkeypatch.delenv("FAL_STYLE_LORA_URL", raising=False)
+
+    langgraph_adapter._fal_scene_loras(scenes[0], visual_bible)
+    elements = langgraph_adapter._fal_kling_elements(scenes[0], visual_bible)
+
+    assert visual_bible["cast_bible"]["required_for_scenes"] == [
+        "alice",
+        "ludovico",
+    ]
+    assert len(elements) == 1
+    assert len(elements[0]["reference_image_urls"]) == 2
 
 
 def test_cast_reference_waiting_stage_distinguishes_retry_from_human_review():
@@ -4534,6 +4583,122 @@ def test_final_compilation_requires_temporal_identity_approved(tmp_path):
 
     with pytest.raises(RuntimeError, match="temporal_identity_gate_blocked:1"):
         ui_server._recompile_final_video_from_attempts(run)
+
+
+def test_partial_video_failure_preserves_paid_clip_for_retry(monkeypatch, tmp_path):
+    run_id = "partial-video-retry"
+    image_one = tmp_path / "scene-1.png"
+    image_two = tmp_path / "scene-2.png"
+    image_one.write_bytes(b"image-one" * 300)
+    image_two.write_bytes(b"image-two" * 300)
+    summary = {
+        "scenes": [
+            {"scene_id": 1, "description": "Alice enters the garden.", "duration": 5},
+            {"scene_id": 2, "description": "Alice opens the book.", "duration": 5},
+        ],
+        "audio_files": [],
+        "visual_bible": {},
+        "scene_videos": [],
+        "curation": {
+            "can_generate_video": True,
+            "scenes": {
+                "1": {
+                    "status": "approved",
+                    "approved_attempt_id": "attempt_1",
+                    "attempts": [
+                        {
+                            "id": "attempt_1",
+                            "status": "approved",
+                            "image_path": str(image_one),
+                        }
+                    ],
+                },
+                "2": {
+                    "status": "approved",
+                    "approved_attempt_id": "attempt_1",
+                    "attempts": [
+                        {
+                            "id": "attempt_1",
+                            "status": "approved",
+                            "image_path": str(image_two),
+                        }
+                    ],
+                },
+            },
+        },
+    }
+    ui_server.RUNS[run_id] = {
+        "id": run_id,
+        "status": "completed",
+        "run_dir": str(tmp_path),
+        "summary": summary,
+    }
+    generated_scene_ids: list[str] = []
+
+    def generate_clip(source, clip_path, *_args, **_kwargs):
+        scene_id = str(source["scene_id"])
+        generated_scene_ids.append(scene_id)
+        if scene_id == "2" and generated_scene_ids.count("2") == 1:
+            return {"error": "temporary_provider_failure"}, False
+        Path(clip_path).write_bytes(b"video" * 300)
+        return {"quality_score": 96, "status": "completed"}, True
+
+    monkeypatch.setattr(
+        ui_server,
+        "_apply_curation_summary",
+        lambda current_summary, _run_dir: current_summary,
+    )
+    monkeypatch.setattr(ui_server, "_persist_summary", lambda _run: None)
+    monkeypatch.setattr(ui_server, "_append_log", lambda *_args: None)
+    monkeypatch.setattr(
+        ui_server,
+        "_planned_scene_ids",
+        lambda _summary: ["1", "2"],
+    )
+    monkeypatch.setattr(
+        ui_server,
+        "_evaluate_temporal_identity",
+        lambda **_kwargs: {"accepted": True, "score": 96, "issues": []},
+    )
+    monkeypatch.setattr(
+        ui_server,
+        "_probe_video_artifact",
+        lambda path: {"valid": Path(path).is_file()},
+    )
+    monkeypatch.setattr(
+        ui_server,
+        "_recompile_final_video_from_attempts",
+        lambda _run: None,
+    )
+    monkeypatch.setattr(ui_server, "_reset_final_gate", lambda *_args: None)
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_video_generation_provider",
+        lambda: "fal_kling",
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_scene_audio_duration",
+        lambda *_args: 5.0,
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_generate_real_video_clip",
+        generate_clip,
+    )
+
+    try:
+        ui_server._run_approved_video_generation(run_id)
+        first_attempt = summary["curation"]["scenes"]["1"]["attempts"][0]
+        assert Path(first_attempt["video_path"]).is_file()
+        assert summary["curation"]["video_generation"]["status"] == "failed"
+
+        ui_server._run_approved_video_generation(run_id)
+    finally:
+        ui_server.RUNS.pop(run_id, None)
+
+    assert generated_scene_ids == ["1", "2", "2"]
+    assert summary["curation"]["video_generation"]["status"] == "completed"
 
 
 def test_ui_exposes_separate_workspaces_cast_bible_and_gate_matrix():

@@ -167,6 +167,58 @@ def test_queue_timeout_cancels_request(monkeypatch):
     assert session.puts
 
 
+def test_transient_poll_failure_retries_without_resubmitting(monkeypatch):
+    session = FakeSession()
+    original_get = session.get
+    poll_attempts = 0
+
+    def flaky_get(*args, **kwargs):
+        nonlocal poll_attempts
+        if str(args[0]).endswith("/status") and poll_attempts == 0:
+            poll_attempts += 1
+            raise fal_provider.requests.Timeout("temporary timeout")
+        return original_get(*args, **kwargs)
+
+    session.get = flaky_get  # type: ignore[method-assign]
+    monkeypatch.setattr(fal_provider.time, "sleep", lambda _seconds: None)
+    client = FalQueueClient("secret-value", session=session)
+
+    result = client.run(
+        "fal-ai/flux/dev",
+        {"prompt": "storybook frame"},
+        poll_interval_seconds=0.1,
+    )
+
+    assert result.request_id == "request-123"
+    assert len(session.posts) == 1
+    assert session.puts == []
+
+
+def test_exhausted_poll_retries_cancel_submitted_job(monkeypatch):
+    session = FakeSession()
+
+    def failed_get(*_args, **_kwargs):
+        raise fal_provider.requests.ConnectionError("connection reset")
+
+    session.get = failed_get  # type: ignore[method-assign]
+    monkeypatch.setenv("FAL_POLL_REQUEST_RETRY_ATTEMPTS", "2")
+    monkeypatch.setattr(fal_provider.time, "sleep", lambda _seconds: None)
+    client = FalQueueClient("secret-value", session=session)
+
+    with pytest.raises(
+        fal_provider.FalTransientRequestError,
+        match="fal_poll_transport_error",
+    ):
+        client.run(
+            "fal-ai/flux/dev",
+            {"prompt": "storybook frame"},
+            poll_interval_seconds=0.1,
+        )
+
+    assert len(session.posts) == 1
+    assert session.puts
+
+
 @pytest.mark.parametrize(
     "url",
     [

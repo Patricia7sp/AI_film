@@ -2414,6 +2414,42 @@ def _replace_scene_record(
     return updated
 
 
+def _persist_generated_video_items(
+    summary: dict[str, Any],
+    generated: list[dict[str, Any]],
+    *,
+    require_current_approval: bool,
+) -> int:
+    persisted = 0
+    for item in generated:
+        scene_id = str(item["scene_id"])
+        attempt_id = str(item["attempt_id"])
+        review = summary.get("curation", {}).get("scenes", {}).get(scene_id, {})
+        if review.get("approved_attempt_id") != attempt_id:
+            if require_current_approval:
+                raise RuntimeError(f"approved_attempt_changed:{scene_id}")
+            continue
+        attempt = _find_attempt(summary, scene_id, attempt_id)
+        if not attempt:
+            if require_current_approval:
+                raise RuntimeError(f"approved_attempt_missing:{scene_id}")
+            continue
+        attempt.update(item)
+        summary["scene_videos"] = _replace_scene_record(
+            summary.get("scene_videos", []),
+            scene_id,
+            {
+                "video_path": item["video_path"],
+                "provider": item["video_provider"],
+                "quality_score": item["video_quality_score"],
+                "duration": item["duration"],
+                "temporal_identity": item["temporal_identity"],
+            },
+        )
+        persisted += 1
+    return persisted
+
+
 def _find_scene_quality_record(
     summary: dict[str, Any],
     scene_id: str,
@@ -3230,24 +3266,11 @@ def _run_approved_video_generation(run_id: str) -> None:
             if run is None:
                 return
             summary = run.get("summary", {})
-            for item in generated:
-                scene_id = item["scene_id"]
-                review = summary["curation"]["scenes"][scene_id]
-                if review.get("approved_attempt_id") != item["attempt_id"]:
-                    raise RuntimeError(f"approved_attempt_changed:{scene_id}")
-                attempt = _find_attempt(summary, scene_id, item["attempt_id"])
-                attempt.update(item)
-                summary["scene_videos"] = _replace_scene_record(
-                    summary.get("scene_videos", []),
-                    scene_id,
-                    {
-                        "video_path": item["video_path"],
-                        "provider": item["video_provider"],
-                        "quality_score": item["video_quality_score"],
-                        "duration": item["duration"],
-                        "temporal_identity": item["temporal_identity"],
-                    },
-                )
+            _persist_generated_video_items(
+                summary,
+                generated,
+                require_current_approval=True,
+            )
             summary.setdefault("runpod_jobs", []).extend(jobs)
             run["summary"] = summary
             _recompile_final_video_from_attempts(run)
@@ -3275,6 +3298,11 @@ def _run_approved_video_generation(run_id: str) -> None:
             if run is None:
                 return
             summary = run.get("summary", {})
+            persisted_count = _persist_generated_video_items(
+                summary,
+                generated,
+                require_current_approval=False,
+            )
             summary.setdefault("runpod_jobs", []).extend(jobs)
             summary.setdefault("curation", {}).setdefault(
                 "video_generation", {}
@@ -3288,6 +3316,11 @@ def _run_approved_video_generation(run_id: str) -> None:
             run["summary"] = _apply_curation_summary(summary, Path(run["run_dir"]))
             run["updated_at"] = _utc_now_iso()
             _persist_summary(run)
+        if persisted_count:
+            _append_log(
+                run_id,
+                f"{persisted_count} animação(ões) concluída(s) preservada(s) para retry",
+            )
         _append_log(run_id, f"falha na animação aprovada: {type(exc).__name__}: {exc}")
 
 
@@ -4400,6 +4433,18 @@ def _probe_runpod_endpoint(
             "http_status": response.status_code,
             "code": "provider_unavailable",
             "message": f"RunPod {label}: health temporariamente indisponível",
+        }
+    if not 200 <= response.status_code < 300:
+        return {
+            "endpoint": label,
+            "status": "blocked",
+            "blocking": True,
+            "http_status": response.status_code,
+            "code": "endpoint_unavailable",
+            "message": (
+                f"RunPod {label}: endpoint indisponível "
+                f"(HTTP {response.status_code})"
+            ),
         }
     return {
         "endpoint": label,

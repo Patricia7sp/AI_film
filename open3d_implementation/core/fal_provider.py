@@ -46,6 +46,10 @@ class FalRequestError(FalProviderError):
     """Raised when fal.ai rejects or fails a queue request."""
 
 
+class FalTransientRequestError(FalRequestError):
+    """Raised when a fal.ai request can be retried without resubmitting the job."""
+
+
 class FalTimeoutError(FalProviderError):
     """Raised when queue or execution exceeds a configured deadline."""
 
@@ -314,9 +318,14 @@ class FalQueueClient:
                 timeout=self._request_timeout_seconds,
             )
         except requests.RequestException as exc:
-            raise FalRequestError(
+            raise FalTransientRequestError(
                 f"fal_poll_transport_error:{type(exc).__name__}"
             ) from exc
+        if response.status_code >= 500:
+            raise FalTransientRequestError(
+                f"fal_poll_provider_error:http_{response.status_code}:"
+                f"{_safe_error_detail(response)}"
+            )
         _raise_for_fal_status(response)
         return response
 
@@ -368,15 +377,44 @@ class FalQueueClient:
         execution_started_at: float | None = None
         history: list[str] = []
         submission = self.submit(validated_model, inputs)
+        try:
+            poll_request_attempts = int(
+                os.getenv("FAL_POLL_REQUEST_RETRY_ATTEMPTS", "3")
+            )
+        except ValueError as exc:
+            self.cancel(submission)
+            raise FalConfigurationError(
+                "invalid_fal_poll_request_retry_attempts"
+            ) from exc
+        poll_request_attempts = max(1, min(8, poll_request_attempts))
+
+        def get_job_payload(url: str) -> JsonObject:
+            for request_attempt in range(1, poll_request_attempts + 1):
+                try:
+                    return _json_object(self._get(url))
+                except FalTransientRequestError:
+                    if request_attempt >= poll_request_attempts:
+                        self.cancel(submission)
+                        raise
+                    retry_delay = min(
+                        30.0,
+                        poll_interval * (2 ** (request_attempt - 1)),
+                    )
+                    time.sleep(retry_delay)
+                except (FalAuthenticationError, FalRequestError):
+                    self.cancel(submission)
+                    raise
+            self.cancel(submission)
+            raise FalRequestError("fal_poll_retry_exhausted")
 
         while True:
-            payload = _json_object(self._get(submission.status_url))
+            payload = get_job_payload(submission.status_url)
             status = str(payload.get("status") or "UNKNOWN").upper()
             if not history or history[-1] != status:
                 history.append(status)
             now = time.monotonic()
             if status in _TERMINAL_SUCCESS:
-                result_payload = _json_object(self._get(submission.response_url))
+                result_payload = get_job_payload(submission.response_url)
                 data = result_payload.get("data")
                 normalized_data = data if isinstance(data, dict) else result_payload
                 queue_seconds = (

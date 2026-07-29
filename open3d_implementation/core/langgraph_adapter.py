@@ -3741,7 +3741,7 @@ def _fal_scene_loras(
                 ),
             }
         )
-    for character in _required_scene_cast([scene], visual_bible):
+    for character in _scene_cast_characters(scene, visual_bible):
         character_id = re.sub(
             r"[^A-Z0-9]+",
             "_",
@@ -7007,7 +7007,7 @@ def _fal_kling_elements(
     if not visual_bible:
         return []
     elements: List[Dict[str, Any]] = []
-    for character in _required_scene_cast([scene_image], visual_bible)[:2]:
+    for character in _scene_cast_characters(scene_image, visual_bible)[:2]:
         front_path = _approved_cast_reference_path(character)
         if not front_path:
             continue
@@ -7015,7 +7015,7 @@ def _fal_kling_elements(
         views = (character.get("reference") or {}).get("views") or {}
         for view_id in ("three_quarter", "profile"):
             view = views.get(view_id) or {}
-            view_path = str(view.get("image_path") or "")
+            view_path = str(view.get("path") or "")
             if (
                 view.get("automatic_approved") is True
                 and view_path
