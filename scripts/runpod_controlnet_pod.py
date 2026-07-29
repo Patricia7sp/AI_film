@@ -141,6 +141,56 @@ write_status "ready" "AI_FILM_QWEN_IMAGE_EDIT_2511_VOLUME_READY"
 sleep 600'"""
 
 
+def flux2_install_command() -> str:
+    return r"""bash -lc 'set -euo pipefail
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl coreutils python3
+rm -rf /var/lib/apt/lists/*
+if [[ -d "/runpod-volume" ]]; then VOLUME_ROOT="/runpod-volume"; elif [[ -d "/workspace" ]]; then VOLUME_ROOT="/workspace"; else echo "missing RunPod volume" >&2; exit 1; fi
+DIFFUSION_MODELS_DIR="${VOLUME_ROOT}/models/diffusion_models"
+TEXT_ENCODERS_DIR="${VOLUME_ROOT}/models/text_encoders"
+VAE_DIR="${VOLUME_ROOT}/models/vae"
+STATUS_DIR="/tmp/ai-film-status"
+mkdir -p "${STATUS_DIR}" "${DIFFUSION_MODELS_DIR}" "${TEXT_ENCODERS_DIR}" "${VAE_DIR}"
+write_status() {
+  status="$1"; detail="$2"
+  printf "{\"status\":\"%s\",\"detail\":\"%s\",\"volume_root\":\"%s\"}\n" "${status}" "${detail}" "${VOLUME_ROOT}" > "${STATUS_DIR}/status.json"
+}
+handle_error() {
+  write_status "failed" "FLUX.2 download command failed"
+  sleep 600
+}
+trap handle_error ERR
+python3 -m http.server 19123 --bind 0.0.0.0 --directory "${STATUS_DIR}" >/tmp/ai-film-status-server.log 2>&1 &
+download_model() {
+  url="$1"; target="$2"; minimum_bytes="$3"; expected_sha256="$4"; partial="${target}.partial"
+  if [[ -f "${target}" ]] && [[ "$(stat -c%s "${target}")" -ge "${minimum_bytes}" ]] && [[ "$(sha256sum "${target}" | cut -d " " -f 1)" == "${expected_sha256}" ]]; then
+    echo "Already ready: ${target}"
+    return
+  fi
+  auth_args=()
+  if [[ -n "${HF_TOKEN:-}" ]]; then auth_args=(-H "Authorization: Bearer ${HF_TOKEN}"); fi
+  write_status "downloading" "$(basename "${target}")"
+  curl -fL --retry 5 --retry-delay 5 --continue-at - "${auth_args[@]}" -o "${partial}" "${url}"
+  size_bytes=$(stat -c%s "${partial}")
+  if [[ "${size_bytes}" -lt "${minimum_bytes}" ]]; then echo "file too small: ${partial} ${size_bytes}" >&2; exit 1; fi
+  actual_sha256=$(sha256sum "${partial}" | cut -d " " -f 1)
+  if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then echo "checksum mismatch: ${partial} ${actual_sha256}" >&2; rm -f "${partial}"; exit 1; fi
+  mv "${partial}" "${target}"
+  write_status "downloaded" "$(basename "${target}"):${size_bytes}"
+}
+download_model "https://huggingface.co/Comfy-Org/flux2-klein/resolve/main/split_files/diffusion_models/flux-2-klein-base-4b.safetensors" "${DIFFUSION_MODELS_DIR}/flux-2-klein-base-4b.safetensors" 6442450944 "9c5fed22b76baea749d88fc2abe3ad53245e7b21a0d353a762665eea00043b92"
+download_model "https://huggingface.co/Comfy-Org/flux2-klein/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors" "${TEXT_ENCODERS_DIR}/qwen_3_4b.safetensors" 7516192768 "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a"
+download_model "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors" "${VAE_DIR}/flux2-vae.safetensors" 107374182 "d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5"
+sha256sum \
+  "${DIFFUSION_MODELS_DIR}/flux-2-klein-base-4b.safetensors" \
+  "${TEXT_ENCODERS_DIR}/qwen_3_4b.safetensors" \
+  "${VAE_DIR}/flux2-vae.safetensors" \
+  > "${STATUS_DIR}/flux2-checksums.txt"
+write_status "ready" "AI_FILM_FLUX2_VOLUME_READY"
+sleep 600'"""
+
+
 def install_command() -> str:
     return r"""bash -lc 'set -euo pipefail
 apt-get update
@@ -266,7 +316,11 @@ def create_pod(
                 else (
                     qwen2511_install_command()
                     if mode == "qwen2511"
-                    else install_command()
+                    else (
+                        flux2_install_command()
+                        if mode == "flux2"
+                        else install_command()
+                    )
                 )
             ),
             "containerDiskInGb": 20,
@@ -306,14 +360,20 @@ def main() -> int:
     parser.add_argument("--gpu-type-id", default="NVIDIA RTX A4000")
     parser.add_argument(
         "--mode",
-        choices=("prepare", "audit", "qwen2511"),
+        choices=("prepare", "audit", "qwen2511", "flux2"),
         default="prepare",
         help="Prepare assets or only audit network-volume capacity and contents.",
     )
+    parser.add_argument("--network-volume-id", default="")
+    parser.add_argument("--datacenter", default="")
     parser.add_argument("--watch-seconds", type=int, default=900)
     args = parser.parse_args()
 
     env = load_env(ENV_PATH)
+    if args.network_volume_id:
+        env["RUNPOD_NETWORK_VOLUME_ID"] = args.network_volume_id
+    if args.datacenter:
+        env["RUNPOD_NETWORK_VOLUME_DATACENTER"] = args.datacenter
     api_key = env.get("RUNPOD_API_KEY", "")
     if not api_key:
         print("RUNPOD_API_KEY is required.", file=sys.stderr)

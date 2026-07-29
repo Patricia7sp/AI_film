@@ -102,6 +102,7 @@ def save_endpoint(
     endpoint_name: str,
     workers_min: int,
     workers_max: int,
+    idle_timeout: int,
     locations: str,
 ) -> Dict[str, Any]:
     query = """
@@ -129,6 +130,7 @@ def save_endpoint(
                 "name": endpoint_name,
                 "workersMin": workers_min,
                 "workersMax": workers_max,
+                "idleTimeout": idle_timeout,
                 "locations": locations,
             }
         },
@@ -527,12 +529,15 @@ def main() -> int:
             return 2
         workers_min, workers_max = args.workers_min, args.workers_max
 
+    current_endpoint = endpoint_details(api_key=api_key, endpoint_id=endpoint_id)
+    idle_timeout = int(current_endpoint.get("idleTimeout") or 10)
     endpoint = save_endpoint(
         api_key=api_key,
         endpoint_id=endpoint_id,
         endpoint_name=args.name,
         workers_min=workers_min,
         workers_max=workers_max,
+        idle_timeout=idle_timeout,
         locations=args.locations
         or env.get("RUNPOD_NETWORK_VOLUME_DATACENTER", "EUR-IS-1"),
     )
