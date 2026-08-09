@@ -52,7 +52,6 @@ from open3d_implementation.core.langgraph_adapter import (  # noqa: E402
     _comfyui_refiner_enabled,
     _create_cast_reference_pose_guide,
     _detect_profile_eye_count,
-    _elevenlabs_voice_id_for_scene,
     _encode_comfyui_control_image,
     _encode_comfyui_reference_image,
     _evaluate_image_semantics,
@@ -66,13 +65,15 @@ from open3d_implementation.core.langgraph_adapter import (  # noqa: E402
     _identity_retry_reference_path,
     _image_generation_max_attempts,
     _image_generation_provider,
+    _local_forbidden_visual_code,
+    _local_forbidden_visual_question,
     _local_required_visual_code,
     _local_required_visual_question,
     _merge_canonical_scenes,
+    _narrative_attempt_order,
     _non_retryable_comfyui_job_error,
     _parse_semantic_qa_response,
-    _premium_audio_direction,
-    _premium_audio_narration,
+    _prepare_fal_kling_lipsync_audio,
     _probe_image_quality,
     _qwen_semantic_retry_enabled,
     _refresh_cast_bible_status,
@@ -194,6 +195,18 @@ def test_cast_reference_identity_checks_are_atomic(
     )
 
 
+def test_university_garden_check_uses_visible_environment_evidence():
+    requirement = "university garden"
+
+    assert (
+        langgraph_adapter._local_required_visual_code(requirement, 1)
+        == "environment_university_garden_missing"
+    )
+    question = langgraph_adapter._local_required_visual_question(requirement)
+    assert "green lawn and mature old trees" in question
+    assert "building may remain off-camera" in question
+
+
 def test_profile_second_eye_is_an_atomic_critical_exclusion():
     exclusion = "two eyes or two eyebrows visible in a profile reference"
 
@@ -204,6 +217,253 @@ def test_profile_second_eye_is_an_atomic_critical_exclusion():
     question = langgraph_adapter._local_forbidden_visual_question(exclusion)
     assert "any part of a second eye" in question
     assert "three-quarter views" in question
+
+
+@pytest.mark.parametrize(
+    ("exclusion", "expected_fragment"),
+    [
+        ("cat", "Do not count a small round-eared mouse"),
+        ("kitten", "Do not count a small round-eared mouse"),
+        ("dog", "Do not count a small round-eared mouse"),
+        ("rabbit", "unmistakably long rabbit ears"),
+    ],
+)
+def test_forbidden_animal_questions_disambiguate_the_white_mouse(
+    exclusion,
+    expected_fragment,
+):
+    question = langgraph_adapter._local_forbidden_visual_question(exclusion)
+
+    assert expected_fragment in question
+
+
+@pytest.mark.parametrize(
+    ("exclusion", "expected_code"),
+    [
+        ("cat", "forbidden_cat"),
+        ("kitten", "forbidden_cat"),
+        ("dog", "forbidden_dog"),
+        ("rabbit", "forbidden_rabbit"),
+    ],
+)
+def test_forbidden_animals_have_stable_exclusive_codes(exclusion, expected_code):
+    assert langgraph_adapter._local_forbidden_visual_code(exclusion, 1) == expected_code
+
+
+def test_exclusive_mouse_classification_reconciles_conflicting_binary_answers():
+    from open3d_implementation.core import local_visual_qa
+
+    answers = [
+        local_visual_qa.LocalVisualAnswer(
+            criterion=local_visual_qa.LocalVisualCriterion(
+                code="hero_mouse_missing_or_wrong",
+                question="mouse?",
+                expected="yes",
+                weight=3.0,
+                critical=True,
+                hero_object=True,
+            ),
+            answer="yes",
+            raw_response="Yes.",
+        ),
+        local_visual_qa.LocalVisualAnswer(
+            criterion=local_visual_qa.LocalVisualCriterion(
+                code="forbidden_cat",
+                question="cat?",
+                expected="no",
+                weight=1.5,
+                critical=True,
+            ),
+            answer="yes",
+            raw_response="Yes.",
+        ),
+        local_visual_qa.LocalVisualAnswer(
+            criterion=local_visual_qa.LocalVisualCriterion(
+                code="forbidden_dog",
+                question="dog?",
+                expected="no",
+                weight=1.5,
+                critical=True,
+            ),
+            answer="yes",
+            raw_response="Yes.",
+        ),
+    ]
+
+    reconciled = local_visual_qa.reconcile_exclusive_small_animal_answers(
+        answers,
+        "mouse",
+    )
+
+    assert [answer.answer for answer in reconciled] == ["yes", "no", "no"]
+    assert all(answer.matched for answer in reconciled)
+
+
+def test_local_anthill_semantic_gate_marks_the_hero_object_legible(
+    monkeypatch,
+    tmp_path,
+):
+    from open3d_implementation.core import local_visual_qa
+
+    def evaluate_checklist(**kwargs):
+        return [
+            local_visual_qa.LocalVisualAnswer(
+                criterion=criterion,
+                answer=criterion.expected,
+                raw_response=f"{criterion.expected}.",
+            )
+            for criterion in kwargs["criteria"]
+        ]
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_visual_checklist",
+        evaluate_checklist,
+    )
+    monkeypatch.setattr(
+        local_visual_qa,
+        "classify_local_small_animal",
+        lambda **_kwargs: pytest.fail(
+            "animal classification is not valid without a required mouse"
+        ),
+    )
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"local-test-image")
+
+    result = _evaluate_semantic_qa_with_local_vlm(
+        image_path=image_path,
+        scene={
+            "description": "Alice observes an anthill.",
+            "must_include": ["small anthill in the grass"],
+            "must_not_include": ["cat", "dog", "rabbit"],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+    )
+
+    assert result["accepted"] is True
+    assert result["hero_object_legibility"] is True
+    assert result["critical_failures"] == []
+
+
+def test_rabbit_hole_and_anthill_checks_are_morphologically_distinct():
+    assert _local_required_visual_code("large rabbit hole", 1) == (
+        "hero_rabbit_hole_missing"
+    )
+    rabbit_question = _local_required_visual_question("large rabbit hole")
+    assert "dark hollow" in rabbit_question
+    assert "not as a small loose-soil mound" in rabbit_question
+
+    assert _local_forbidden_visual_code("anthill", 1) == "forbidden_anthill"
+    anthill_question = _local_forbidden_visual_question("anthill")
+    assert "above-ground mound" in anthill_question
+    assert "Do not count a large deep dark hollow" in anthill_question
+
+    hero_objects = _hero_object_requirements(
+        {
+            "description": "Alice kneels beside a rabbit hole.",
+            "must_include": ["large rabbit hole in a grassy earth bank"],
+        }
+    )
+    assert [item["name"] for item in hero_objects] == ["rabbit hole"]
+
+
+def test_university_garden_does_not_require_an_unrequested_building():
+    question = _local_required_visual_question("university garden")
+
+    assert "green lawn and mature old trees" in question
+    assert "building may remain off-camera" in question
+
+
+def test_plum_pies_and_princess_gown_checks_use_visible_morphology():
+    plum_question = _local_required_visual_question("plum pies")
+    gown_question = _local_forbidden_visual_question("princess gown")
+
+    assert "purple plum filling" in plum_question
+    assert "wicker basket" in plum_question
+    assert "Answer yes when purple filling is visible" in plum_question
+    assert "ornate fantasy princess ball gown" in gown_question
+    assert "plain modest ankle-length ivory Victorian day dress" in gown_question
+
+
+def test_unreliable_comic_style_classification_routes_to_human_review(
+    monkeypatch,
+    tmp_path,
+):
+    from open3d_implementation.core import local_visual_qa
+
+    def evaluate_checklist(**kwargs):
+        return [
+            local_visual_qa.LocalVisualAnswer(
+                criterion=criterion,
+                answer=(
+                    "no" if criterion.code == "style_match" else criterion.expected
+                ),
+                raw_response="No." if criterion.code == "style_match" else "Yes.",
+            )
+            for criterion in kwargs["criteria"]
+        ]
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_visual_checklist",
+        evaluate_checklist,
+    )
+    image_path = tmp_path / "scene.png"
+    image_path.write_bytes(b"local-test-image")
+
+    parsed = _evaluate_semantic_qa_with_local_vlm(
+        image_path=image_path,
+        scene={
+            "description": "A garden with ancient trees.",
+            "must_include": ["ancient trees"],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+    )
+    metrics = {}
+    langgraph_adapter._apply_semantic_qa_result(metrics, parsed, [])
+
+    assert parsed["semantic_score"] == 100
+    assert parsed["accepted"] is True
+    assert parsed["style_score"] == 0
+    assert parsed["style_accepted"] is False
+    assert parsed["style_human_review_required"] is True
+    assert "style_match" not in parsed["critical_failures"]
+    assert metrics["accepted"] is True
+    assert metrics["style_human_review_required"] is True
+    assert "style_mismatch" not in metrics["critical_failures"]
+
+
+def test_semantic_result_preserves_character_identity_for_aggregation():
+    metrics = {}
+    identity = [
+        {
+            "character_id": "alice",
+            "score": 81.3,
+            "accepted": True,
+        }
+    ]
+
+    langgraph_adapter._apply_semantic_qa_result(
+        metrics,
+        {
+            "semantic_score": 95,
+            "accepted": True,
+            "style_score": 98,
+            "style_accepted": True,
+            "hero_object_legibility": True,
+            "hero_object_notes": "legible",
+            "issues": [],
+            "critical_failures": [],
+            "retry_prompt": "",
+            "evidence": [],
+            "character_identity": identity,
+        },
+        [],
+    )
+
+    assert metrics["character_identity"] == identity
 
 
 def test_profile_eye_detector_rejects_the_known_three_quarter_regression():
@@ -302,6 +562,108 @@ def test_structured_scene_validation_and_canonical_merge_preserve_scene_count():
     assert len(merged) == 8
     assert [scene["scene_id"] for scene in merged] == list(range(1, 9))
     assert any("narrative action" in scene["description"] for scene in merged[3:])
+
+
+def _scene_resume_test_scenes(count: int = 2):
+    return [
+        {
+            "scene_id": index,
+            "description": f"Canonical scene {index}.",
+            "prompt": f"Comic storybook scene {index}.",
+            "duration": 6,
+            "must_include": [f"canonical action {index}"],
+            "must_not_include": ["contact sheet"],
+            "source_excerpt": f"Story passage {index}.",
+            "camera_motion": "slow controlled cinematic push-in",
+        }
+        for index in range(1, count + 1)
+    ]
+
+
+def test_scene_resume_manifest_requires_matching_story_hash(tmp_path):
+    story_text = "Alice encontra o Professor Ludovico."
+    manifest_path = tmp_path / "scene_resume_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "story_sha256": hashlib.sha256(story_text.encode("utf-8")).hexdigest(),
+                "image_style": "comic_storybook",
+                "max_scenes": 2,
+                "scenes": _scene_resume_test_scenes(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = langgraph_adapter._load_scene_resume_manifest(
+        str(manifest_path),
+        story_text=story_text,
+        image_style="comic_storybook",
+        max_scenes=2,
+    )
+
+    assert [scene["scene_id"] for scene in loaded] == [1, 2]
+    with pytest.raises(ValueError, match="scene_resume_manifest_story_mismatch"):
+        langgraph_adapter._load_scene_resume_manifest(
+            str(manifest_path),
+            story_text="Uma história diferente.",
+            image_style="comic_storybook",
+            max_scenes=2,
+        )
+
+
+def test_scene_resume_manifest_traverses_trusted_retry_lineage(
+    monkeypatch,
+    tmp_path,
+):
+    runs_root = (tmp_path / "runs").resolve()
+    canonical_run_id = "20260722_001022_77706927"
+    retry_run_id = "20260722_010000_aaaaaaaa"
+    target_run_id = "20260722_020000_bbbbbbbb"
+    story_text = "Alice encontra o Professor Ludovico."
+    image_style = "comic_storybook"
+
+    canonical_run = runs_root / canonical_run_id
+    canonical_run.mkdir(parents=True)
+    (canonical_run / "historia.txt").write_text(story_text, encoding="utf-8")
+    (canonical_run / "pipeline_summary.json").write_text(
+        json.dumps(
+            {
+                "image_style": image_style,
+                "scenes": _scene_resume_test_scenes(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    retry_output = runs_root / retry_run_id / "output"
+    retry_output.mkdir(parents=True)
+    (retry_output / ui_server.CAST_REFERENCE_RESUME_TRUST_FILE).write_text(
+        json.dumps({"source_run_id": canonical_run_id}),
+        encoding="utf-8",
+    )
+    target_run = runs_root / target_run_id
+    target_run.mkdir(parents=True)
+    monkeypatch.setattr(ui_server, "RUNS_ROOT", runs_root)
+
+    manifest_path = ui_server._copy_scene_resume_manifest(
+        retry_run_id,
+        target_run,
+        story_text=story_text,
+        image_style=image_style,
+        max_scenes=2,
+    )
+
+    assert manifest_path == target_run / ui_server.SCENE_RESUME_MANIFEST
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload["canonical_run_id"] == canonical_run_id
+    assert payload["lineage"] == [retry_run_id, canonical_run_id]
+    assert (
+        payload["story_sha256"]
+        == hashlib.sha256(story_text.encode("utf-8")).hexdigest()
+    )
+    assert [scene["scene_id"] for scene in payload["scenes"]] == [1, 2]
 
 
 def _mock_valid_video_probe(monkeypatch):
@@ -610,6 +972,51 @@ def test_sugar_bowl_mouse_is_hero_object_without_negative_prompt_false_positives
     assert len(negative_prompt) <= 1200
 
 
+def test_forbidden_cats_never_become_positive_generation_instructions():
+    scene = {
+        "description": (
+            "Alice searches the university garden for a safe place to hide the kittens, "
+            "but the animals remain elsewhere and outside the frame."
+        ),
+        "prompt": "Alice in an ivory Victorian day dress in the university garden.",
+        "must_include": ["Alice", "ancient beech trees", "university garden"],
+        "must_not_include": ["cats", "kittens", "indoor room"],
+    }
+
+    prompt = _build_image_prompt(scene, "comic_storybook", {}, "")
+    negative_prompt = _scene_negative_prompt(scene)
+
+    assert "Cats/kittens must be visibly cats only" not in prompt
+    assert "cats or kittens only where requested" not in prompt
+    positive_prompt = prompt.split("Must not include:", 1)[0].lower()
+    assert "kitten" not in positive_prompt
+    assert "safe place to hide" not in positive_prompt
+    assert "Must not include: cats, kittens, indoor room" in prompt
+    assert "black mouse" not in negative_prompt
+
+
+def test_forbidden_named_children_are_removed_from_positive_scene_instruction():
+    scene = {
+        "scene_id": 6,
+        "description": (
+            "Professor Ludovico smiles as he notices the children peeking through "
+            "the door."
+        ),
+        "prompt": (
+            "Professor Ludovico sits alone at a wooden tea table and looks toward "
+            "the door."
+        ),
+        "must_include": ["Professor Ludovico", "tea table"],
+        "must_not_include": ["Alice", "Edith", "cats"],
+    }
+
+    prompt = _build_image_prompt(scene, DEFAULT_IMAGE_STYLE)
+    positive_scene_instruction = prompt.split("Visual prompt:", 1)[0]
+
+    assert "children peeking" not in positive_scene_instruction
+    assert "sits alone at a wooden tea table" in positive_scene_instruction
+
+
 def test_turbo_quality_preset_is_available_for_sdxl_turbo_models():
     preset = _resolve_quality_preset("turbo")
 
@@ -733,7 +1140,14 @@ def test_comfyui_pipeline_requires_an_approved_character_anchor():
     assert "_scene_reference_image_path" in source
 
 
-def test_cast_bible_is_versioned_and_contains_recurring_characters():
+def test_cast_bible_is_versioned_and_contains_recurring_characters(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AI_FILM_CAST_BIBLE_REGISTRY",
+        str(tmp_path / "empty-cast-registry.json"),
+    )
     story = (
         "Alice asks Professor Ludovico for help. Ludovico smiles at Alice. "
         "Edith and Lóri watch while Mia rests nearby."
@@ -897,6 +1311,35 @@ def test_character_reference_image_prompt_excludes_narrative_environment():
     assert "rule of thirds" not in prompt
 
 
+def test_adolescent_front_repair_prioritizes_age_without_preserving_bad_age():
+    visual_bible = _build_visual_bible(
+        "Alice speaks with her older sister Lóri.",
+        "comic_storybook",
+    )
+    scene = _build_character_reference_scene(
+        visual_bible,
+        "lori",
+        "front",
+    )
+    scene["cast_front_repair"] = True
+
+    prompt = _build_image_prompt(
+        scene,
+        "comic_storybook",
+        visual_bible,
+        "correct age and proportions",
+    )
+
+    assert prompt.startswith("NON-NEGOTIABLE AGE DESIGN")
+    assert "exactly 16 years old" in prompt
+    assert "age-appropriate medium-sized eyes" in prompt
+    assert "non-chibi western animated feature character design" in prompt
+    assert "large readable eyes" not in prompt
+    assert "rejected design draft" in prompt
+    assert "do not preserve its apparent age" in prompt
+    assert "preserve the exact same fictional character, apparent age" not in prompt
+
+
 def test_cast_reference_reconciliation_overrides_deterministic_false_negatives(
     monkeypatch,
     tmp_path,
@@ -1007,6 +1450,160 @@ def test_cast_reference_reconciliation_keeps_nonuniform_background_failure(
     assert metric["issues"] == ["required_6", "required_6_no"]
 
 
+def test_cast_front_reconciliation_accepts_deterministic_close_portrait(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    candidate = tmp_path / "lori_character_reference_front.png"
+    Image.new("RGB", (1086, 1448), color=(192, 181, 169)).save(candidate)
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_detect_profile_eye_count",
+        lambda _path: 2,
+    )
+    metric = {
+        "technical_score": 93.2,
+        "quality_score": 77.3,
+        "semantic_score": 79.0,
+        "semantic_accepted": False,
+        "semantic_critical_failures": ["required_1"],
+        "issues": [
+            "required_1",
+            "required_1_no",
+            "semantic_quality_below_threshold",
+        ],
+        "semantic_qa_evidence": [
+            {
+                "code": "required_1",
+                "question": (
+                    "Is this requirement clearly satisfied in the image: "
+                    "front-facing close identity portrait from top of head to "
+                    "mid-torso only?"
+                ),
+                "matched": False,
+            }
+        ],
+    }
+
+    langgraph_adapter._reconcile_cast_reference_semantic_false_negatives(
+        image_metric=metric,
+        candidate_path=str(candidate),
+        view_id="front",
+        identity_accepted=True,
+        composition_similarity=0.0,
+    )
+
+    assert metric["semantic_critical_failures"] == []
+    assert metric["issues"] == []
+    assert metric["semantic_score"] == 100.0
+    assert metric["semantic_accepted"] is True
+    assert metric["quality_score"] == 97.3
+
+
+def test_cast_reference_reconciliation_accepts_age_when_identity_is_proven(
+    tmp_path,
+):
+    from PIL import Image
+
+    candidate = tmp_path / "lori_character_reference_profile.png"
+    Image.new("RGB", (896, 1152), color=(192, 181, 169)).save(candidate)
+    metric = {
+        "technical_score": 96.0,
+        "quality_score": 77.7,
+        "semantic_score": 79.0,
+        "semantic_accepted": False,
+        "semantic_critical_failures": ["required_2"],
+        "issues": [
+            "required_2",
+            "required_2_no",
+            "semantic_quality_below_threshold",
+        ],
+        "semantic_qa_evidence": [
+            {
+                "code": "required_2",
+                "question": (
+                    "Is this requirement clearly satisfied in the image: "
+                    "exactly one 16-year-old adolescent Lóri?"
+                ),
+                "matched": False,
+            },
+            {
+                "code": "cast_identity_proportions_mismatch",
+                "question": (
+                    "Is this requirement clearly satisfied in the image: "
+                    "mature teenage face and adolescent body proportions?"
+                ),
+                "matched": True,
+            },
+            {
+                "code": "forbidden_1",
+                "question": (
+                    "Are two or more distinct people or animals visible in this image?"
+                ),
+                "matched": True,
+            },
+        ],
+    }
+
+    langgraph_adapter._reconcile_cast_reference_semantic_false_negatives(
+        image_metric=metric,
+        candidate_path=str(candidate),
+        view_id="profile",
+        identity_accepted=True,
+        composition_similarity=0.69,
+    )
+
+    assert metric["semantic_critical_failures"] == []
+    assert metric["issues"] == []
+    assert metric["semantic_score"] == 100.0
+    assert metric["semantic_accepted"] is True
+    assert metric["semantic_qa_evidence"][-1]["overridden_codes"] == ["required_2"]
+
+
+def test_cast_reference_reconciliation_keeps_age_failure_when_count_is_uncertain(
+    tmp_path,
+):
+    from PIL import Image
+
+    candidate = tmp_path / "lori_character_reference_profile.png"
+    Image.new("RGB", (896, 1152), color=(192, 181, 169)).save(candidate)
+    metric = {
+        "technical_score": 96.0,
+        "semantic_critical_failures": ["required_2", "forbidden_1"],
+        "issues": ["required_2", "forbidden_1"],
+        "semantic_qa_evidence": [
+            {
+                "code": "required_2",
+                "question": "Exactly one 16-year-old adolescent Lóri?",
+                "matched": False,
+            },
+            {
+                "code": "cast_identity_proportions_mismatch",
+                "question": "Mature teenage face and adolescent body proportions?",
+                "matched": True,
+            },
+            {
+                "code": "forbidden_1",
+                "question": "Are two or more distinct people visible?",
+                "matched": False,
+            },
+        ],
+    }
+
+    langgraph_adapter._reconcile_cast_reference_semantic_false_negatives(
+        image_metric=metric,
+        candidate_path=str(candidate),
+        view_id="profile",
+        identity_accepted=True,
+        composition_similarity=0.69,
+    )
+
+    assert metric["semantic_critical_failures"] == ["required_2", "forbidden_1"]
+    assert metric["issues"] == ["required_2", "forbidden_1"]
+
+
 def test_cast_reference_canvas_border_is_removed_without_touching_plain_image(
     tmp_path,
 ):
@@ -1029,6 +1626,64 @@ def test_cast_reference_canvas_border_is_removed_without_touching_plain_image(
     assert hashlib.sha256(plain.read_bytes()).hexdigest() == plain_checksum
     with Image.open(bordered) as normalized:
         assert normalized.convert("RGB").getpixel((0, 0))[0] > 150
+
+
+def test_cast_reference_front_portrait_normalizes_only_full_body_humans(tmp_path):
+    from PIL import Image, ImageDraw
+
+    scene = {
+        "scene_role": "character_reference",
+        "reference_view_id": "front",
+        "character_kind": "human",
+    }
+    full_body = tmp_path / "full_body_front.png"
+    full_body_image = Image.new("RGB", (512, 512), color=(230, 220, 200))
+    draw = ImageDraw.Draw(full_body_image)
+    draw.ellipse((196, 18, 316, 138), fill=(110, 62, 38))
+    draw.rectangle((178, 126, 334, 484), fill=(65, 95, 74))
+    draw.rectangle((178, 460, 334, 484), fill=(24, 52, 126))
+    full_body_image.save(full_body)
+
+    close_portrait = tmp_path / "close_portrait.png"
+    close_image = Image.new("RGB", (512, 512), color=(230, 220, 200))
+    close_draw = ImageDraw.Draw(close_image)
+    close_draw.ellipse((94, 20, 418, 344), fill=(110, 62, 38))
+    close_draw.rectangle((62, 320, 450, 512), fill=(65, 95, 74))
+    close_image.save(close_portrait)
+    close_checksum = hashlib.sha256(close_portrait.read_bytes()).hexdigest()
+
+    assert langgraph_adapter._normalize_cast_reference_front_portrait(
+        str(full_body),
+        scene,
+    )
+    assert not langgraph_adapter._normalize_cast_reference_front_portrait(
+        str(close_portrait),
+        scene,
+    )
+    assert hashlib.sha256(close_portrait.read_bytes()).hexdigest() == close_checksum
+    with Image.open(full_body) as normalized:
+        assert normalized.size == (512, 512)
+        colors = normalized.convert("RGB").getdata()
+        assert not any(
+            blue > 100 and blue > red * 2 and blue > green * 1.5
+            for red, green, blue in colors
+        )
+
+
+def test_cast_reference_front_portrait_ignores_animals(tmp_path):
+    from PIL import Image
+
+    source = tmp_path / "animal.png"
+    Image.new("RGB", (512, 512), color=(230, 220, 200)).save(source)
+
+    assert not langgraph_adapter._normalize_cast_reference_front_portrait(
+        str(source),
+        {
+            "scene_role": "character_reference",
+            "reference_view_id": "front",
+            "character_kind": "animal",
+        },
+    )
 
 
 def test_cast_reference_runtime_limits_and_portrait_framing(monkeypatch):
@@ -1057,7 +1712,8 @@ def test_cast_reference_runtime_limits_and_portrait_framing(monkeypatch):
     assert _cast_reference_qwen_denoise("profile") == 0.2
     assert _cast_reference_qwen_denoise("three_quarter") == 0.95
     assert _cast_reference_qwen_denoise("full_body") == 1.0
-    assert _cast_reference_qwen_denoise("expression_warm") == 0.35
+    assert _cast_reference_qwen_denoise("expression_warm") == 0.2
+    assert "gentle closed-mouth smile" in CAST_REFERENCE_VIEWS["expression_warm"]
     with pytest.raises(ValueError, match="unknown_cast_reference_view"):
         _cast_reference_qwen_denoise("invalid")
 
@@ -1328,6 +1984,44 @@ def test_retry_run_without_summary_or_manifest_copies_nothing(monkeypatch, tmp_p
         ui_server._validated_retry_run_id("../escape")
 
 
+def test_retry_run_copies_only_valid_narrative_image_assets(monkeypatch, tmp_path):
+    from PIL import Image
+
+    runs_root = tmp_path / "runs"
+    run_id = "20260722_001022_77706927"
+    source_output = runs_root / run_id / "output"
+    target_output = runs_root / "20260722_010000_aaaaaaaa" / "output"
+    source_output.mkdir(parents=True)
+    target_output.mkdir(parents=True)
+    for name in (
+        "scene_1_fal_attempt_1.png",
+        "scene_1_fal_attempt_5.png",
+        "scene_1_image.png",
+    ):
+        Image.new("RGB", (512, 768), "white").save(source_output / name)
+    Image.new("RGB", (128, 128), "white").save(
+        source_output / "scene_2_fal_attempt_1.png"
+    )
+    Image.new("RGB", (512, 768), "white").save(source_output / "unrelated.png")
+    monkeypatch.setattr(ui_server, "RUNS_ROOT", runs_root.resolve())
+
+    copied = ui_server._copy_narrative_image_resume_assets(
+        run_id,
+        target_output,
+    )
+
+    assert copied == [
+        "scene_1_fal_attempt_1.png",
+        "scene_1_fal_attempt_5.png",
+        "scene_1_image.png",
+    ]
+    assert (target_output / "scene_1_fal_attempt_1.png").is_file()
+    assert (target_output / "scene_1_fal_attempt_5.png").is_file()
+    assert (target_output / "scene_1_image.png").is_file()
+    assert not (target_output / "scene_2_fal_attempt_1.png").exists()
+    assert not (target_output / "unrelated.png").exists()
+
+
 def test_retry_run_with_summary_copies_only_automatic_pass_views(
     monkeypatch,
     tmp_path,
@@ -1392,6 +2086,89 @@ def test_retry_run_with_summary_copies_only_automatic_pass_views(
             "sha256": checksum,
         }
     ]
+
+
+def test_retry_run_carries_untrusted_drafts_from_rejected_cast_pack(
+    monkeypatch,
+    tmp_path,
+):
+    runs_root = tmp_path / "runs"
+    run_id = "20260722_001022_77706927"
+    run_dir = runs_root / run_id
+    source_output = run_dir / "output"
+    target_output = runs_root / "20260722_010000_aaaaaaaa" / "output"
+    source_output.mkdir(parents=True)
+    target_output.mkdir(parents=True)
+    front = source_output / "alice_character_reference_front.png"
+    profile = source_output / "alice_character_reference_profile.png"
+    front.write_bytes(b"f" * 2000)
+    profile.write_bytes(b"p" * 2000)
+    checksum = hashlib.sha256(front.read_bytes()).hexdigest()
+    (run_dir / "pipeline_summary.json").write_text(
+        json.dumps(
+            {
+                "visual_bible": {
+                    "cast_bible": {
+                        "characters": [
+                            {
+                                "id": "alice",
+                                "reference": {
+                                    "status": "rejected_by_human",
+                                    "human_approved": False,
+                                    "human_reviewed_at": ("2026-07-29T04:00:00+00:00"),
+                                    "views": {
+                                        "front": {
+                                            "automatic_approved": True,
+                                            "path": f"output/{front.name}",
+                                            "checksum": checksum,
+                                        }
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ui_server, "RUNS_ROOT", runs_root.resolve())
+
+    copied = ui_server._copy_cast_reference_resume_assets(run_id, target_output)
+
+    assert copied == [front.name, profile.name]
+    assert (target_output / front.name).exists()
+    assert (target_output / profile.name).exists()
+    assert not (target_output / ui_server.CAST_REFERENCE_RESUME_TRUST_FILE).exists()
+    (run_dir / ui_server.CAST_REFERENCE_RESUME_MANIFEST).write_text(
+        json.dumps(
+            {
+                "schema_version": (ui_server.CAST_REFERENCE_RESUME_SCHEMA_VERSION),
+                "source_run_id": run_id,
+                "assets": [
+                    {
+                        "validated": True,
+                        "source_name": front.name,
+                        "destination_name": front.name,
+                        "sha256": checksum,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_target = runs_root / "20260722_020000_bbbbbbbb" / "output"
+    manifest_target.mkdir(parents=True)
+
+    copied_from_manifest = ui_server._copy_cast_reference_resume_assets(
+        run_id,
+        manifest_target,
+    )
+
+    assert copied_from_manifest == [front.name]
+    assert (manifest_target / front.name).exists()
+    assert not (manifest_target / profile.name).exists()
+    assert not (manifest_target / ui_server.CAST_REFERENCE_RESUME_TRUST_FILE).exists()
 
 
 def test_retry_run_uses_checksum_verified_manifest_as_authoritative_allowlist(
@@ -1542,6 +2319,50 @@ def test_resumed_cast_reference_cache_requires_matching_checksum(tmp_path):
     assert langgraph_adapter._trusted_resumed_cast_reference(str(candidate)) is False
 
 
+def test_retry_run_chains_checksum_verified_trust_assets(monkeypatch, tmp_path):
+    runs_root = tmp_path / "runs"
+    run_id = "20260722_001022_77706927"
+    source_output = runs_root / run_id / "output"
+    target_output = runs_root / "20260722_010000_aaaaaaaa" / "output"
+    source_output.mkdir(parents=True)
+    target_output.mkdir(parents=True)
+    candidate = source_output / "edith_character_reference_front.png"
+    candidate.write_bytes(b"trusted-reference" * 200)
+    checksum = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    (source_output / ui_server.CAST_REFERENCE_RESUME_TRUST_FILE).write_text(
+        json.dumps(
+            {
+                "schema_version": ui_server.CAST_REFERENCE_RESUME_SCHEMA_VERSION,
+                "source_run_id": "20260721_001022_77706926",
+                "assets": [
+                    {
+                        "name": candidate.name,
+                        "sha256": checksum,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ui_server, "RUNS_ROOT", runs_root.resolve())
+
+    copied = ui_server._copy_cast_reference_resume_assets(run_id, target_output)
+
+    assert copied == [candidate.name]
+    chained_trust = json.loads(
+        (target_output / ui_server.CAST_REFERENCE_RESUME_TRUST_FILE).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert chained_trust["source_run_id"] == run_id
+    assert chained_trust["assets"] == [
+        {
+            "name": candidate.name,
+            "sha256": checksum,
+        }
+    ]
+
+
 def test_retry_run_summary_normalizes_approved_attempt_to_canonical_name(
     monkeypatch,
     tmp_path,
@@ -1629,6 +2450,62 @@ def test_retry_run_manifest_verifies_checksum_and_canonical_destination(
         target_output,
     )
     assert copied_after_tamper == []
+
+
+def test_resume_manifest_resolves_versioned_summary_path_to_canonical_alias(
+    tmp_path,
+):
+    run_dir = tmp_path / "20260722_001022_77706927"
+    output_dir = run_dir / "output"
+    output_dir.mkdir(parents=True)
+    canonical = output_dir / "ludovico_character_reference_front.png"
+    canonical.write_bytes(b"l" * 2000)
+    checksum = hashlib.sha256(canonical.read_bytes()).hexdigest()
+    summary_path = run_dir / "pipeline_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "visual_bible": {
+                    "cast_bible": {
+                        "characters": [
+                            {
+                                "id": "ludovico",
+                                "reference": {
+                                    "views": {
+                                        "front": {
+                                            "automatic_approved": True,
+                                            "path": (
+                                                "output/cast_bible/ludovico/v1/front.png"
+                                            ),
+                                            "checksum": checksum,
+                                        }
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_path = create_cast_reference_resume_manifest(
+        run_dir,
+        approved_summary=summary_path,
+        overrides=[],
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["assets"] == [
+        {
+            "source_name": "ludovico_character_reference_front.png",
+            "destination_name": "ludovico_character_reference_front.png",
+            "sha256": checksum,
+            "validated": True,
+            "validation_source": "automatic_gate",
+        }
+    ]
 
 
 def test_cast_reference_generation_parallelizes_only_derived_views():
@@ -1767,8 +2644,13 @@ def test_identity_retry_switches_to_the_character_that_failed(tmp_path):
 
 
 def test_cast_reference_gate_requires_all_characters_used_by_scenes(
+    monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setenv(
+        "AI_FILM_CAST_BIBLE_REGISTRY",
+        str(tmp_path / "empty-cast-registry.json"),
+    )
     visual_bible = _build_visual_bible(
         "Alice conversa com Ludovico. Ludovico responde a Alice.",
         "comic_storybook",
@@ -1848,7 +2730,7 @@ def test_cast_identity_thresholds_are_calibrated_per_view(monkeypatch):
     monkeypatch.delenv("LOCAL_CAST_IDENTITY_MIN_SIMILARITY", raising=False)
 
     assert _identity_similarity_threshold("profile") == 0.65
-    assert _identity_composition_threshold("profile") == 0.72
+    assert _identity_composition_threshold("profile") == 0.65
     assert _identity_similarity_threshold("three_quarter") == 0.75
     assert _identity_composition_threshold("three_quarter") == 0.80
     assert _identity_similarity_threshold("full_body") == 0.68
@@ -1861,6 +2743,8 @@ def test_refresh_cast_stage_reports_regeneration_required():
         "Alice caminha no jardim. Alice olha para Ludovico.",
         "comic_storybook",
     )
+    for character in visual_bible["cast_bible"]["characters"]:
+        _begin_cast_reference_revision(character)
     summary = {
         "scenes": [{"scene_id": 1, "description": "Alice talks to Ludovico."}],
         "visual_bible": visual_bible,
@@ -1900,6 +2784,42 @@ def test_refresh_cast_stage_does_not_require_lora_for_fal(monkeypatch, tmp_path)
     }
 
 
+def test_refresh_cast_stage_resolves_run_relative_reference_paths(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(ui_server, "load_dotenv", lambda *args, **kwargs: True)
+    monkeypatch.setenv("IMAGE_GENERATION_PROVIDER", "fal")
+    run_dir = tmp_path / "run"
+    output_dir = run_dir / "output"
+    output_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    visual_bible = _build_visual_bible(
+        "Alice walks through the garden. Alice looks curious.",
+        DEFAULT_IMAGE_STYLE,
+    )
+    alice = visual_bible["cast_bible"]["characters"][0]
+    _approve_cast_reference_pack(alice, output_dir)
+    reference = alice["reference"]
+    reference["path"] = str(Path(reference["path"]).relative_to(run_dir))
+    for view in reference["views"].values():
+        view["path"] = str(Path(view["path"]).relative_to(run_dir))
+    monkeypatch.chdir(elsewhere)
+    summary = {
+        "scenes": [{"scene_id": 1, "description": "Alice walks in the garden."}],
+        "visual_bible": visual_bible,
+        "quality_metrics": {},
+    }
+
+    assert langgraph_adapter._approved_cast_reference_path(alice) is None
+    stage = ui_server._refresh_cast_stage(summary, base_dir=run_dir)
+
+    assert stage == "ready_to_generate_scenes"
+    assert summary["visual_bible"]["cast_bible"]["status"] == "approved"
+    assert summary["visual_bible"]["cast_bible"]["missing_reference_ids"] == []
+
+
 def test_character_anchor_requires_explicit_semantic_acceptance():
     assert (
         _character_reference_accepted(
@@ -1930,6 +2850,10 @@ def test_character_anchor_requires_explicit_semantic_acceptance():
 def test_cast_reference_revision_updates_checksum_version_and_lora_contract(
     monkeypatch, tmp_path
 ):
+    monkeypatch.setenv(
+        "AI_FILM_CAST_BIBLE_REGISTRY",
+        str(tmp_path / "missing-cast-registry.json"),
+    )
     monkeypatch.setenv("COMFYUI_CHARACTER_LORA_ALICE", "char_alice_v1.safetensors")
     visual_bible = _build_visual_bible(
         "Alice walks through the garden. Alice looks curious.",
@@ -1977,7 +2901,14 @@ def test_flux2_lora_gate_requires_current_individual_character_adapter(
     ]
 
 
-def test_cast_bible_export_creates_checksum_verified_training_pack(tmp_path):
+def test_cast_bible_export_creates_checksum_verified_training_pack(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AI_FILM_CAST_BIBLE_REGISTRY",
+        str(tmp_path / "missing-cast-registry.json"),
+    )
     visual_bible = _build_visual_bible(
         "Alice walks through the garden. Alice looks curious.",
         DEFAULT_IMAGE_STYLE,
@@ -2016,6 +2947,196 @@ def test_cast_reference_requires_separate_human_approval(tmp_path):
     assert approved["status"] == "approved"
     assert approved["human_approved"] is True
     assert all(view["human_approved"] is True for view in approved["views"].values())
+
+
+def _cast_front_upload_run(tmp_path):
+    visual_bible = _build_visual_bible(
+        "Alice walks through the garden. Alice looks curious.",
+        DEFAULT_IMAGE_STYLE,
+    )
+    scenes = [{"scene_id": 1, "description": "Alice walks through the garden."}]
+    _required_scene_cast(scenes, visual_bible)
+    return {
+        "id": "cast-front-upload-test",
+        "status": "completed",
+        "run_dir": str(tmp_path),
+        "image_style": DEFAULT_IMAGE_STYLE,
+        "image_quality_preset": "high",
+        "updated_at": "initial",
+        "summary": {
+            "status": "awaiting_cast_reference_regeneration",
+            "current_step": "awaiting_cast_reference_regeneration",
+            "scenes": scenes,
+            "scenes_count": 1,
+            "visual_bible": visual_bible,
+            "scene_videos": [{"scene_id": 1, "video_path": "old.mp4"}],
+            "curation": {"scenes": {}},
+            "quality_metrics": {},
+        },
+        "log": [],
+    }
+
+
+def _cast_front_upload_bytes():
+    from PIL import Image
+
+    image = Image.effect_noise((640, 800), 80).convert("RGB")
+    payload = BytesIO()
+    image.save(payload, format="PNG")
+    payload.seek(0)
+    return payload
+
+
+def test_cast_front_upload_accepts_anchor_and_invalidates_derived_views(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AI_FILM_CAST_BIBLE_REGISTRY",
+        str(tmp_path / "missing-cast-registry.json"),
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_probe_image_quality",
+        lambda *_args, **_kwargs: {"valid": True, "quality_score": 100},
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_evaluate_image_semantics",
+        lambda *_args, **_kwargs: {"accepted": True, "semantic_score": 96},
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_combine_image_quality",
+        lambda *_args, **_kwargs: {
+            "quality_score": 98.0,
+            "technical_accepted": True,
+            "semantic_score": 96.0,
+            "semantic_accepted": True,
+            "semantic_critical_failures": [],
+            "issues": [],
+        },
+    )
+    run = _cast_front_upload_run(tmp_path)
+    run_id = run["id"]
+    ui_server.RUNS[run_id] = run
+    try:
+        response = ui_server.app.test_client().post(
+            f"/api/runs/{run_id}/cast-front-reference",
+            data={
+                "character_id": "alice",
+                "reference": (
+                    _cast_front_upload_bytes(),
+                    "alice-front.png",
+                    "image/png",
+                ),
+            },
+        )
+    finally:
+        ui_server.RUNS.pop(run_id, None)
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    summary = payload["summary"]
+    alice = summary["visual_bible"]["cast_bible"]["characters"][0]
+    reference = alice["reference"]
+    front = reference["views"]["front"]
+    assert front["automatic_approved"] is True
+    assert front["human_approved"] is True
+    assert front["source"] == "human_upload"
+    assert Path(front["path"]).resolve().parent == (tmp_path / "output").resolve()
+    assert Path(front["path"]).is_file()
+    assert reference["anchor_source"] == "human_upload"
+    assert all(
+        reference["views"][view_id]["status"] == "pending"
+        for view_id in CAST_REFERENCE_VIEWS
+        if view_id != "front"
+    )
+    assert summary["status"] == "awaiting_cast_reference_regeneration"
+    assert summary["scene_videos"] == []
+    assert summary["quality_metrics"]["cast_reference_uploads"][-1]["accepted"] is True
+
+
+def test_cast_front_upload_keeps_rejected_candidate_out_of_canonical_pack(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv(
+        "AI_FILM_CAST_BIBLE_REGISTRY",
+        str(tmp_path / "missing-cast-registry.json"),
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_probe_image_quality",
+        lambda *_args, **_kwargs: {"valid": True, "quality_score": 100},
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_evaluate_image_semantics",
+        lambda *_args, **_kwargs: {"accepted": False, "semantic_score": 65},
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_combine_image_quality",
+        lambda *_args, **_kwargs: {
+            "quality_score": 76.0,
+            "technical_accepted": True,
+            "semantic_score": 65.0,
+            "semantic_accepted": False,
+            "semantic_critical_failures": ["required_2"],
+            "issues": ["required_2"],
+        },
+    )
+    run = _cast_front_upload_run(tmp_path)
+    run_id = run["id"]
+    ui_server.RUNS[run_id] = run
+    try:
+        response = ui_server.app.test_client().post(
+            f"/api/runs/{run_id}/cast-front-reference",
+            data={
+                "character_id": "alice",
+                "reference": (
+                    _cast_front_upload_bytes(),
+                    "alice-front.png",
+                    "image/png",
+                ),
+            },
+        )
+    finally:
+        ui_server.RUNS.pop(run_id, None)
+
+    assert response.status_code == 422
+    payload = response.get_json()
+    reference = payload["run"]["summary"]["visual_bible"]["cast_bible"]["characters"][
+        0
+    ]["reference"]
+    assert reference["views"]["front"]["automatic_approved"] is False
+    assert reference["upload_candidate"]["accepted"] is False
+    assert Path(reference["upload_candidate"]["path"]).is_file()
+    assert not (tmp_path / "output/alice_character_reference_front.png").exists()
+
+
+def test_cast_front_upload_rejects_non_image(tmp_path):
+    run = _cast_front_upload_run(tmp_path)
+    run_id = run["id"]
+    ui_server.RUNS[run_id] = run
+    try:
+        response = ui_server.app.test_client().post(
+            f"/api/runs/{run_id}/cast-front-reference",
+            data={
+                "character_id": "alice",
+                "reference": (
+                    BytesIO(b"not-an-image" * 200),
+                    "alice-front.png",
+                    "image/png",
+                ),
+            },
+        )
+    finally:
+        ui_server.RUNS.pop(run_id, None)
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "cast_reference_upload_invalid_image"
 
 
 def test_cast_approval_endpoint_persists_registry_and_invalidates_old_assets(
@@ -2079,6 +3200,65 @@ def test_cast_approval_endpoint_persists_registry_and_invalidates_old_assets(
     assert payload["summary"]["curation"]["scenes"]["1"]["approved_attempt_id"] is None
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     assert registry["characters"][0]["reference"]["human_approved"] is True
+    assert Path(
+        registry["characters"][0]["reference"]["views"]["front"]["path"]
+    ).is_absolute()
+
+
+def test_cast_approval_endpoint_resolves_persisted_run_relative_paths(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(ui_server, "load_dotenv", lambda *args, **kwargs: True)
+    registry_path = tmp_path / "cast-registry.json"
+    monkeypatch.setenv("AI_FILM_CAST_BIBLE_REGISTRY", str(registry_path))
+    monkeypatch.setenv("COMFYUI_FLUX2_STYLE_LORA", "style_storybook_v1.safetensors")
+    monkeypatch.setenv("COMFYUI_CHARACTER_LORA_ALICE", "char_alice_v1.safetensors")
+    visual_bible = _build_visual_bible(
+        "Alice walks through the garden. Alice looks curious.",
+        DEFAULT_IMAGE_STYLE,
+    )
+    alice = visual_bible["cast_bible"]["characters"][0]
+    _auto_approve_cast_reference_pack(alice, tmp_path)
+    reference = alice["reference"]
+    for view in reference["views"].values():
+        view["path"] = str(Path(view["path"]).relative_to(tmp_path))
+    reference["path"] = str(Path(reference["path"]).relative_to(tmp_path))
+    scenes = [{"scene_id": 1, "description": "Alice walks through the garden."}]
+    _required_scene_cast(scenes, visual_bible)
+    summary = {
+        "status": "awaiting_cast_reference_approval",
+        "current_step": "awaiting_cast_reference_approval",
+        "scenes": scenes,
+        "scenes_count": 1,
+        "visual_bible": visual_bible,
+        "curation": {"scenes": {}},
+    }
+    run_id = "cast-approval-relative-path-test"
+    ui_server.RUNS[run_id] = {
+        "id": run_id,
+        "status": "completed",
+        "run_dir": str(tmp_path),
+        "image_style": DEFAULT_IMAGE_STYLE,
+        "image_quality_preset": "high",
+        "summary": summary,
+        "log": [],
+    }
+    try:
+        response = ui_server.app.test_client().post(
+            f"/api/runs/{run_id}/cast-reference-approval",
+            json={"character_id": "alice", "approved": True},
+        )
+    finally:
+        ui_server.RUNS.pop(run_id, None)
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    approved_reference = payload["summary"]["visual_bible"]["cast_bible"]["characters"][
+        0
+    ]["reference"]
+    assert approved_reference["human_approved"] is True
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
     assert Path(
         registry["characters"][0]["reference"]["views"]["front"]["path"]
     ).is_absolute()
@@ -2252,24 +3432,6 @@ def test_generic_small_objects_require_word_boundaries():
     assert _names(false_positive_scene) == []
 
 
-def test_premium_audio_narration_removes_debug_scene_label():
-    scene = {
-        "scene_id": 2,
-        "description": (
-            "Na sala de jantar vitoriana, Ludovico revela o truque do açucareiro: "
-            "um pequeno ratinho branco surge do açucareiro."
-        ),
-        "must_include": ["small white mouse emerging from the sugar bowl"],
-    }
-
-    narration = _premium_audio_narration(scene)
-    direction = _premium_audio_direction(scene)
-
-    assert not narration.lower().startswith("cena 2:")
-    assert "ratinho branco" in narration
-    assert "suspense" in direction["tone"]
-
-
 def test_audio_quality_gate_marks_non_premium_provider():
     metrics = {
         "valid": True,
@@ -2286,22 +3448,42 @@ def test_audio_quality_gate_marks_non_premium_provider():
     assert gated["quality_score"] <= 72.0
 
 
-def test_voice_id_can_route_future_character_dialogue(monkeypatch):
-    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "narrator-default")
-    monkeypatch.setenv("ELEVENLABS_VOICE_ID_ALICE", "alice-premium")
-
-    voice_id, role = _elevenlabs_voice_id_for_scene({"scene_id": 1, "speaker": "Alice"})
-
-    assert role == "Alice"
-    assert voice_id == "alice-premium"
-
-
 def test_selective_audio_retry_is_premium_elevenlabs_only():
     source = inspect.getsource(ui_server._run_selective_audio_retry)
 
     assert "_generate_local_tts_audio" not in source
-    assert "_enhance_premium_audio" in source
+    assert "_generate_scene_dialogue_audio" in source
     assert '"audio_provider": "elevenlabs"' in source
+    assert "_recompile_final_video_from_attempts" not in source
+    assert "corte final aguarda aprovação humana" in source
+
+
+def test_audio_retry_inherits_complete_visual_evidence():
+    visual_attempt = {
+        "id": "attempt_1",
+        "image_path": "output/scene_3_image.png",
+        "image_job": {
+            "technical_accepted": True,
+            "style_human_review_required": True,
+            "cast_reference_versions": {
+                "alice": {"version": 1, "checksum": "alice-v1"}
+            },
+        },
+        "audio_path": "output/scene_3_audio.mp3",
+    }
+    audio_only_attempt = {
+        "id": "attempt_2",
+        "image_path": "output/scene_3_image.png",
+        "audio_path": "output/curation/scene_3_attempt_2_audio.mp3",
+    }
+
+    inherited = ui_server._inherited_audio_retry_attempt(
+        [visual_attempt, audio_only_attempt],
+        audio_only_attempt,
+    )
+
+    assert inherited["image_job"] == visual_attempt["image_job"]
+    assert inherited["audio_path"] == audio_only_attempt["audio_path"]
 
 
 def test_image_generation_defaults_to_comfyui_comic_storybook(monkeypatch):
@@ -2789,7 +3971,10 @@ def test_deterministic_prop_stage_preserves_canvas_and_limits_edit(tmp_path):
         assert staged.getpixel((150, 225)) != (0, 0, 128)
         corner = staged.getpixel((127, 193))
         assert (
-            sum(abs(value - expected) for value, expected in zip(corner, (0, 0, 128)))
+            sum(
+                abs(value - expected)
+                for value, expected in zip(corner, (0, 0, 128), strict=True)
+            )
             <= 50
         )
     assert placement["target_box"] == (126, 192, 174, 237)
@@ -3118,6 +4303,11 @@ def test_local_semantic_qa_scores_atomic_evidence(monkeypatch, tmp_path):
     monkeypatch.setattr(
         local_visual_qa, "evaluate_local_visual_checklist", evaluate_checklist
     )
+    monkeypatch.setattr(
+        local_visual_qa,
+        "classify_local_small_animal",
+        lambda **_kwargs: "mouse",
+    )
     image_path = tmp_path / "scene.png"
     image_path.write_bytes(b"local-test-image")
 
@@ -3142,6 +4332,57 @@ def test_local_semantic_qa_scores_atomic_evidence(monkeypatch, tmp_path):
     assert result["hero_object_legibility"] is True
     assert result["evidence"][1]["answer"] == "no"
     assert result["evidence"][2]["question"].startswith("Is one tiny natural")
+
+
+def test_forbidden_animal_false_positive_requires_human_review(
+    monkeypatch,
+    tmp_path,
+):
+    from open3d_implementation.core import local_visual_qa
+
+    def evaluate_checklist(**kwargs):
+        return [
+            local_visual_qa.LocalVisualAnswer(
+                criterion=criterion,
+                answer=(
+                    "yes" if criterion.code == "forbidden_cat" else criterion.expected
+                ),
+                raw_response=(
+                    "Yes." if criterion.code == "forbidden_cat" else criterion.expected
+                ),
+            )
+            for criterion in kwargs["criteria"]
+        ]
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_visual_checklist",
+        evaluate_checklist,
+    )
+    image_path = tmp_path / "chess.png"
+    image_path.write_bytes(b"local-test-image")
+
+    result = _evaluate_semantic_qa_with_local_vlm(
+        image_path=image_path,
+        scene={
+            "description": "Alice plays chess with Professor Ludovico.",
+            "must_include": ["Alice", "Professor Ludovico", "chessboard"],
+            "must_not_include": ["cats", "kittens"],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+    )
+
+    animal_evidence = [
+        item for item in result["evidence"] if item["code"] == "forbidden_cat"
+    ]
+    assert result["accepted"] is True
+    assert result["semantic_score"] == 100
+    assert result["animal_human_review_required"] is True
+    assert result["critical_failures"] == []
+    assert result["issues"] == ["animal_presence_human_review_required"]
+    assert animal_evidence
+    assert all(item["matched"] is False for item in animal_evidence)
 
 
 def test_local_semantic_qa_requires_specialized_age_evidence(monkeypatch, tmp_path):
@@ -3227,6 +4468,72 @@ def test_local_character_identity_comparison_rejects_any_failed_anchor(
     assert result.score == pytest.approx(87.5, abs=0.1)
     assert result.answers[2].criterion.code == "identity_hair_alice"
     assert result.answers[2].matched is False
+
+
+def test_local_cast_full_body_identity_compares_detected_faces(monkeypatch):
+    import torch
+    from PIL import Image
+
+    from open3d_implementation.core import local_visual_qa
+
+    reference = Image.new("RGB", (256, 256), "white")
+    candidate = Image.new("RGB", (256, 512), "gray")
+    reference_face = Image.new("RGB", (96, 128), "white")
+    candidate_face = Image.new("RGB", (88, 118), "gray")
+
+    def load_image(path):
+        return reference if "reference" in str(path) else candidate
+
+    def primary_face(source):
+        if source is reference:
+            return reference_face, (20, 20, 120, 150)
+        return candidate_face, (84, 30, 172, 148)
+
+    monkeypatch.setattr(local_visual_qa, "_load_rgb_image", load_image)
+    monkeypatch.setattr(local_visual_qa, "_primary_reference_face", primary_face)
+    monkeypatch.setattr(
+        local_visual_qa,
+        "_neutral_subject_crop",
+        lambda *_args, **_kwargs: pytest.fail(
+            "full-body identity must prefer detected face crops"
+        ),
+    )
+
+    class Processor:
+        def __call__(self, **_kwargs):
+            return {}
+
+    class Output:
+        last_hidden_state = torch.tensor(
+            [
+                [[1.0, 0.0]],
+                [[0.99, 0.01]],
+                [[1.0, 0.0]],
+                [[0.0, 1.0]],
+            ]
+        )
+
+    class Model:
+        def __call__(self, **_kwargs):
+            return Output()
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "_load_local_identity_model",
+        lambda *_args: (Processor(), Model()),
+    )
+
+    result = local_visual_qa.evaluate_local_cast_reference_identity(
+        reference_path=Path("reference.png"),
+        candidate_path=Path("candidate.png"),
+        view_id="full_body",
+    )
+
+    assert result.accepted is True
+    assert result.crop_similarity > 0.99
+    assert result.composition_similarity == pytest.approx(0.0)
+    assert result.reference_box == (20, 20, 120, 150)
+    assert result.candidate_box == (84, 30, 172, 148)
 
 
 def test_local_narrative_identity_uses_contrastive_face_prototypes(
@@ -3356,6 +4663,124 @@ def test_local_narrative_identity_rejects_face_closer_to_another_character(
     assert "identity_contrastive_margin_below_threshold" in result.issues
 
 
+def test_local_narrative_identity_tolerates_small_cartoon_contrastive_overlap(
+    monkeypatch,
+):
+    import torch
+    from PIL import Image
+
+    from open3d_implementation.core import local_visual_qa
+
+    image = Image.new("RGB", (256, 256), "white")
+    monkeypatch.setattr(local_visual_qa, "_load_rgb_image", lambda _path: image)
+    monkeypatch.setattr(
+        local_visual_qa,
+        "_primary_reference_face",
+        lambda source: (source, (10, 10, 110, 110)),
+    )
+    monkeypatch.setattr(
+        local_visual_qa,
+        "_face_candidate_boxes",
+        lambda _source: ((20, 20, 120, 120),),
+    )
+    monkeypatch.setattr(
+        local_visual_qa,
+        "_expanded_face_crop",
+        lambda source, _box: source,
+    )
+
+    class Processor:
+        def __call__(self, **_kwargs):
+            return {}
+
+    class Output:
+        last_hidden_state = torch.tensor(
+            [
+                [[1.0, 0.0]],
+                [[0.995, 0.103]],
+                [[0.70, 0.714]],
+            ]
+        )
+
+    class Model:
+        def __call__(self, **_kwargs):
+            return Output()
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "_load_local_identity_model",
+        lambda *_args: (Processor(), Model()),
+    )
+
+    result = local_visual_qa.evaluate_local_narrative_identity(
+        reference_paths=[Path("alice-front.png")],
+        negative_reference_paths=[Path("another-cartoon-girl.png")],
+        candidate_path=Path("scene.png"),
+        character_id="alice",
+    )
+
+    assert result.face_similarity >= result.face_threshold
+    assert result.similarity_margin is not None
+    assert result.margin_threshold == pytest.approx(-0.12)
+    assert result.similarity_margin >= result.margin_threshold
+    assert result.accepted is True
+    assert "identity_contrastive_margin_below_threshold" not in result.issues
+
+
+def test_resumed_narrative_image_is_revalidated_without_external_cost(
+    monkeypatch,
+    tmp_path,
+):
+    image_path = tmp_path / "scene_1_fal_attempt_1.png"
+    image_path.write_bytes(b"image" * 1000)
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_probe_image_quality",
+        lambda *_args, **_kwargs: {"quality_score": 96.0, "valid": True},
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_evaluate_image_semantics",
+        lambda *_args, **_kwargs: {
+            "semantic_score": 95.0,
+            "accepted": True,
+            "issues": [],
+        },
+    )
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_combine_image_quality",
+        lambda technical, semantic: {
+            "quality_score": technical["quality_score"],
+            "semantic_score": semantic["semantic_score"],
+            "semantic_accepted": semantic["accepted"],
+            "issues": [],
+        },
+    )
+
+    monitor, record, metric = langgraph_adapter._run_resumed_local_image_attempt(
+        scene={
+            "scene_id": 1,
+            "prompt": "Alice in the garden",
+            "duration": 6,
+        },
+        image_path=str(image_path),
+        directed_prompt="Alice in the garden",
+        image_style="comic_storybook",
+        quality_preset_key="high",
+        scene_seed=123,
+        visual_bible={},
+        attempt=1,
+    )
+
+    assert monitor["status"] == "RESUMED_LOCAL_QA"
+    assert monitor["estimated_cost_usd"] == 0.0
+    assert monitor["cost_estimate_status"] == "reused_local_asset"
+    assert record["generation_method"] == "fal_resumed_local_qa"
+    assert metric["resumed_local_asset"] is True
+    assert metric["semantic_accepted"] is True
+
+
 def test_local_visual_checklist_batches_all_criteria_in_one_inference(
     monkeypatch,
 ):
@@ -3392,6 +4817,52 @@ def test_local_visual_checklist_batches_all_criteria_in_one_inference(
     assert len(calls) == 1
     assert [answer.answer for answer in answers] == ["yes", "no", "uncertain"]
     assert "1. criterion 1?" in calls[0]["prompt"]
+
+
+def test_local_visual_checklist_confirms_critical_batch_failure(
+    monkeypatch,
+):
+    from open3d_implementation.core import local_visual_qa
+
+    monkeypatch.setattr(local_visual_qa, "_load_rgb_image", lambda path: object())
+    monkeypatch.setattr(
+        local_visual_qa,
+        "_load_local_vision_model",
+        lambda *args: (object(), object()),
+    )
+    responses = iter(["1: yes\n2: yes", "no"])
+    calls = []
+
+    def run_prompt(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(local_visual_qa, "_run_local_visual_prompt", run_prompt)
+    criteria = [
+        local_visual_qa.LocalVisualCriterion(
+            code="required_subject",
+            question="Is exactly one subject visible?",
+            expected="yes",
+            weight=1.0,
+            critical=True,
+        ),
+        local_visual_qa.LocalVisualCriterion(
+            code="forbidden_text",
+            question="Is readable text visible?",
+            expected="no",
+            weight=1.0,
+            critical=True,
+        ),
+    ]
+
+    answers = local_visual_qa.evaluate_local_visual_checklist(
+        image_path=Path("candidate.png"),
+        criteria=criteria,
+    )
+
+    assert len(calls) == 2
+    assert [answer.answer for answer in answers] == ["yes", "no"]
+    assert "Re-check this criterion independently" in calls[1]["prompt"]
 
 
 def test_cast_reference_delegates_style_consistency_to_embedding_gate(
@@ -3567,6 +5038,8 @@ def test_cast_reference_blocks_uncertain_identity_mark(monkeypatch, tmp_path):
 def test_local_semantic_qa_records_reference_backed_identity_score(
     monkeypatch, tmp_path
 ):
+    from PIL import Image
+
     from open3d_implementation.core import local_visual_qa
 
     def evaluate_checklist(**kwargs):
@@ -3595,13 +5068,13 @@ def test_local_semantic_qa_records_reference_backed_identity_score(
             face_threshold=0.68,
             margin_threshold=0.08,
             reference_boxes=((1, 2, 3, 4),),
-            candidate_box=(5, 6, 7, 8),
+            candidate_box=(20, 20, 150, 150),
             issues=(),
             model_name="local-test-model",
         ),
     )
     candidate_path = tmp_path / "scene.png"
-    candidate_path.write_bytes(b"candidate")
+    Image.new("RGB", (256, 256), "white").save(candidate_path)
     visual_bible = _build_visual_bible(
         "Alice walks through the garden. Alice looks curious.",
         DEFAULT_IMAGE_STYLE,
@@ -3624,10 +5097,252 @@ def test_local_semantic_qa_records_reference_backed_identity_score(
     assert result["character_identity"][0]["character_id"] == "alice"
     assert result["character_identity"][0]["score"] == 100.0
     assert result["character_identity"][0]["accepted"] is True
+    assert result["character_identity"][0]["human_review_required"] is False
     assert result["character_identity"][0]["dimensions"] == {
         "face": 100.0,
         "contrastive_margin": 100.0,
     }
+
+
+def test_verified_identity_reconciles_plain_character_presence(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    from open3d_implementation.core import local_visual_qa
+
+    def evaluate_checklist(**kwargs):
+        return [
+            local_visual_qa.LocalVisualAnswer(
+                criterion=criterion,
+                answer=("no" if criterion.code == "required_1" else criterion.expected),
+                raw_response=(
+                    "no character detected"
+                    if criterion.code == "required_1"
+                    else criterion.expected
+                ),
+            )
+            for criterion in kwargs["criteria"]
+        ]
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_visual_checklist",
+        evaluate_checklist,
+    )
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_narrative_identity",
+        lambda **kwargs: local_visual_qa.LocalNarrativeIdentityAssessment(
+            character_id=kwargs["character_id"],
+            score=93.0,
+            accepted=True,
+            face_similarity=0.89,
+            closest_negative_similarity=0.42,
+            similarity_margin=0.47,
+            face_threshold=0.68,
+            margin_threshold=0.08,
+            reference_boxes=((1, 2, 101, 102),),
+            candidate_box=(100, 100, 250, 250),
+            issues=(),
+            model_name="local-test-model",
+        ),
+    )
+    candidate_path = tmp_path / "scene.png"
+    Image.new("RGB", (512, 512), "white").save(candidate_path)
+    visual_bible = _build_visual_bible(
+        "Alice sees Edith. Edith follows Alice.",
+        DEFAULT_IMAGE_STYLE,
+    )
+    edith = next(
+        character
+        for character in visual_bible["cast_bible"]["characters"]
+        if character["id"] == "edith"
+    )
+    _approve_cast_reference_pack(edith, tmp_path)
+
+    result = _evaluate_semantic_qa_with_local_vlm(
+        image_path=candidate_path,
+        scene={
+            "description": "Edith peeks through a half-open door.",
+            "must_include": ["Edith"],
+            "cast_character_ids": ["edith"],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+        visual_bible=visual_bible,
+    )
+
+    criterion = next(
+        item for item in result["evidence"] if item["code"] == "required_1"
+    )
+    assert result["accepted"] is True
+    assert result["semantic_score"] == 100
+    assert result["critical_failures"] == []
+    assert result["issues"] == []
+    assert criterion["matched"] is True
+    assert criterion["raw_response"] == "identity_reference_comparison:edith"
+    assert criterion["provider"] == "local_reference_comparison"
+
+
+def test_small_scene_face_is_routed_to_blocking_human_identity_review(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    from open3d_implementation.core import local_visual_qa
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_visual_checklist",
+        lambda **kwargs: [
+            local_visual_qa.LocalVisualAnswer(
+                criterion=criterion,
+                answer=criterion.expected,
+                raw_response=f"{criterion.expected}.",
+            )
+            for criterion in kwargs["criteria"]
+        ],
+    )
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_narrative_identity",
+        lambda **_kwargs: local_visual_qa.LocalNarrativeIdentityAssessment(
+            character_id="alice",
+            score=41.0,
+            accepted=False,
+            face_similarity=0.34,
+            closest_negative_similarity=0.46,
+            similarity_margin=-0.12,
+            face_threshold=0.65,
+            margin_threshold=-0.12,
+            reference_boxes=((1, 2, 101, 102),),
+            candidate_box=(380, 480, 442, 542),
+            issues=("identity_face_similarity_below_threshold",),
+            model_name="local-test-model",
+        ),
+    )
+    candidate_path = tmp_path / "scene.png"
+    Image.new("RGB", (832, 1248), "white").save(candidate_path)
+    visual_bible = _build_visual_bible(
+        "Alice kneels beside a rabbit hole.",
+        DEFAULT_IMAGE_STYLE,
+    )
+    alice = visual_bible["cast_bible"]["characters"][0]
+    _approve_cast_reference_pack(alice, tmp_path)
+
+    result = _evaluate_semantic_qa_with_local_vlm(
+        image_path=candidate_path,
+        scene={
+            "description": "Alice kneels beside a rabbit hole.",
+            "must_include": ["one ten-year-old Alice", "large rabbit hole"],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+        visual_bible=visual_bible,
+    )
+
+    identity = result["character_identity"][0]
+    assert result["accepted"] is True
+    assert "identity_mismatch_alice" not in result["critical_failures"]
+    assert identity["accepted"] is True
+    assert identity["automatic_verification_passed"] is False
+    assert identity["human_review_required"] is True
+    assert identity["verification_status"] == "human_review_required"
+    resolution = identity["evidence"][0]["candidate_face_resolution"]
+    assert resolution["automatically_scorable"] is False
+    assert resolution["face_width"] == 62
+
+
+def test_borderline_identity_is_routed_to_human_review(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image
+
+    from open3d_implementation.core import local_visual_qa
+
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_visual_checklist",
+        lambda **kwargs: [
+            local_visual_qa.LocalVisualAnswer(
+                criterion=criterion,
+                answer=criterion.expected,
+                raw_response=f"{criterion.expected}.",
+            )
+            for criterion in kwargs["criteria"]
+        ],
+    )
+    monkeypatch.setattr(
+        local_visual_qa,
+        "evaluate_local_narrative_identity",
+        lambda **_kwargs: local_visual_qa.LocalNarrativeIdentityAssessment(
+            character_id="alice",
+            score=73.1,
+            accepted=False,
+            face_similarity=0.6012,
+            closest_negative_similarity=0.6408,
+            similarity_margin=-0.0395,
+            face_threshold=0.65,
+            margin_threshold=-0.12,
+            reference_boxes=((1, 2, 101, 102),),
+            candidate_box=(100, 100, 374, 374),
+            issues=("identity_face_similarity_below_threshold",),
+            model_name="local-test-model",
+        ),
+    )
+    candidate_path = tmp_path / "scene.png"
+    Image.new("RGB", (832, 1248), "white").save(candidate_path)
+    visual_bible = _build_visual_bible(
+        "Alice carries a basket. Alice looks through a window.",
+        DEFAULT_IMAGE_STYLE,
+    )
+    alice = visual_bible["cast_bible"]["characters"][0]
+    _approve_cast_reference_pack(alice, tmp_path)
+
+    result = _evaluate_semantic_qa_with_local_vlm(
+        image_path=candidate_path,
+        scene={
+            "description": "Alice carries a basket beside a window.",
+            "must_include": ["one ten-year-old Alice", "wicker basket"],
+        },
+        style_key=DEFAULT_IMAGE_STYLE,
+        model="local-test-model",
+        visual_bible=visual_bible,
+    )
+
+    identity = result["character_identity"][0]
+    assert result["accepted"] is True
+    assert identity["accepted"] is True
+    assert identity["automatic_verification_passed"] is False
+    assert identity["human_review_required"] is True
+    assert identity["verification_status"] == "human_review_required"
+    assert "identity_borderline_requires_human_review" in identity["issues"]
+    assert (
+        identity["evidence"][0]["candidate_face_resolution"]["automatically_scorable"]
+        is True
+    )
+
+
+def test_existing_final_fal_image_is_revalidated_before_paid_attempts(tmp_path):
+    final_path = tmp_path / "scene_1_image.png"
+    final_path.write_bytes(b"cached")
+    for attempt in (1, 2, 3):
+        (tmp_path / f"scene_1_fal_attempt_{attempt}.png").write_bytes(b"cached")
+
+    assert _narrative_attempt_order(
+        image_provider="fal",
+        image_path=str(final_path),
+        max_attempts=4,
+    ) == [4, 1, 2, 3, 5]
+    assert _narrative_attempt_order(
+        image_provider="fal",
+        image_path=str(tmp_path / "missing.png"),
+        max_attempts=4,
+    ) == [1, 2, 3, 4]
 
 
 def test_missing_custom_node_is_not_retried():
@@ -3684,13 +5399,13 @@ def test_response_text_falls_back_to_candidate_parts_when_property_raises():
         text = '{"accepted": false}'
 
     class Content:
-        parts = [Part()]
+        parts = (Part(),)
 
     class Candidate:
         content = Content()
 
     class Response:
-        candidates = [Candidate()]
+        candidates = (Candidate(),)
 
         @property
         def text(self):
@@ -4360,6 +6075,42 @@ def test_hero_object_sharpness_uses_focal_region_not_cinematic_background(tmp_pa
     assert "blurry_image" not in technical["issues"]
 
 
+def test_character_scene_sharpness_uses_primary_face_not_soft_background(
+    monkeypatch,
+    tmp_path,
+):
+    from PIL import Image, ImageDraw, ImageFilter
+
+    from open3d_implementation.core import local_visual_qa
+
+    source = tmp_path / "focused_character.png"
+    image = Image.new("RGB", (512, 512), "#bca98e").filter(
+        ImageFilter.GaussianBlur(radius=8)
+    )
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((130, 110, 382, 362), fill="#d5a176", outline="#171717", width=6)
+    for offset in range(150, 370, 16):
+        draw.line((offset, 120, offset, 352), fill="#171717", width=4)
+    image.save(source)
+    monkeypatch.setattr(
+        local_visual_qa,
+        "detect_local_face_boxes",
+        lambda _image: ((130, 110, 382, 362),),
+    )
+    scene = {
+        "description": "Alice and Edith peek through a door.",
+        "must_include": ["Alice", "Edith"],
+        "cast_character_ids": ["alice", "edith"],
+    }
+
+    technical = _probe_image_quality(str(source), scene=scene)
+
+    assert technical["sharpness_gate_scope"] == "primary_face_subject"
+    assert technical["focal_edge_sharpness"] >= 24
+    assert technical["sharpness_face_box"] == [130, 110, 382, 362]
+    assert "blurry_image" not in technical["issues"]
+
+
 def test_visual_retry_blocks_when_controlled_workflow_is_required_but_unavailable(
     monkeypatch,
 ):
@@ -4519,6 +6270,29 @@ def _gate_test_summary(tmp_path, semantic_score=96, review_status="pending_revie
     }
 
 
+def test_curation_hydration_repairs_legacy_audio_attempt_visual_evidence(tmp_path):
+    summary = _gate_test_summary(tmp_path)
+    review = summary["curation"]["scenes"]["1"]
+    review["attempts"].append(
+        {
+            "id": "attempt_2",
+            "status": "active",
+            "image_path": review["attempts"][0]["image_path"],
+            "audio_path": "output/curation/scene_1_attempt_2_audio.mp3",
+            "audio_provider": "elevenlabs",
+        }
+    )
+    review["attempts"][0]["status"] = "superseded"
+    review["active_attempt_id"] = "attempt_2"
+
+    curated = ui_server._apply_curation_summary(summary, tmp_path)
+    repaired = curated["curation"]["scenes"]["1"]["attempts"][1]
+
+    assert repaired["image_job"]["technical_accepted"] is True
+    assert repaired["image_job"]["semantic_accepted"] is True
+    assert repaired["audio_path"] == "output/curation/scene_1_attempt_2_audio.mp3"
+
+
 def test_automatic_gate_keeps_technical_100_separate_from_semantic_79(tmp_path):
     summary = _gate_test_summary(tmp_path, semantic_score=79)
     attempt = summary["curation"]["scenes"]["1"]["attempts"][0]
@@ -4529,6 +6303,262 @@ def test_automatic_gate_keeps_technical_100_separate_from_semantic_79(tmp_path):
     assert gate["gates"]["technical"] == {"score": 100.0, "passed": True}
     assert gate["gates"]["semantic"] == {"score": 79.0, "passed": False}
     assert gate["blockers"] == ["semantic"]
+
+
+def test_video_generation_gate_does_not_require_future_dialogue_segments(tmp_path):
+    summary = _gate_test_summary(tmp_path, review_status="approved")
+    scene = langgraph_adapter.enrich_scene_performance(summary["scenes"][0])
+    summary["scenes"] = [scene]
+    summary["audio_files"] = [
+        {
+            "scene_id": 1,
+            "audio_path": "scene_dialogue.mp3",
+            "dialogue_turns": [
+                {
+                    **turn,
+                    "voice_id": "alice-voice",
+                    "voice_role": "Alice",
+                }
+                for turn in scene["dialogue"]
+            ],
+        }
+    ]
+    summary["scene_videos"] = [
+        {
+            "scene_id": 1,
+            "video_path": "legacy_scene.mp4",
+            "provider": "fal_kling",
+            "dialogue_segments": [],
+        }
+    ]
+    summary["curation"]["video_generation"] = {"status": "stale_after_attempt_change"}
+
+    result = ui_server._apply_curation_summary(summary, tmp_path)
+
+    assert result["quality_metrics"]["dialogue_pre_video"]["passed"] is True
+    assert result["quality_metrics"]["dialogue"]["passed"] is False
+    assert result["curation"]["quality_gate_status"] == "passed"
+    assert result["curation"]["can_generate_video"] is True
+    assert result["video_current"] is False
+
+
+def test_current_dialogue_video_disables_duplicate_global_generation(
+    monkeypatch,
+    tmp_path,
+):
+    summary = _gate_test_summary(tmp_path, review_status="approved")
+    scene = langgraph_adapter.enrich_scene_performance(summary["scenes"][0])
+    summary["scenes"] = [scene]
+    rendered_turns = [
+        {
+            **turn,
+            "voice_id": "alice-voice",
+            "voice_role": "Alice",
+        }
+        for turn in scene["dialogue"]
+    ]
+    summary["audio_files"] = [
+        {
+            "scene_id": 1,
+            "audio_path": "scene_dialogue.mp3",
+            "dialogue_turns": rendered_turns,
+        }
+    ]
+    summary["scene_videos"] = [
+        {
+            "scene_id": 1,
+            "video_path": "current_scene.mp4",
+            "provider": "fal_kling",
+            "dialogue_segments": [
+                {"turn_id": turn["turn_id"]} for turn in rendered_turns
+            ],
+        }
+    ]
+    summary["curation"]["video_generation"] = {"status": "completed"}
+    current_video = tmp_path / "current_video.mp4"
+    current_video.write_bytes(b"current-dialogue-video")
+    monkeypatch.setattr(
+        ui_server,
+        "_validated_video_artifact",
+        lambda *_args: {
+            "path": str(current_video),
+            "exists": True,
+            "valid": True,
+            "size_bytes": current_video.stat().st_size,
+        },
+    )
+
+    result = ui_server._apply_curation_summary(summary, tmp_path)
+
+    assert result["video_current"] is True
+    assert result["curation"]["can_generate_video"] is False
+
+
+def test_automatic_gate_routes_unscorable_small_face_to_human_review(tmp_path):
+    summary = _gate_test_summary(tmp_path)
+    summary["scenes"][0]["cast_character_ids"] = ["alice"]
+    summary["visual_bible"]["cast_bible"]["characters"] = [
+        {
+            "id": "alice",
+            "reference": {"version": 3, "checksum": "alice-v3"},
+        }
+    ]
+    attempt = summary["curation"]["scenes"]["1"]["attempts"][0]
+    attempt["image_job"]["character_identity"] = [
+        {
+            "character_id": "alice",
+            "score": 41.0,
+            "accepted": True,
+            "human_review_required": True,
+        }
+    ]
+    attempt["image_job"]["cast_reference_versions"] = {
+        "alice": {"version": 3, "checksum": "alice-v3"}
+    }
+
+    gate = ui_server._attempt_automatic_gate(summary, "1", attempt)
+
+    assert gate["passed"] is True
+    assert gate["gates"]["identity"]["passed"] is True
+    assert gate["gates"]["identity"]["score"] == 41.0
+    assert gate["gates"]["identity"]["human_review_required"] is True
+    assert gate["gates"]["identity"]["human_review_required_character_ids"] == ["alice"]
+
+
+def test_automatic_gate_routes_unscorable_style_to_human_review(tmp_path):
+    summary = _gate_test_summary(tmp_path)
+    attempt = summary["curation"]["scenes"]["1"]["attempts"][0]
+    attempt["image_job"]["style_score"] = 0
+    attempt["image_job"]["style_accepted"] = False
+    attempt["image_job"]["style_human_review_required"] = True
+
+    gate = ui_server._attempt_automatic_gate(summary, "1", attempt)
+
+    assert gate["passed"] is True
+    assert gate["gates"]["style"] == {
+        "score": 0.0,
+        "passed": True,
+        "human_review_required": True,
+    }
+
+
+def test_automatic_gate_uses_domain_identity_acceptance_and_normalized_versions(
+    tmp_path,
+):
+    summary = _gate_test_summary(tmp_path)
+    summary["scenes"][0]["cast_character_ids"] = ["alice"]
+    summary["visual_bible"]["cast_bible"]["characters"] = [
+        {
+            "id": "alice",
+            "reference": {"version": 1, "checksum": "alice-v1"},
+        }
+    ]
+    attempt = summary["curation"]["scenes"]["1"]["attempts"][0]
+    attempt["image_job"]["character_identity"] = [
+        {
+            "character_id": "alice",
+            "score": 80.6,
+            "accepted": True,
+            "human_review_required": False,
+        }
+    ]
+    attempt["image_job"]["cast_reference_versions"] = {
+        "alice": {
+            "version": 1,
+            "checksum": "alice-v1",
+            "human_approved": True,
+            "human_reviewed_at": "2026-07-29T15:42:14+00:00",
+        }
+    }
+
+    gate = ui_server._attempt_automatic_gate(summary, "1", attempt)
+
+    assert gate["passed"] is True
+    assert gate["gates"]["identity"]["score"] == 80.6
+    assert gate["gates"]["identity"]["passed"] is True
+    assert gate["gates"]["reference_version"]["passed"] is True
+
+
+def test_fal_reference_generation_does_not_require_lora(tmp_path):
+    summary = _gate_test_summary(tmp_path)
+    image_path = Path(summary["scene_images"][0]["image_path"])
+    summary["scene_images"][0]["generation_method"] = "fal_resumed_local_qa"
+    summary["scenes"][0]["cast_character_ids"] = ["alice"]
+    summary["visual_bible"]["cast_bible"].update(
+        {
+            "status": "approved",
+            "required_for_scenes": ["alice"],
+            "characters": [
+                {
+                    "id": "alice",
+                    "name": "Alice",
+                    "reference": {
+                        "approved": True,
+                        "version": 1,
+                        "checksum": "alice-v1",
+                        "path": str(image_path),
+                        "required_views": ["front"],
+                        "views": {
+                            "front": {
+                                "approved": True,
+                                "checksum": "alice-front-v1",
+                                "path": str(image_path),
+                            }
+                        },
+                    },
+                    "lora": {"status": "not_configured"},
+                }
+            ],
+        }
+    )
+    summary["visual_bible"]["lora_gate"] = {
+        "status": "blocked",
+        "blockers": ["Alice LoRA missing"],
+    }
+    metric = summary["quality_metrics"]["images"][0]
+    metric.update(
+        {
+            "style_score": 0,
+            "style_accepted": False,
+            "style_human_review_required": True,
+            "character_identity": [
+                {
+                    "character_id": "alice",
+                    "score": 80.6,
+                    "accepted": True,
+                }
+            ],
+            "cast_reference_versions": {
+                "alice": {
+                    "version": 1,
+                    "checksum": "alice-v1",
+                    "human_approved": True,
+                }
+            },
+        }
+    )
+
+    blockers = ui_server._visual_quality_blockers(summary, tmp_path, ["1"])
+
+    assert all("LoRA" not in blocker for blocker in blockers)
+    assert all("gate de estilo" not in blocker for blocker in blockers)
+    assert all("gate de identidade" not in blocker for blocker in blockers)
+    assert all("versão antiga" not in blocker for blocker in blockers)
+
+
+def test_automatic_gate_surfaces_animal_presence_review(tmp_path):
+    summary = _gate_test_summary(tmp_path)
+    attempt = summary["curation"]["scenes"]["1"]["attempts"][0]
+    attempt["image_job"]["animal_human_review_required"] = True
+
+    gate = ui_server._attempt_automatic_gate(summary, "1", attempt)
+
+    assert gate["passed"] is True
+    assert gate["gates"]["semantic"] == {
+        "score": 96.0,
+        "passed": True,
+        "human_review_required": True,
+    }
 
 
 def test_human_curation_cannot_approve_automatic_gate_failure(tmp_path):
@@ -4585,18 +6615,223 @@ def test_final_compilation_requires_temporal_identity_approved(tmp_path):
         ui_server._recompile_final_video_from_attempts(run)
 
 
+def test_kling_lipsync_audio_reuses_supported_duration(monkeypatch, tmp_path):
+    source = tmp_path / "scene.mp3"
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_probe_media_quality",
+        lambda _path, _kind: {
+            "valid": True,
+            "duration_seconds": 8.4,
+            "issues": [],
+        },
+    )
+    monkeypatch.setattr(
+        langgraph_adapter.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("ffmpeg should not run"),
+    )
+
+    result = _prepare_fal_kling_lipsync_audio(
+        str(source),
+        str(tmp_path / "derived.mp3"),
+    )
+
+    assert result["valid"] is True
+    assert result["path"] == str(source)
+    assert result["adjusted"] is False
+    assert result["mode"] == "original"
+
+
+def test_kling_lipsync_audio_compresses_modest_overflow(monkeypatch, tmp_path):
+    source = tmp_path / "scene.mp3"
+    derived = tmp_path / "scene_lipsync.mp3"
+    probe_results = iter(
+        [
+            {"valid": True, "duration_seconds": 10.762, "issues": []},
+            {"valid": True, "duration_seconds": 9.8, "issues": []},
+        ]
+    )
+    commands = []
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_probe_media_quality",
+        lambda _path, _kind: next(probe_results),
+    )
+    monkeypatch.setattr(langgraph_adapter.shutil, "which", lambda _name: "/ffmpeg")
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(langgraph_adapter.subprocess, "run", fake_run)
+
+    result = _prepare_fal_kling_lipsync_audio(str(source), str(derived))
+
+    assert result["valid"] is True
+    assert result["path"] == str(derived)
+    assert result["duration_seconds"] == 9.8
+    assert result["adjusted"] is True
+    assert result["mode"] == "tempo_compressed"
+    assert result["tempo_factor"] == pytest.approx(10.762 / 9.8, abs=1e-6)
+    assert any("atempo=1.098163" in item for item in commands[0])
+
+
+def test_kling_lipsync_audio_rejects_excessive_tempo(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_probe_media_quality",
+        lambda _path, _kind: {
+            "valid": True,
+            "duration_seconds": 15.0,
+            "issues": [],
+        },
+    )
+    monkeypatch.setattr(langgraph_adapter.shutil, "which", lambda _name: "/ffmpeg")
+    monkeypatch.setattr(
+        langgraph_adapter.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("ffmpeg should not run"),
+    )
+
+    result = _prepare_fal_kling_lipsync_audio(
+        str(tmp_path / "scene.mp3"),
+        str(tmp_path / "derived.mp3"),
+    )
+
+    assert result["valid"] is False
+    assert "fal_lipsync_audio_requires_excessive_tempo" in result["issues"]
+
+
+def test_temporal_identity_uses_animation_specific_score_floor(monkeypatch):
+    monkeypatch.delenv("TEMPORAL_IDENTITY_MIN_SCORE", raising=False)
+    monkeypatch.delenv("TEMPORAL_IDENTITY_FRAME_FLOOR", raising=False)
+
+    assert ui_server._temporal_identity_min_score() == 75.0
+    assert ui_server._temporal_identity_frame_floor() == 70.0
+    assert ui_server._temporal_identity_frame_accepted(74.4, False) is True
+    assert ui_server._temporal_identity_frame_accepted(69.9, False) is False
+    assert ui_server._temporal_identity_frame_accepted(60.0, True) is True
+
+
+def test_final_video_normalizes_mixed_kling_streams(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def probe(path):
+        height = 1176 if path.name == "scene_1.mp4" else 1168
+        return {
+            "valid": True,
+            "width": 784,
+            "height": height,
+        }
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ui_server, "_probe_video_artifact", probe)
+    monkeypatch.setattr(ui_server.subprocess, "run", run)
+
+    ui_server._normalize_and_concat_video_clips(
+        [tmp_path / "scene_1.mp4", tmp_path / "scene_2.mp4"],
+        tmp_path / "final.mp4",
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    filter_complex = command[command.index("-filter_complex") + 1]
+    assert "scale=784:1176:force_original_aspect_ratio=decrease" in filter_complex
+    assert "pad=784:1176" in filter_complex
+    assert "fps=24,settb=AVTB,setpts=PTS-STARTPTS" in filter_complex
+    assert "concat=n=2:v=1:a=0[outv]" in filter_complex
+    assert command[command.index("-c:v") + 1] == "libx264"
+    assert captured["kwargs"]["timeout"] == 600
+
+
+def test_temporal_identity_tolerates_one_cross_assignment(monkeypatch):
+    monkeypatch.delenv("TEMPORAL_IDENTITY_MIN_SCORE", raising=False)
+    monkeypatch.delenv("TEMPORAL_IDENTITY_FRAME_FLOOR", raising=False)
+    result = ui_server._temporal_identity_character_gate(
+        [
+            {"score": 0.0, "accepted": False},
+            {"score": 80.6, "accepted": True},
+            {"score": 77.7, "accepted": True},
+        ]
+    )
+
+    assert result == {
+        "score": 79.2,
+        "accepted": True,
+        "passing_frames": 2,
+        "required_passing_frames": 2,
+    }
+
+
+def test_temporal_tracking_boxes_follow_scaled_anchor_region():
+    boxes = ui_server._temporal_tracking_boxes(
+        (400, 480, 464, 544),
+        (832, 1248),
+        (784, 1168),
+    )
+
+    assert len(boxes) == 25
+    assert all(0 <= left < right <= 784 for left, _top, right, _bottom in boxes)
+    assert all(0 <= top < bottom <= 1168 for _left, top, _right, bottom in boxes)
+    assert (377, 449, 437, 509) in boxes
+
+
+def test_video_worker_accepts_prevalidated_queued_gate():
+    curation = {
+        "can_generate_video": False,
+        "quality_gate_status": "passed",
+        "approved_count": 8,
+        "pending_count": 0,
+        "rejected_count": 0,
+        "retry_requested_count": 0,
+        "automatic_blocked_count": 0,
+        "total_scenes": 8,
+        "video_generation": {"status": "queued"},
+    }
+
+    assert ui_server._approved_video_worker_gate(curation) is True
+
+    curation["approved_count"] = 7
+    assert ui_server._approved_video_worker_gate(curation) is False
+
+
 def test_partial_video_failure_preserves_paid_clip_for_retry(monkeypatch, tmp_path):
     run_id = "partial-video-retry"
     image_one = tmp_path / "scene-1.png"
     image_two = tmp_path / "scene-2.png"
     image_one.write_bytes(b"image-one" * 300)
     image_two.write_bytes(b"image-two" * 300)
+    scenes = [
+        langgraph_adapter.enrich_scene_performance(
+            {"scene_id": 1, "description": "Alice entra no jardim."}
+        ),
+        langgraph_adapter.enrich_scene_performance(
+            {"scene_id": 2, "description": "Alice abre o livro."}
+        ),
+    ]
+    audio_files = [
+        {
+            "scene_id": scene["scene_id"],
+            "dialogue_turns": [
+                {
+                    **turn,
+                    "duration_seconds": 3.0,
+                    "voice_id": "alice-voice",
+                    "voice_role": "Alice",
+                }
+                for turn in scene["dialogue"]
+            ],
+        }
+        for scene in scenes
+    ]
     summary = {
-        "scenes": [
-            {"scene_id": 1, "description": "Alice enters the garden.", "duration": 5},
-            {"scene_id": 2, "description": "Alice opens the book.", "duration": 5},
-        ],
-        "audio_files": [],
+        "scenes": scenes,
+        "audio_files": audio_files,
         "visual_bible": {},
         "scene_videos": [],
         "curation": {
@@ -4678,14 +6913,15 @@ def test_partial_video_failure_preserves_paid_clip_for_retry(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(
         langgraph_adapter,
-        "_scene_audio_duration",
-        lambda *_args: 5.0,
-    )
-    monkeypatch.setattr(
-        langgraph_adapter,
         "_generate_real_video_clip",
         generate_clip,
     )
+
+    def concat_segments(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"scene-video" * 300)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(ui_server.subprocess, "run", concat_segments)
 
     try:
         ui_server._run_approved_video_generation(run_id)
@@ -4701,6 +6937,192 @@ def test_partial_video_failure_preserves_paid_clip_for_retry(monkeypatch, tmp_pa
     assert summary["curation"]["video_generation"]["status"] == "completed"
 
 
+def test_video_worker_replaces_legacy_scene_clip_with_dialogue_segment(
+    monkeypatch, tmp_path
+):
+    run_id = "local-video-revalidation"
+    image_path = tmp_path / "scene-1.png"
+    video_path = tmp_path / "scene-1.mp4"
+    image_path.write_bytes(b"image" * 300)
+    video_path.write_bytes(b"video" * 300)
+    scene = langgraph_adapter.enrich_scene_performance(
+        {"scene_id": 1, "description": "Alice espera perto da janela."}
+    )
+    rendered_turns = [
+        {
+            **turn,
+            "duration_seconds": 3.0,
+            "voice_id": "alice-voice",
+            "voice_role": "Alice",
+        }
+        for turn in scene["dialogue"]
+    ]
+    summary = {
+        "scenes": [scene],
+        "audio_files": [{"scene_id": 1, "dialogue_turns": rendered_turns}],
+        "visual_bible": {},
+        "scene_videos": [],
+        "curation": {
+            "can_generate_video": True,
+            "scenes": {
+                "1": {
+                    "status": "approved",
+                    "approved_attempt_id": "attempt_1",
+                    "attempts": [
+                        {
+                            "id": "attempt_1",
+                            "status": "approved",
+                            "image_path": str(image_path),
+                            "video_path": str(video_path),
+                            "video_provider": "fal_kling",
+                            "video_job": {"job_id": "paid-job"},
+                            "temporal_identity": {
+                                "accepted": False,
+                                "score": 40.0,
+                            },
+                        }
+                    ],
+                }
+            },
+        },
+    }
+    ui_server.RUNS[run_id] = {
+        "id": run_id,
+        "status": "completed",
+        "run_dir": str(tmp_path),
+        "summary": summary,
+    }
+    evaluated_paths: list[Path] = []
+
+    monkeypatch.setattr(
+        ui_server,
+        "_apply_curation_summary",
+        lambda current_summary, _run_dir: current_summary,
+    )
+    monkeypatch.setattr(ui_server, "_persist_summary", lambda _run: None)
+    monkeypatch.setattr(ui_server, "_append_log", lambda *_args: None)
+    monkeypatch.setattr(ui_server, "_planned_scene_ids", lambda _summary: ["1"])
+    monkeypatch.setattr(
+        ui_server,
+        "_probe_video_artifact",
+        lambda path: {"valid": Path(path).is_file()},
+    )
+
+    def evaluate_clip(**kwargs):
+        evaluated_paths.append(Path(kwargs["clip_path"]))
+        return {"accepted": True, "score": 91.0, "issues": []}
+
+    monkeypatch.setattr(ui_server, "_evaluate_temporal_identity", evaluate_clip)
+    monkeypatch.setattr(
+        ui_server,
+        "_recompile_final_video_from_attempts",
+        lambda _run: None,
+    )
+    monkeypatch.setattr(ui_server, "_reset_final_gate", lambda *_args: None)
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_video_generation_provider",
+        lambda: "fal_kling",
+    )
+
+    def generate_dialogue_segment(_source, clip_path, *_args, **_kwargs):
+        Path(clip_path).write_bytes(b"dialogue-video" * 300)
+        return {"quality_score": 96, "status": "completed"}, True
+
+    monkeypatch.setattr(
+        langgraph_adapter,
+        "_generate_real_video_clip",
+        generate_dialogue_segment,
+    )
+
+    def concat_segments(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"scene-video" * 300)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(ui_server.subprocess, "run", concat_segments)
+
+    try:
+        ui_server._run_approved_video_generation(run_id)
+    finally:
+        ui_server.RUNS.pop(run_id, None)
+
+    attempt = summary["curation"]["scenes"]["1"]["attempts"][0]
+    assert evaluated_paths == [Path(attempt["video_path"])]
+    assert Path(attempt["video_path"]) != video_path
+    assert len(attempt["dialogue_segments"]) == 1
+    assert attempt["temporal_identity"]["accepted"] is True
+    assert summary["curation"]["video_generation"]["status"] == "completed"
+
+
+def test_motion_prompt_treats_approved_still_as_authoritative_inventory():
+    prompt = langgraph_adapter._build_runway_motion_prompt(
+        {
+            "description": "A rabbit emerges from the empty burrow.",
+            "prompt": "Reveal a new white rabbit.",
+            "camera_motion": "slow push-in",
+        }
+    )
+
+    assert "Reveal a new white rabbit" not in prompt
+    assert "authoritative inventory" in prompt
+    assert "Animate only subjects and objects already visible" in prompt
+    assert "Do not add, reveal, spawn" in prompt
+    assert "Camera motion: slow push-in" in prompt
+
+
+def test_persisted_video_retry_preserves_rejected_attempt_history(tmp_path):
+    rejected_path = tmp_path / "scene_3_rejected.mp4"
+    accepted_path = tmp_path / "scene_3_retry_2.mp4"
+    summary = {
+        "scene_videos": [],
+        "curation": {
+            "scenes": {
+                "3": {
+                    "approved_attempt_id": "attempt_3",
+                    "attempts": [
+                        {
+                            "id": "attempt_3",
+                            "status": "approved",
+                            "video_path": str(rejected_path),
+                            "video_provider": "fal_kling",
+                            "video_quality_score": 90.9,
+                            "video_job": {"job_id": "rejected-job"},
+                            "temporal_identity": {
+                                "accepted": False,
+                                "score": 44.7,
+                            },
+                            "duration": 7,
+                        }
+                    ],
+                }
+            }
+        },
+    }
+
+    persisted = ui_server._persist_generated_video_items(
+        summary,
+        [
+            {
+                "scene_id": "3",
+                "attempt_id": "attempt_3",
+                "video_path": str(accepted_path),
+                "video_provider": "fal_kling",
+                "video_quality_score": 97.0,
+                "video_job": {"job_id": "accepted-job"},
+                "temporal_identity": {"accepted": True, "score": 92.0},
+                "duration": 7,
+            }
+        ],
+        require_current_approval=True,
+    )
+
+    attempt = summary["curation"]["scenes"]["3"]["attempts"][0]
+    assert persisted == 1
+    assert attempt["video_path"] == str(accepted_path)
+    assert attempt["video_attempts"][0]["video_path"] == str(rejected_path)
+    assert attempt["video_attempts"][0]["temporal_identity"]["accepted"] is False
+
+
 def test_ui_exposes_separate_workspaces_cast_bible_and_gate_matrix():
     html = ui_server.INDEX_HTML
 
@@ -4711,6 +7133,115 @@ def test_ui_exposes_separate_workspaces_cast_bible_and_gate_matrix():
     assert "reference_version: 'Referência'" in html
     assert "Gerar animação real" in html
     assert "gates visuais" in html
+    assert "dialogueMediaCurrent(summary)" in html
+    assert "vídeo legado ocultado" in html
+    assert "summary.video_valid ? `<video controls" not in html
+
+
+def test_legacy_narrated_video_is_preserved_but_not_exposed_as_current(
+    monkeypatch, tmp_path
+):
+    _mock_valid_video_probe(monkeypatch)
+    final_video = tmp_path / "output" / "final_video.mp4"
+    final_video.parent.mkdir()
+    final_video.write_bytes(b"legacy-narrated-video")
+    scene_image = tmp_path / "scene.png"
+    scene_image.write_bytes(b"image" * 300)
+    scene = langgraph_adapter.enrich_scene_performance(
+        {
+            "scene_id": 1,
+            "description": "Alice observa um formigueiro no jardim.",
+            "prompt": "Alice beside an anthill in the university garden.",
+            "must_include": ["Alice", "formigueiro"],
+        }
+    )
+    summary = {
+        "video_path": str(final_video),
+        "video_exists": True,
+        "scenes": [scene],
+        "scenes_count": 1,
+        "scene_images": [
+            {
+                "scene_id": 1,
+                "image_path": str(scene_image),
+                "generation_method": "fal_flux_schnell",
+            }
+        ],
+        "scene_videos": [
+            {
+                "scene_id": 1,
+                "video_path": "scene_1_legacy.mp4",
+                "provider": "fal_kling",
+            }
+        ],
+        "audio_files": [
+            {
+                "scene_id": 1,
+                "audio_path": "scene_1_narration.mp3",
+                "voice_role": "Narrador",
+            }
+        ],
+        "visual_bible": {
+            "cast_bible": {
+                "schema_version": CAST_BIBLE_SCHEMA_VERSION,
+                "revision": "cast-legacy-video",
+                "characters": [],
+                "required_for_scenes": [],
+            }
+        },
+        "quality_metrics": {
+            "images": [
+                {
+                    "scene_id": 1,
+                    "semantic_accepted": True,
+                    "semantic_score": 100,
+                    "technical_accepted": True,
+                    "technical_score": 100,
+                    "style_accepted": True,
+                    "style_score": 100,
+                }
+            ]
+        },
+        "curation": {
+            "scenes": {"1": {"status": "approved", "attempts": []}},
+            "final_review": {
+                "status": "final_approved",
+                "video_viewed": True,
+                "viewed_at": "2026-08-08T00:00:00Z",
+            },
+        },
+    }
+
+    result = ui_server._apply_curation_summary(summary, tmp_path)
+
+    assert result["video_technically_valid"] is True
+    assert result["video_dialogue_compliant"] is False
+    assert result["video_current"] is False
+    assert result["video_valid"] is False
+    assert result["legacy_video_artifact"]["reason"] == "dialogue_contract_blocked"
+    assert result["curation"]["final_review"]["video_viewed"] is False
+    assert "viewed_at" not in result["curation"]["final_review"]
+    assert result["curation"]["can_final_approve"] is False
+    assert result["production_status"]["published_current"] is False
+    assert any(
+        "vídeo legado ocultado" in blocker for blocker in result["curation"]["blockers"]
+    )
+    run_id = "legacy-narrated-video"
+    ui_server.RUNS[run_id] = {
+        "id": run_id,
+        "status": "completed",
+        "run_dir": str(tmp_path),
+        "summary": result,
+    }
+    try:
+        response = ui_server.app.test_client().post(
+            f"/api/runs/{run_id}/final-video-viewed"
+        )
+    finally:
+        ui_server.RUNS.pop(run_id, None)
+
+    assert response.status_code == 409
+    assert "not current and dialogue-compliant" in response.get_json()["error"]
 
 
 def test_failed_youtube_upload_is_retryable_after_final_gate(monkeypatch, tmp_path):
@@ -4977,6 +7508,18 @@ def test_corrupt_video_revokes_final_approval(monkeypatch, tmp_path):
             "issues": ["ffprobe_failed"],
         },
     )
+    scene = langgraph_adapter.enrich_scene_performance(
+        {
+            "scene_id": 1,
+            "description": "Alice observa um formigueiro no jardim.",
+            "prompt": "Alice beside an anthill in the university garden.",
+            "must_include": ["Alice", "formigueiro"],
+        }
+    )
+    rendered_turns = [
+        {**turn, "voice_id": "alice-voice", "voice_role": "Alice"}
+        for turn in scene["dialogue"]
+    ]
     summary = {
         "video_path": str(video),
         "video_exists": True,
@@ -4988,8 +7531,15 @@ def test_corrupt_video_revokes_final_approval(monkeypatch, tmp_path):
                 "required_for_scenes": [],
             }
         },
-        "scenes": [{"scene_id": 1}],
+        "scenes": [scene],
         "scenes_count": 1,
+        "audio_files": [
+            {
+                "scene_id": 1,
+                "audio_path": "scene.mp3",
+                "dialogue_turns": rendered_turns,
+            }
+        ],
         "scene_images": [
             {
                 "scene_id": 1,
@@ -5109,3 +7659,38 @@ def test_invalid_video_cannot_be_marked_as_viewed(monkeypatch, tmp_path):
 
     assert response.status_code == 409
     assert response.get_json()["issues"] == ["ffprobe_failed"]
+
+
+def test_ui_exposes_audio_players_for_human_dialogue_review():
+    assert '<audio controls preload="metadata"' in ui_server.INDEX_HTML
+    assert "Áudio cena" in ui_server.INDEX_HTML
+    assert "revisão de qualidade necessária" in ui_server.INDEX_HTML
+
+
+def test_legacy_final_video_is_archived_with_checksum_manifest(tmp_path):
+    source = tmp_path / "output" / "final_video.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"legacy-video")
+    summary = {
+        "video_path": "output/final_video.mp4",
+        "legacy_video_artifact": {
+            "path": str(source),
+            "reason": "dialogue_contract_blocked",
+            "technically_valid": True,
+        },
+    }
+
+    archived = ui_server._archive_legacy_final_video(summary, tmp_path)
+
+    assert archived is not None
+    assert archived["archived"] is True
+    assert archived["sha256"] == ui_server._file_sha256(tmp_path / archived["path"])
+    assert not source.exists()
+    manifest = json.loads(
+        (tmp_path / "output/archive/legacy/legacy_media_manifest.json").read_text()
+    )
+    assert manifest["assets"][0]["sha256"] == archived["sha256"]
+
+    summary.pop("legacy_video_artifact")
+    recovered = ui_server._archive_legacy_final_video(summary, tmp_path)
+    assert recovered == archived

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -21,6 +22,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,6 +30,7 @@ import requests
 from dagster._core.errors import DagsterError
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, redirect, request, send_file
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPEN3D_ROOT = Path(__file__).resolve().parent
@@ -52,6 +55,15 @@ RUN_ID_PATTERN = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{8}$")
 CAST_REFERENCE_RESUME_MANIFEST = "cast_reference_resume_manifest.json"
 CAST_REFERENCE_RESUME_SCHEMA_VERSION = "1.0"
 CAST_REFERENCE_RESUME_TRUST_FILE = ".validated_cast_reference_resume.json"
+CAST_REFERENCE_VIEW_IDS = (
+    "front",
+    "three_quarter",
+    "profile",
+    "full_body",
+    "expression_neutral",
+    "expression_warm",
+    "expression_concerned",
+)
 CAST_REFERENCE_RESUME_SOURCE_PATTERN = re.compile(
     r"^[a-z0-9][a-z0-9_-]{0,63}_character_reference_"
     r"(?:front|three_quarter|profile|full_body|expression_neutral|"
@@ -62,6 +74,13 @@ CAST_REFERENCE_RESUME_DESTINATION_PATTERN = re.compile(
     r"(?:front|three_quarter|profile|full_body|expression_neutral|"
     r"expression_warm|expression_concerned)\.png$"
 )
+NARRATIVE_IMAGE_RESUME_PATTERN = re.compile(
+    r"^scene_(?:[1-9]|1[0-9]|2[0-4])_" r"(?:(?:fal|gemini)_attempt_[1-9]|image)\.png$"
+)
+SCENE_RESUME_MANIFEST = "scene_resume_manifest.json"
+SCENE_RESUME_SCHEMA_VERSION = "1.0"
+MAX_CAST_REFERENCE_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_CAST_REFERENCE_UPLOAD_PIXELS = 24_000_000
 ALLOWED_CURATION_STATUSES = {
     "approved",
     "rejected",
@@ -111,6 +130,7 @@ INDEX_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI Film Pipeline</title>
+  <link rel="icon" href="data:,">
   <style>
     :root {
       color-scheme: dark;
@@ -191,12 +211,13 @@ INDEX_HTML = r"""<!doctype html>
     .assets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
     .asset { background: #0d0f12; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; min-height: 110px; }
     .asset img, .asset video { display: block; width: 100%; background: #050607; }
+    .asset audio { display: block; width: calc(100% - 20px); height: 38px; margin: 10px; }
     .asset a { display: block; color: var(--accent); padding: 10px; text-decoration: none; overflow-wrap: anywhere; }
     .asset-meta { padding: 0 10px 10px; color: var(--muted); font-size: 12px; }
     .asset-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 0 10px 10px; }
     .asset-actions button { height: 32px; padding: 0 8px; font-size: 12px; }
     .asset-note { width: calc(100% - 20px); min-height: 56px; margin: 0 10px 10px; font-size: 12px; }
-    .badge { display: inline-flex; align-items: center; height: 22px; border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; font-size: 11px; color: var(--muted); }
+    .badge { display: inline-flex; align-items: center; height: 22px; border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; font-size: 11px; color: var(--muted); white-space: nowrap; }
     .badge.approved { color: var(--ok); border-color: rgba(110, 211, 154, .35); }
     .badge.rejected { color: var(--bad); border-color: rgba(212, 103, 94, .35); }
     .badge.pending_review, .badge.retry_requested { color: var(--warn); border-color: rgba(224, 168, 92, .35); }
@@ -221,7 +242,11 @@ INDEX_HTML = r"""<!doctype html>
     .gate-cell.fail { border-color: rgba(212, 103, 94, .5); }
     .cast-character { padding: 14px; border-bottom: 1px solid var(--line); }
     .cast-character-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+    .cast-character-head > div:first-child { min-width: 0; flex: 1; }
+    .cast-character-status { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; flex: 0 0 auto; }
     .cast-views { display: grid; grid-template-columns: repeat(7, minmax(86px, 1fr)); gap: 6px; margin-top: 10px; }
+    .cast-anchor-upload { display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 10px; align-items: end; margin-top: 12px; }
+    .cast-anchor-upload label { margin: 0; }
     .cast-view { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #050607; }
     .cast-view.pass { border-color: rgba(110, 211, 154, .38); }
     .cast-view.fail { border-color: rgba(212, 103, 94, .5); }
@@ -245,6 +270,7 @@ INDEX_HTML = r"""<!doctype html>
     .attempt-card-title { font-weight: 700; }
     .attempt-media { display: grid; gap: 8px; padding: 10px; }
     .attempt-media img, .attempt-media video { width: 100%; border-radius: 6px; background: #090a0c; }
+    .attempt-media audio { width: 100%; height: 38px; display: block; }
     .attempt-card audio { width: 100%; }
     .attempt-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 0 10px 10px; color: var(--muted); font-size: 12px; }
     .attempt-facts div { overflow-wrap: anywhere; }
@@ -261,7 +287,8 @@ INDEX_HTML = r"""<!doctype html>
     th { color: var(--muted); font-weight: 600; }
     td { color: var(--text); overflow-wrap: anywhere; }
     .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
-    @media (max-width: 900px) { main { padding: 18px; } .grid, .status, .assets, .review-grid, .final-gate, .attempt-compare, .compare-tools, .gate-matrix, .cast-views { grid-template-columns: 1fr; } header { display: block; } }
+    @media (max-width: 900px) { main { padding: 18px; } .grid, .status, .assets, .review-grid, .final-gate, .attempt-compare, .compare-tools, .gate-matrix, .cast-views, .cast-anchor-upload { grid-template-columns: 1fr; } header { display: block; } }
+    @media (max-width: 640px) { .cast-character-head { flex-direction: column; } .cast-character-status { justify-content: flex-start; } }
   </style>
 </head>
 <body>
@@ -418,6 +445,10 @@ function mediaUrl(run, path) {
   return `/api/runs/${run.id}/file?path=${encodeURIComponent(path)}`;
 }
 
+function dialogueMediaCurrent(summary = {}) {
+  return summary.video_current === true && summary.quality_metrics?.dialogue?.passed === true;
+}
+
 function activeAttempt(review) {
   const attempts = review.attempts || [];
   return attempts.find(attempt => attempt.id === review.active_attempt_id) || attempts[attempts.length - 1] || {};
@@ -436,7 +467,10 @@ function attemptOptions(attempts, selected) {
 
 function attemptMedia(run, attempt) {
   const image = attempt.image_path ? `<img src="${mediaUrl(run, attempt.image_path)}" alt="${escapeHtml(attempt.id)} imagem">` : '<div class="asset-meta">sem imagem nesta tentativa</div>';
-  return image;
+  const audio = attempt.audio_path
+    ? `<audio controls preload="metadata" src="${mediaUrl(run, attempt.audio_path)}" aria-label="Áudio ${escapeHtml(attempt.id)}"></audio>`
+    : '';
+  return `${image}${audio}`;
 }
 
 const GATE_LABELS = {
@@ -454,7 +488,8 @@ function renderGateMatrix(automaticGate = {}) {
     const gate = gates[key] || {};
     const passed = gate.passed === true;
     const score = gate.score === null || gate.score === undefined ? (passed ? 'OK' : '-') : gate.score;
-    return `<div class="gate-cell ${passed ? 'pass' : 'fail'}"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(score)} · ${passed ? 'PASS' : 'BLOCK'}</span></div>`;
+    const verdict = gate.human_review_required === true ? 'REVIEW' : (passed ? 'PASS' : 'BLOCK');
+    return `<div class="gate-cell ${passed ? 'pass' : 'fail'}"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(score)} · ${verdict}</span></div>`;
   }).join('')}</div>`;
 }
 
@@ -552,8 +587,35 @@ function audioQualityDetail(item) {
   const direction = item.voice_direction?.tone ? ` · ${item.voice_direction.tone}` : '';
   const loudness = item.loudness?.input_i_lufs ? ` · ${item.loudness.input_i_lufs} LUFS alvo ${item.loudness.target_i_lufs}` : '';
   const ambient = item.ambient?.profile?.label ? ` · ambiente ${item.ambient.profile.label}` : '';
-  const voice = item.voice_role || item.voice_id ? ` · voz ${item.voice_role || 'narrator'}:${item.voice_id || '-'}` : '';
-  return `${item.duration_seconds || 0}s · ${item.bit_rate || 0}bps${loudness} · ${premium}${ambient}${voice}${direction}`;
+  const roleList = (item.voice_roles || []).join(', ');
+  const idList = (item.voice_ids || []).join(', ');
+  const voice = roleList || idList || item.voice_role || item.voice_id ? ` · vozes ${roleList || item.voice_role || 'personagens'}:${idList || item.voice_id || '-'}` : '';
+  const legacyNarrator = `${roleList} ${item.voice_role || ''}`.toLowerCase().includes('narrat') ? ' · legado bloqueado' : '';
+  const turns = Array.isArray(item.dialogue_turns) ? ` · ${item.dialogue_turns.length} falas` : '';
+  return `${item.duration_seconds || 0}s · ${item.bit_rate || 0}bps${loudness} · ${premium}${ambient}${voice}${legacyNarrator}${turns}${direction}`;
+}
+
+function renderDialoguePlan(summary) {
+  const scenes = summary.scenes || [];
+  const gate = summary.quality_metrics?.dialogue || summary.quality_metrics?.dialogue_contract || {};
+  if (!scenes.length) return '';
+  const sceneRows = scenes.map(scene => {
+    const turns = scene.dialogue || [];
+    const sceneGate = (gate.scenes || []).find(item => String(item.scene_id) === String(scene.scene_id)) || {};
+    const turnRows = turns.map(turn => {
+      const mode = turn.mode === 'internal_thought' ? 'pensamento' : 'fala';
+      const sync = turn.lip_sync_required ? 'lip sync' : 'boca fechada';
+      return `<div class="curation-sub"><strong>${escapeHtml(turn.speaker_name || turn.speaker_id || 'personagem')}</strong> · ${escapeHtml(mode)} · ${escapeHtml(sync)} · ${escapeHtml(turn.emotion || '-')}<br>“${escapeHtml(turn.text_pt_br || '')}”<br><span>${escapeHtml(turn.action || '')}</span></div>`;
+    }).join('');
+    const blockers = sceneGate.blockers || [];
+    return `<div class="cast-character">
+      <div class="cast-character-head"><strong>Cena ${escapeHtml(scene.scene_id)}</strong><span class="badge ${sceneGate.passed === false ? 'rejected' : 'approved'}">${sceneGate.passed === false ? 'BLOCK' : 'pt-BR'}</span></div>
+      <div class="curation-sub">${escapeHtml(scene.location || '-')} · ${escapeHtml(scene.main_action || '-')} · ${escapeHtml(scene.dominant_emotion || '-')}</div>
+      ${turnRows}
+      ${blockers.length ? `<div class="blockers">${blockers.map(escapeHtml).join(' · ')}</div>` : ''}
+    </div>`;
+  }).join('');
+  return `<div class="curation-head"><div><div class="curation-title">Roteiro falado</div><div class="curation-sub">Sem narrador · português brasileiro · uma boca ativa por fala</div></div><span class="badge ${gate.passed === false ? 'rejected' : 'approved'}">${gate.passed === false ? 'BLOCK' : 'PASS'}</span></div>${sceneRows}`;
 }
 
 function renderCastBible(summary, run) {
@@ -585,13 +647,27 @@ function renderCastBible(summary, run) {
             <button class="danger" onclick="setCastReferenceApproval('${escapeHtml(character.id)}', false)">Reprovar referência</button>
           </div>`
         : '';
+      const uploadCandidate = reference.upload_candidate || {};
+      const uploadCandidatePreview = uploadCandidate.path
+        ? `<div class="curation-sub warn">Último upload bloqueado · técnico ${escapeHtml(uploadCandidate.quality_score ?? '-')} · semântico ${escapeHtml(uploadCandidate.semantic_score ?? '-')} · ${escapeHtml((uploadCandidate.issues || []).join(', ') || 'gate reprovado')}</div>`
+        : '';
+      const anchorUpload = character.kind === 'human'
+        ? `<div class="cast-anchor-upload">
+            <label>Frente canônica
+              <input id="cast-front-upload-${escapeHtml(character.id)}" type="file" accept="image/png,image/jpeg,image/webp" aria-label="Frente canônica de ${escapeHtml(character.name || character.id)}">
+            </label>
+            <button onclick="uploadCastFront('${escapeHtml(character.id)}')">Substituir frente</button>
+          </div>
+          ${uploadCandidatePreview}`
+        : '';
       return `<div class="cast-character">
         <div class="cast-character-head">
           <div><strong>${escapeHtml(character.name || character.id)}</strong><div class="curation-sub">${escapeHtml(character.role || '-')} · ${escapeHtml(character.identity_prompt || '-')}</div></div>
-          <div><span class="badge ${reference.approved ? 'approved' : 'rejected'}">ref v${escapeHtml(reference.version || 1)} · ${escapeHtml(reference.status || 'pending')}</span> <span class="badge ${lora.status === 'configured' ? 'approved' : 'rejected'}">LoRA ${escapeHtml(lora.status || 'unconfigured')}</span></div>
+          <div class="cast-character-status"><span class="badge ${reference.approved ? 'approved' : 'rejected'}">ref v${escapeHtml(reference.version || 1)} · ${escapeHtml(reference.status || 'pending')}</span><span class="badge ${lora.status === 'configured' ? 'approved' : 'rejected'}">LoRA ${escapeHtml(lora.status || 'unconfigured')}</span></div>
         </div>
         <div class="curation-sub">checksum ${escapeHtml((reference.checksum || '-').slice(0, 16))} · ${escapeHtml(lora.name || lora.expected_name || '-')}</div>
         <div class="cast-views">${viewCards}</div>
+        ${anchorUpload}
         ${referenceActions}
       </div>`;
     }).join('');
@@ -615,19 +691,31 @@ function characterIdentityDetail(item) {
     const dimensions = Object.entries(identity.dimensions || {})
       .map(([key, score]) => `${labels[key] || key} ${score}`)
       .join(' · ');
-    return `${identity.character_name || identity.character_id}: ${identity.score ?? 0} ${identity.accepted ? 'aprovado' : 'reprovado'}${dimensions ? ` · ${dimensions}` : ''}`;
+    const verdict = identity.human_review_required === true
+      ? 'revisão humana obrigatória'
+      : (identity.accepted ? 'aprovado automático' : 'reprovado');
+    return `${identity.character_name || identity.character_id}: ${identity.score ?? 0} ${verdict}${dimensions ? ` · ${dimensions}` : ''}`;
   }).join(' | ');
 }
 
 function attemptAudioDetail(attempt) {
   const job = attempt.audio_job || {};
-  const premium = job.premium_audio === true ? 'áudio premium' : job.premium_audio === false ? 'áudio não-premium' : '';
+  const provider = attempt.audio_provider || job.provider || '';
+  const providerLabel = provider.includes('elevenlabs') ? 'ElevenLabs' : provider || 'áudio';
+  const premium = job.premium_audio === true
+    ? `${providerLabel} · gate premium aprovado`
+    : job.premium_audio === false
+      ? `${providerLabel} · revisão de qualidade necessária`
+      : providerLabel;
   const direction = attempt.voice_direction || job.voice_direction || {};
   const loudness = job.loudness?.input_i_lufs ? ` · ${job.loudness.input_i_lufs} LUFS alvo ${job.loudness.target_i_lufs}` : '';
   const ambient = job.ambient?.profile?.label ? ` · ambiente ${job.ambient.profile.label}` : '';
-  const voice = attempt.voice_role || job.voice_role || attempt.voice_id || job.voice_id ? ` · voz ${attempt.voice_role || job.voice_role || 'narrator'}:${attempt.voice_id || job.voice_id || '-'}` : '';
+  const roleList = (attempt.voice_roles || job.voice_roles || []).join(', ');
+  const idList = (attempt.voice_ids || job.voice_ids || []).join(', ');
+  const voice = roleList || idList || attempt.voice_role || job.voice_role || attempt.voice_id || job.voice_id ? ` · vozes ${roleList || attempt.voice_role || job.voice_role || 'personagens'}:${idList || attempt.voice_id || job.voice_id || '-'}` : '';
+  const legacyNarrator = `${roleList} ${attempt.voice_role || job.voice_role || ''}`.toLowerCase().includes('narrat') ? ' · legado bloqueado' : '';
   if (!premium && !direction.tone && !job.waveform?.length) return '';
-  return `<div style="grid-column:1 / -1">${escapeHtml(premium || 'áudio')}${escapeHtml(loudness)}${escapeHtml(ambient)}${escapeHtml(voice)}${direction.tone ? ` · ${escapeHtml(direction.tone)}` : ''}${waveformHtml(job.waveform)}</div>`;
+  return `<div style="grid-column:1 / -1">${escapeHtml(premium)}${escapeHtml(loudness)}${escapeHtml(ambient)}${escapeHtml(voice)}${escapeHtml(legacyNarrator)}${direction.tone ? ` · ${escapeHtml(direction.tone)}` : ''}${waveformHtml(job.waveform)}</div>`;
 }
 
 function gateTone(status) {
@@ -685,7 +773,8 @@ function renderCuration(run) {
         <span class="badge ${runBlockers.length ? 'rejected' : 'pending_review'}">${runBlockers.length ? 'BLOCK' : 'aguardando'}</span>
       </div>
       ${runBlockers.length ? `<div class="blockers">${runBlockers.map(item => escapeHtml(item.message || item.code || 'RunPod indisponível')).join(' · ')}</div>` : ''}
-      ${renderCastBible(summary, run)}`;
+      ${renderCastBible(summary, run)}
+      ${renderDialoguePlan(summary)}`;
     return;
   }
 
@@ -783,6 +872,7 @@ function renderCuration(run) {
     ${(production.blockers || []).length ? `<div class="blockers">${production.blockers.map(escapeHtml).join(' · ')}</div>` : ''}
     ${(production.warnings || []).length ? `<div class="blockers">${production.warnings.map(escapeHtml).join(' · ')}</div>` : ''}
     ${renderCastBible(summary, run)}
+    ${renderDialoguePlan(summary)}
     <div class="curation-scenes">${sceneCards}</div>
     <div class="final-gate">
       <div>
@@ -793,7 +883,7 @@ function renderCuration(run) {
         <div class="curation-sub">YouTube: ${escapeHtml(publication.status || 'not_started')}${publication.url ? ` · <a href="${escapeHtml(publication.url)}" target="_blank">${escapeHtml(publication.url)}</a>` : ''}${publication.error ? ` · ${escapeHtml(publication.error)}` : ''}</div>
         ${production.published_current === false && publication.status === 'published' ? `<div class="curation-sub warn">O vídeo publicado não corresponde ao corte final atual.</div>` : ''}
       </div>
-      ${summary.video_valid ? `<video controls onplay="markFinalVideoViewed()" src="/api/runs/${run.id}/file?path=${encodeURIComponent('output/final_video.mp4')}"></video>` : `<span class="badge rejected">${summary.video_exists ? 'vídeo inválido' : 'sem vídeo'}</span>`}
+      ${dialogueMediaCurrent(summary) ? `<video controls onplay="markFinalVideoViewed()" src="/api/runs/${run.id}/file?path=${encodeURIComponent('output/final_video.mp4')}"></video>` : `<span class="badge rejected">${summary.legacy_video_artifact ? 'vídeo legado ocultado' : summary.video_exists ? 'vídeo inválido' : 'sem vídeo'}</span>`}
       <div class="final-actions">
         <button onclick="authenticateYoutube().catch(err => logLine(err.message))">Autenticar YouTube</button>
         <button onclick="generateApprovedVideos()" ${curation.can_generate_video ? '' : 'disabled'}>Gerar animação real</button>
@@ -851,7 +941,7 @@ function renderRun(run) {
       <tbody>
         ${(q.audio || []).map(item => `<tr><td>áudio cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>${escapeHtml(audioQualityDetail(item))}${waveformHtml(item.waveform)}</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
         ${q.video ? `<tr><td>vídeo final</td><td>${q.video.quality_score || 0}</td><td>${q.video.duration_seconds || 0}s · ${q.video.bit_rate || 0}bps</td><td>${(q.video.issues || []).join(', ') || '-'}</td></tr>` : ''}
-        ${voices.map(item => `<tr><td>voz cena ${item.scene_id}</td><td>${item.quality_score || 0}</td><td>${escapeHtml(`${item.voice_id || '-'} · ${item.text_characters || 0} chars · ${item.premium_audio ? 'premium' : 'revisar'}${item.voice_direction?.tone ? ` · ${item.voice_direction.tone}` : ''}`)}</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
+        ${voices.map(item => `<tr><td>voz cena ${item.scene_id}${item.turn_id ? ` · ${escapeHtml(item.turn_id)}` : ''}</td><td>${item.quality_score || 0}</td><td>${escapeHtml(`${item.voice_role || item.speaker_id || (item.voice_roles || []).join(', ') || '-'} · ${item.voice_id || (item.voice_ids || []).join(', ') || '-'} · ${item.text_characters || 0} chars · ${item.premium_audio ? 'premium' : 'revisar'}${item.voice_direction?.tone ? ` · ${item.voice_direction.tone}` : ''}`)}</td><td>${(item.issues || []).join(', ') || '-'}</td></tr>`).join('')}
       </tbody>
     </table>
   `;
@@ -887,18 +977,41 @@ function renderRun(run) {
       assets.appendChild(div);
     }
   }
+  for (const audio of summary.audio_files || []) {
+    if (!audio.audio_path) continue;
+    const div = document.createElement('div');
+    div.className = 'asset';
+    const roles = (audio.voice_roles || []).join(', ') || 'personagens';
+    div.innerHTML = `
+      <audio controls preload="metadata" src="${mediaUrl(run, audio.audio_path)}" aria-label="Áudio cena ${escapeHtml(audio.scene_id)}"></audio>
+      <a href="${mediaUrl(run, audio.audio_path)}" target="_blank">Áudio cena ${escapeHtml(audio.scene_id)} · ${escapeHtml(roles)}</a>
+      <div class="asset-meta">${escapeHtml(audio.generation_method || 'áudio')} · ${escapeHtml(audio.language || '-')} · ${escapeHtml((audio.dialogue_turns || []).length)} fala(s)</div>`;
+    assets.appendChild(div);
+  }
+  const currentDialogueMedia = dialogueMediaCurrent(summary);
   for (const clip of summary.scene_videos || []) {
-    if (clip.video_path) {
+    if (clip.video_path && currentDialogueMedia) {
       const div = document.createElement('div');
       div.className = 'asset';
       div.innerHTML = `<video controls src="/api/runs/${run.id}/file?path=${encodeURIComponent(clip.video_path)}"></video><a href="/api/runs/${run.id}/file?path=${encodeURIComponent(clip.video_path)}" target="_blank">Clipe cena ${escapeHtml(clip.scene_id)} · ${escapeHtml(clip.provider || 'video')}</a><div class="asset-meta">score ${escapeHtml(clip.quality_score || 0)} · ${escapeHtml(clip.duration || 0)}s</div>`;
       assets.appendChild(div);
     }
   }
-  if (summary.video_valid) {
+  if ((summary.scene_videos || []).some(clip => clip.video_path) && !currentDialogueMedia) {
+    const div = document.createElement('div');
+    div.className = 'asset';
+    div.innerHTML = `<div class="asset-meta"><span class="badge rejected">mídia legada</span><br>Clipes anteriores preservados para auditoria, sem carregamento no player.</div>`;
+    assets.appendChild(div);
+  }
+  if (currentDialogueMedia) {
     const div = document.createElement('div');
     div.className = 'asset';
     div.innerHTML = `<video controls src="/api/runs/${run.id}/file?path=${encodeURIComponent('output/final_video.mp4')}"></video><a href="/api/runs/${run.id}/file?path=${encodeURIComponent('output/final_video.mp4')}" target="_blank">Vídeo final</a>`;
+    assets.appendChild(div);
+  } else if (summary.legacy_video_artifact) {
+    const div = document.createElement('div');
+    div.className = 'asset';
+    div.innerHTML = `<div class="asset-meta"><span class="badge rejected">vídeo legado ocultado</span><br>O MP4 anterior foi preservado para auditoria, mas não atende ao contrato atual de diálogo.</div>`;
     assets.appendChild(div);
   }
 }
@@ -933,6 +1046,32 @@ async function setCastReferenceApproval(characterId, approved) {
     logLine(`Cast Bible ${characterId}: ${approved ? 'aprovada' : 'reprovada'}`);
   } catch (err) {
     logLine(`aprovação da Cast Bible bloqueada: ${err.message}`);
+  }
+}
+
+async function uploadCastFront(characterId) {
+  if (!currentRun) return;
+  const input = document.getElementById(`cast-front-upload-${characterId}`);
+  const file = input?.files?.[0];
+  if (!file) {
+    logLine(`selecione uma frente canônica para ${characterId}`);
+    return;
+  }
+  const body = new FormData();
+  body.append('character_id', characterId);
+  body.append('reference', file);
+  try {
+    const response = await fetch(`/api/runs/${currentRun}/cast-front-reference`, {
+      method: 'POST',
+      body
+    });
+    const payload = await response.json();
+    if (payload.run) renderRun(payload.run);
+    if (!response.ok) throw new Error(payload.error || 'upload bloqueado');
+    renderRun(payload);
+    logLine(`frente canônica ${characterId}: aceita; vistas derivadas invalidadas`);
+  } catch (err) {
+    logLine(`frente canônica ${characterId}: ${err.message}`);
   }
 }
 
@@ -1535,11 +1674,17 @@ def _apply_production_status(
     curation = summary.setdefault("curation", {})
     final_review = curation.setdefault("final_review", {})
     current_artifact = _video_artifact_signature(run_dir, summary)
+    video_current = bool(
+        current_artifact.get("valid")
+        and summary.get("video_current", current_artifact.get("valid"))
+    )
+    current_artifact["dialogue_compliant"] = summary.get("video_dialogue_compliant")
+    current_artifact["release_ready"] = video_current
     published_artifact = publication.get("artifact") or {}
     publication_status = str(publication.get("status") or "not_started")
     published_current = (
         publication_status == "published"
-        and bool(current_artifact.get("valid"))
+        and video_current
         and current_artifact.get("sha256") == published_artifact.get("sha256")
     )
     cost_quota = _cost_quota_summary(summary)
@@ -1570,8 +1715,10 @@ def _apply_production_status(
         status = "ready_to_publish"
     elif publication_status == "published":
         status = "published_stale"
-    elif bool(current_artifact.get("valid")):
+    elif video_current:
         status = "needs_final_review"
+    elif bool(current_artifact.get("valid")):
+        status = "legacy_video"
     elif bool(current_artifact.get("exists")):
         status = "invalid_video"
     else:
@@ -1660,6 +1807,20 @@ def _current_cast_reference_versions(
     }
 
 
+def _cast_reference_versions_match(
+    generated: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    return all(
+        _safe_int_value((generated.get(character_id) or {}).get("version"), 0)
+        == _safe_int_value(reference.get("version"), 0)
+        and bool(reference.get("checksum"))
+        and str((generated.get(character_id) or {}).get("checksum") or "")
+        == str(reference.get("checksum") or "")
+        for character_id, reference in current.items()
+    )
+
+
 def _attempt_automatic_gate(
     summary: dict[str, Any], scene_id: str, attempt: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1677,15 +1838,19 @@ def _attempt_automatic_gate(
     ]
     identity_accepted = all(
         identities.get(character_id, {}).get("accepted") is True
-        and _safe_float_value(identities[character_id].get("score")) >= minimum
+        or identities.get(character_id, {}).get("human_review_required") is True
         for character_id in expected_cast_ids
     )
+    human_identity_review_ids = [
+        character_id
+        for character_id in expected_cast_ids
+        if identities.get(character_id, {}).get("human_review_required") is True
+    ]
     generated_versions = image_job.get("cast_reference_versions") or {}
     current_versions = _current_cast_reference_versions(summary, expected_cast_ids)
-    reference_versions_current = all(
-        generated_versions.get(character_id) == current_versions.get(character_id)
-        and bool(current_versions.get(character_id, {}).get("checksum"))
-        for character_id in expected_cast_ids
+    reference_versions_current = _cast_reference_versions_match(
+        generated_versions,
+        current_versions,
     )
     hero_objects = list(image_job.get("hero_objects", []))
     gates = {
@@ -1698,6 +1863,11 @@ def _attempt_automatic_gate(
             "score": _safe_float_value(image_job.get("semantic_score")),
             "passed": image_job.get("semantic_accepted") is True
             and _safe_float_value(image_job.get("semantic_score")) >= minimum,
+            **(
+                {"human_review_required": True}
+                if image_job.get("animal_human_review_required") is True
+                else {}
+            ),
         },
         "identity": {
             "score": (
@@ -1707,11 +1877,19 @@ def _attempt_automatic_gate(
             ),
             "passed": identity_accepted if expected_cast_ids else True,
             "required_character_ids": expected_cast_ids,
+            "human_review_required": bool(human_identity_review_ids),
+            "human_review_required_character_ids": human_identity_review_ids,
         },
         "style": {
             "score": _safe_float_value(image_job.get("style_score")),
-            "passed": image_job.get("style_accepted") is True
-            and _safe_float_value(image_job.get("style_score")) >= minimum,
+            "passed": (
+                image_job.get("style_accepted") is True
+                and _safe_float_value(image_job.get("style_score")) >= minimum
+            )
+            or image_job.get("style_human_review_required") is True,
+            "human_review_required": (
+                image_job.get("style_human_review_required") is True
+            ),
         },
         "objects": {
             "score": (
@@ -1761,6 +1939,11 @@ def _visual_quality_blockers(
     }
     missing_character_references: list[str] = []
     missing_character_loras: list[str] = []
+    image_providers = {
+        str(item.get("generation_method") or item.get("provider") or "").lower()
+        for item in images
+    }
+    lora_required = any("comfyui" in provider for provider in image_providers)
     for character_id in sorted(required_character_ids):
         character = characters.get(character_id, {})
         reference = character.get("reference", {})
@@ -1791,7 +1974,10 @@ def _visual_quality_blockers(
             missing_character_references.append(
                 str(character.get("name") or character_id)
             )
-        if (character.get("lora") or {}).get("status") != "configured":
+        if (
+            lora_required
+            and (character.get("lora") or {}).get("status") != "configured"
+        ):
             missing_character_loras.append(str(character.get("name") or character_id))
     if missing_character_references:
         blockers.append(
@@ -1804,7 +1990,7 @@ def _visual_quality_blockers(
             + ", ".join(missing_character_loras)
         )
     lora_gate = summary.get("visual_bible", {}).get("lora_gate") or {}
-    if lora_gate.get("status") == "blocked":
+    if lora_required and lora_gate.get("status") == "blocked":
         blockers.append(
             "Gate LoRA bloqueado: " + ", ".join(lora_gate.get("blockers", []))
         )
@@ -1842,8 +2028,11 @@ def _visual_quality_blockers(
         ):
             blockers.append(f"cena {scene_id} reprovada pelo gate técnico")
         if (
-            metric.get("style_accepted") is not True
-            or _safe_float_value(metric.get("style_score")) < minimum
+            not (
+                metric.get("style_accepted") is True
+                and _safe_float_value(metric.get("style_score")) >= minimum
+            )
+            and metric.get("style_human_review_required") is not True
         ):
             blockers.append(f"cena {scene_id} reprovada pelo gate de estilo")
         expected_cast_ids = _scene_expected_cast_ids(summary, scene_id)
@@ -1854,8 +2043,8 @@ def _visual_quality_blockers(
         }
         if any(
             identity_by_id.get(character_id, {}).get("accepted") is not True
-            or _safe_float_value(identity_by_id.get(character_id, {}).get("score"))
-            < minimum
+            and identity_by_id.get(character_id, {}).get("human_review_required")
+            is not True
             for character_id in expected_cast_ids
         ):
             blockers.append(f"cena {scene_id} reprovada pelo gate de identidade")
@@ -1866,7 +2055,10 @@ def _visual_quality_blockers(
             blockers.append(f"cena {scene_id} reprovada pelo gate de objetos")
         generated_versions = metric.get("cast_reference_versions") or {}
         current_versions = _current_cast_reference_versions(summary, expected_cast_ids)
-        if expected_cast_ids and generated_versions != current_versions:
+        if expected_cast_ids and not _cast_reference_versions_match(
+            generated_versions,
+            current_versions,
+        ):
             blockers.append(
                 f"cena {scene_id} usa versão antiga ou desconhecida do Cast Bible"
             )
@@ -1888,6 +2080,13 @@ def _apply_curation_summary(
     summary: dict[str, Any],
     run_dir: Path | None = None,
 ) -> dict[str, Any]:
+    from open3d_implementation.core.dialogue_contract import enrich_scene_performance
+
+    summary["scenes"] = [
+        enrich_scene_performance(scene)
+        for scene in summary.get("scenes", [])
+        if isinstance(scene, dict)
+    ]
     curation = summary.setdefault("curation", {})
     scenes = curation.setdefault("scenes", {})
     if not isinstance(scenes, dict):
@@ -1946,6 +2145,10 @@ def _apply_curation_summary(
                     "image_path": image.get("image_path"),
                     "video_path": video.get("video_path"),
                     "audio_path": audio.get("audio_path"),
+                    "audio_text": audio.get("text"),
+                    "dialogue_turns": audio.get("dialogue_turns", []),
+                    "voice_ids": audio.get("voice_ids", []),
+                    "voice_roles": audio.get("voice_roles", []),
                     "image_provider": image.get("generation_method")
                     or image.get("provider"),
                     "video_provider": video.get("provider"),
@@ -1955,6 +2158,7 @@ def _apply_curation_summary(
                     "image_semantic_accepted": image_metric.get("semantic_accepted"),
                     "image_job": dict(image_metric),
                     "audio_quality_score": audio_metric.get("quality_score", 0),
+                    "audio_job": dict(audio_metric),
                     "prompt": image.get("prompt") or image.get("base_prompt"),
                 }
             )
@@ -1967,6 +2171,18 @@ def _apply_curation_summary(
             ),
             {},
         )
+        if (
+            active_attempt
+            and active_attempt.get("image_path")
+            and not active_attempt.get("image_job")
+        ):
+            repaired_attempt = _inherited_audio_retry_attempt(
+                attempts,
+                active_attempt,
+            )
+            if repaired_attempt.get("image_job"):
+                active_attempt.clear()
+                active_attempt.update(repaired_attempt)
         if active_attempt:
             automatic_gate = _attempt_automatic_gate(
                 summary,
@@ -2031,7 +2247,52 @@ def _apply_curation_summary(
         if scenes.get(scene_id, {}).get("status") == "automatic_gate_blocked"
     )
     run_dir = run_dir or Path(".")
-    quality_blockers = _visual_quality_blockers(summary, run_dir, scene_ids)
+    visual_quality_blockers = _visual_quality_blockers(summary, run_dir, scene_ids)
+    from open3d_implementation.core.dialogue_contract import production_dialogue_gate
+
+    video_generation = curation.setdefault(
+        "video_generation",
+        {
+            "status": "not_started",
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+        },
+    )
+    dialogue_pre_video_gate = production_dialogue_gate(
+        summary.get("scenes", []),
+        audio_files,
+        [],
+    )
+    quality_metrics["dialogue_pre_video"] = dialogue_pre_video_gate
+    generation_dialogue_blockers = [
+        f"diálogo: {item}" for item in dialogue_pre_video_gate.get("blockers", [])
+    ]
+    quality_blockers = [
+        *visual_quality_blockers,
+        *generation_dialogue_blockers,
+    ]
+    current_scene_videos = (
+        scene_videos if video_generation.get("status") == "completed" else []
+    )
+    dialogue_gate = production_dialogue_gate(
+        summary.get("scenes", []),
+        audio_files,
+        current_scene_videos,
+    )
+    if video_generation.get("status") != "completed":
+        dialogue_gate = {
+            **dialogue_gate,
+            "passed": False,
+            "blockers": [
+                *dialogue_gate.get("blockers", []),
+                "video_generation_not_current",
+            ],
+        }
+    quality_metrics["dialogue"] = dialogue_gate
+    dialogue_blockers = [
+        f"diálogo: {item}" for item in dialogue_gate.get("blockers", [])
+    ]
     blockers = list(quality_blockers)
     if pending:
         blockers.append(f"{pending} cena(s) pendente(s)")
@@ -2048,7 +2309,26 @@ def _apply_curation_summary(
     final_review.setdefault("approved_at", None)
     final_review.setdefault("note", "")
     video_artifact = _validated_video_artifact(run_dir, summary)
-    video_ready = bool(video_artifact.get("valid"))
+    technical_video_valid = bool(video_artifact.get("valid"))
+    dialogue_video_compliant = dialogue_gate.get("passed") is True
+    video_ready = technical_video_valid and dialogue_video_compliant
+    summary["video_technically_valid"] = technical_video_valid
+    summary["video_dialogue_compliant"] = dialogue_video_compliant
+    summary["video_current"] = video_ready
+    summary["video_valid"] = video_ready
+    if not video_ready:
+        final_review["video_viewed"] = False
+        final_review.pop("viewed_at", None)
+    if technical_video_valid and not dialogue_video_compliant:
+        summary["legacy_video_artifact"] = {
+            "path": video_artifact.get("path"),
+            "size_bytes": video_artifact.get("size_bytes", 0),
+            "technically_valid": True,
+            "reason": "dialogue_contract_blocked",
+            "blockers": dialogue_gate.get("blockers", []),
+        }
+    elif not summary.get("legacy_video_artifact", {}).get("archived"):
+        summary.pop("legacy_video_artifact", None)
     scene_gate_passed = (
         bool(scene_ids) and approved == len(scene_ids) and not quality_blockers
     )
@@ -2056,17 +2336,11 @@ def _apply_curation_summary(
         scene_gate_passed and video_ready and bool(final_review.get("video_viewed"))
     )
 
-    video_generation = curation.setdefault(
-        "video_generation",
-        {
-            "status": "not_started",
-            "started_at": None,
-            "completed_at": None,
-            "error": None,
-        },
-    )
-
-    if not video_ready and scene_gate_passed:
+    if technical_video_valid and not dialogue_video_compliant:
+        blockers.append(
+            "vídeo legado ocultado: regenere o corte com vozes por personagem e segmentos por fala"
+        )
+    elif not video_ready and scene_gate_passed:
         if video_artifact.get("exists"):
             issues = ", ".join(video_artifact.get("issues", [])) or "mídia inválida"
             blockers.append(f"vídeo final inválido ou corrompido: {issues}")
@@ -2113,6 +2387,9 @@ def _apply_curation_summary(
 
     curation["status"] = status
     production_status = _apply_production_status(summary, run_dir, blockers)
+    # Artifact probing remains technical; the public compatibility flag is release-ready.
+    summary["video_valid"] = video_ready
+    summary["video_current"] = video_ready
     curation.update(
         {
             "status": status,
@@ -2126,14 +2403,42 @@ def _apply_curation_summary(
             "can_final_approve": can_final_approve,
             "can_generate_video": bool(
                 scene_gate_passed
+                and not video_ready
                 and video_generation.get("status") not in {"queued", "running"}
             ),
             "can_publish": production_status.get("status") == "ready_to_publish",
             "quality_gate_status": "blocked" if quality_blockers else "passed",
             "quality_blockers": quality_blockers,
+            "generation_dialogue_gate_status": (
+                "passed" if dialogue_pre_video_gate.get("passed") else "blocked"
+            ),
+            "generation_dialogue_blockers": generation_dialogue_blockers,
+            "dialogue_gate_status": (
+                "passed" if dialogue_gate.get("passed") else "blocked"
+            ),
+            "dialogue_blockers": dialogue_blockers,
         }
     )
     return summary
+
+
+def _approved_video_worker_gate(curation: Mapping[str, Any]) -> bool:
+    if curation.get("can_generate_video") is True:
+        return True
+    generation_status = str(
+        (curation.get("video_generation") or {}).get("status") or ""
+    )
+    total_scenes = _safe_int_value(curation.get("total_scenes"), 0)
+    return bool(
+        generation_status in {"queued", "running"}
+        and curation.get("quality_gate_status") == "passed"
+        and total_scenes > 0
+        and _safe_int_value(curation.get("approved_count"), 0) == total_scenes
+        and _safe_int_value(curation.get("pending_count"), 0) == 0
+        and _safe_int_value(curation.get("rejected_count"), 0) == 0
+        and _safe_int_value(curation.get("retry_requested_count"), 0) == 0
+        and _safe_int_value(curation.get("automatic_blocked_count"), 0) == 0
+    )
 
 
 def _persist_summary(run: dict[str, Any]) -> None:
@@ -2261,7 +2566,11 @@ def _invalidate_assets_for_cast_change(summary: dict[str, Any]) -> None:
     )
 
 
-def _refresh_cast_stage(summary: dict[str, Any]) -> str:
+def _refresh_cast_stage(
+    summary: dict[str, Any],
+    *,
+    base_dir: Path | None = None,
+) -> str:
     from open3d_implementation.core.langgraph_adapter import (
         _cast_reference_waiting_stage,
         _flux2_lora_gate,
@@ -2274,7 +2583,11 @@ def _refresh_cast_stage(summary: dict[str, Any]) -> str:
     visual_bible = summary.get("visual_bible") or {}
     scenes = list(summary.get("scenes") or [])
     required_characters = _required_production_cast(scenes, visual_bible)
-    cast_status = _refresh_cast_bible_status(visual_bible, required_characters)
+    cast_status = _refresh_cast_bible_status(
+        visual_bible,
+        required_characters,
+        base_dir=base_dir,
+    )
     if cast_status.get("status") == "blocked":
         stage = _cast_reference_waiting_stage(required_characters)
         lora_gate = {"status": "blocked", "blockers": ["cast_reference_pending"]}
@@ -2309,6 +2622,37 @@ def _refresh_cast_stage(summary: dict[str, Any]) -> str:
     )
     summary["quality_metrics"]["lora_gate"] = lora_gate
     return stage
+
+
+def _decode_cast_reference_upload(raw: bytes) -> Image.Image:
+    if len(raw) <= 1000:
+        raise ValueError("cast_reference_upload_too_small")
+    if len(raw) > MAX_CAST_REFERENCE_UPLOAD_BYTES:
+        raise ValueError("cast_reference_upload_too_large")
+    try:
+        with Image.open(BytesIO(raw)) as source:
+            if source.format not in {"JPEG", "PNG", "WEBP"}:
+                raise ValueError("cast_reference_upload_format_not_allowed")
+            if int(getattr(source, "n_frames", 1)) != 1:
+                raise ValueError("cast_reference_upload_must_be_single_frame")
+            width, height = source.size
+            if width * height > MAX_CAST_REFERENCE_UPLOAD_PIXELS:
+                raise ValueError("cast_reference_upload_pixel_limit")
+            source.load()
+            image = ImageOps.exif_transpose(source).convert("RGB")
+    except (
+        Image.DecompressionBombError,
+        UnidentifiedImageError,
+        OSError,
+    ) as exc:
+        raise ValueError("cast_reference_upload_invalid_image") from exc
+    width, height = image.size
+    if width < 512 or height < 512:
+        raise ValueError("cast_reference_upload_dimensions_too_small")
+    aspect_ratio = width / max(1, height)
+    if not 0.55 <= aspect_ratio <= 1.20:
+        raise ValueError("cast_reference_upload_requires_portrait")
+    return image
 
 
 def _run_path(run: dict[str, Any], media_path: str | None) -> Path | None:
@@ -2434,6 +2778,31 @@ def _persist_generated_video_items(
             if require_current_approval:
                 raise RuntimeError(f"approved_attempt_missing:{scene_id}")
             continue
+        previous_video_path = str(attempt.get("video_path") or "")
+        next_video_path = str(item.get("video_path") or "")
+        if previous_video_path and previous_video_path != next_video_path:
+            history = attempt.setdefault("video_attempts", [])
+            if not any(
+                str(record.get("video_path") or "") == previous_video_path
+                for record in history
+                if isinstance(record, dict)
+            ):
+                history.append(
+                    {
+                        "video_path": previous_video_path,
+                        "video_provider": attempt.get("video_provider"),
+                        "video_quality_score": attempt.get("video_quality_score"),
+                        "video_job": copy.deepcopy(attempt.get("video_job") or {}),
+                        "temporal_identity": copy.deepcopy(
+                            attempt.get("temporal_identity") or {}
+                        ),
+                        "dialogue_segments": copy.deepcopy(
+                            attempt.get("dialogue_segments") or []
+                        ),
+                        "duration": attempt.get("duration"),
+                        "superseded_at": _utc_now_iso(),
+                    }
+                )
         attempt.update(item)
         summary["scene_videos"] = _replace_scene_record(
             summary.get("scene_videos", []),
@@ -2444,6 +2813,9 @@ def _persist_generated_video_items(
                 "quality_score": item["video_quality_score"],
                 "duration": item["duration"],
                 "temporal_identity": item["temporal_identity"],
+                "dialogue_segments": copy.deepcopy(item.get("dialogue_segments") or []),
+                "language": item.get("language", "pt-BR"),
+                "narration_absent": item.get("narration_absent", True),
             },
         )
         persisted += 1
@@ -2512,6 +2884,14 @@ def _attempt_image_quality_patch(attempt: dict[str, Any]) -> dict[str, Any]:
         "semantic_accepted": attempt.get("image_semantic_accepted"),
         "style_score": image_job.get("style_score"),
         "style_accepted": image_job.get("style_accepted"),
+        "style_human_review_required": image_job.get(
+            "style_human_review_required",
+            False,
+        ),
+        "animal_human_review_required": image_job.get(
+            "animal_human_review_required",
+            False,
+        ),
         "identity_score": image_job.get("identity_score"),
         "identity_accepted": image_job.get("identity_accepted"),
         "character_identity": image_job.get("character_identity", []),
@@ -2560,6 +2940,10 @@ def _attempt_audio_quality_patch(attempt: dict[str, Any]) -> dict[str, Any]:
         or audio_job.get("voice_direction", {}),
         "voice_id": attempt.get("voice_id") or audio_job.get("voice_id"),
         "voice_role": attempt.get("voice_role") or audio_job.get("voice_role"),
+        "voice_ids": attempt.get("voice_ids") or audio_job.get("voice_ids", []),
+        "voice_roles": attempt.get("voice_roles") or audio_job.get("voice_roles", []),
+        "dialogue_turns": attempt.get("dialogue_turns")
+        or audio_job.get("dialogue_turns", []),
         "model_id": attempt.get("model_id") or audio_job.get("model"),
         "text_characters": audio_job.get("text_characters"),
         "issues": audio_job.get("issues", []),
@@ -2577,6 +2961,85 @@ def _reset_final_gate(summary: dict[str, Any], status: str) -> None:
         }
     )
     summary.setdefault("publication", {}).update({"status": status})
+
+
+def _archive_legacy_final_video(
+    summary: dict[str, Any],
+    run_dir: Path,
+) -> dict[str, Any] | None:
+    archive_dir = run_dir / "output" / "archive" / "legacy"
+    manifest_path = archive_dir / "legacy_media_manifest.json"
+    manifest = {"schema_version": "1.0", "assets": []}
+    if manifest_path.is_file():
+        parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            manifest = parsed
+
+    def recover_from_manifest() -> dict[str, Any] | None:
+        for asset in reversed(manifest.get("assets", [])):
+            if not isinstance(asset, dict) or asset.get("archived") is not True:
+                continue
+            archived_path = _run_path(
+                {"run_dir": str(run_dir)},
+                str(asset.get("path") or ""),
+            )
+            if archived_path and archived_path.is_file():
+                summary["legacy_video_artifact"] = dict(asset)
+                return summary["legacy_video_artifact"]
+        return None
+
+    legacy = summary.get("legacy_video_artifact")
+    if (
+        not isinstance(legacy, dict)
+        or legacy.get("reason") != "dialogue_contract_blocked"
+    ):
+        return recover_from_manifest()
+    if legacy.get("archived"):
+        archived_path = _run_path(
+            {"run_dir": str(run_dir)},
+            str(legacy.get("path") or ""),
+        )
+        return legacy if archived_path and archived_path.is_file() else None
+
+    source = _resolve_video_path(run_dir, summary)
+    if not source.is_file():
+        return recover_from_manifest()
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    digest = _file_sha256(source)
+    destination = archive_dir / f"narrated_final_video_{digest[:12]}.mp4"
+    if destination.exists() and _file_sha256(destination) != digest:
+        raise RuntimeError("legacy_video_archive_checksum_conflict")
+    if not destination.exists():
+        shutil.move(str(source), str(destination))
+
+    relative_destination = str(destination.relative_to(run_dir))
+    archived = {
+        **legacy,
+        "path": relative_destination,
+        "original_path": str(source.relative_to(run_dir)),
+        "sha256": digest,
+        "archived": True,
+        "archived_at": _utc_now_iso(),
+    }
+    assets = [
+        item
+        for item in manifest.get("assets", [])
+        if isinstance(item, dict) and item.get("sha256") != digest
+    ]
+    assets.append(archived)
+    manifest.update({"schema_version": "1.0", "assets": assets})
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    summary["legacy_video_artifact"] = archived
+    summary.pop("video_artifact", None)
+    summary["video_exists"] = False
+    summary["video_technically_valid"] = False
+    summary["video_current"] = False
+    summary["video_valid"] = False
+    return archived
 
 
 def _apply_attempt_to_summary(
@@ -2650,9 +3113,12 @@ def _apply_attempt_to_summary(
             {
                 "audio_path": selected.get("audio_path"),
                 "text": selected.get("audio_text"),
+                "dialogue_turns": selected.get("dialogue_turns", []),
                 "voice_direction": selected.get("voice_direction")
                 or audio_quality_patch.get("voice_direction"),
                 "voice_id": selected.get("voice_id"),
+                "voice_ids": selected.get("voice_ids", []),
+                "voice_roles": selected.get("voice_roles", []),
                 "generation_method": selected.get("audio_provider") or "curation",
             },
         )
@@ -2720,6 +3186,77 @@ def _ffmpeg_concat_file(filelist_path: Path, paths: list[Path]) -> None:
         "".join(f"file '{path.resolve()}'\n" for path in paths),
         encoding="utf-8",
     )
+
+
+def _normalize_and_concat_video_clips(
+    clip_paths: list[Path],
+    output_path: Path,
+) -> None:
+    if not clip_paths:
+        raise ValueError("video_clip_paths_required")
+
+    artifacts = [_probe_video_artifact(path) for path in clip_paths]
+    invalid_paths = [
+        str(path)
+        for path, artifact in zip(clip_paths, artifacts, strict=True)
+        if not artifact.get("valid")
+    ]
+    if invalid_paths:
+        raise RuntimeError(
+            "video_clip_normalization_source_invalid:" + ",".join(invalid_paths)
+        )
+
+    target_width = max(_safe_int_value(item.get("width"), 0) for item in artifacts)
+    target_height = max(_safe_int_value(item.get("height"), 0) for item in artifacts)
+    target_width += target_width % 2
+    target_height += target_height % 2
+    if target_width <= 0 or target_height <= 0:
+        raise RuntimeError("video_clip_normalization_dimensions_invalid")
+
+    command = ["ffmpeg", "-nostdin", "-y"]
+    for clip_path in clip_paths:
+        command.extend(["-i", str(clip_path)])
+
+    filters: list[str] = []
+    for index in range(len(clip_paths)):
+        filters.append(
+            f"[{index}:v]"
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            "setsar=1,fps=24,settb=AVTB,setpts=PTS-STARTPTS"
+            f"[v{index}]"
+        )
+    inputs = "".join(f"[v{index}]" for index in range(len(clip_paths)))
+    filters.append(f"{inputs}concat=n={len(clip_paths)}:v=1:a=0[outv]")
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[outv]",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg_video_normalization_failed:{result.stderr[:300]}")
 
 
 def _approved_stills_manifest(
@@ -2795,33 +3332,24 @@ def _recompile_final_video_from_attempts(run: dict[str, Any]) -> dict[str, Any]:
     if not scene_ids or len(clip_paths) != len(scene_ids):
         raise RuntimeError("approved_scene_clip_count_mismatch")
 
-    output_dir.mkdir(exist_ok=True)
-    video_list = output_dir / "curation_video_filelist.txt"
-    temp_video = output_dir / "curation_temp_video.mp4"
-    final_video = output_dir / "final_video.mp4"
-    _ffmpeg_concat_file(video_list, clip_paths)
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(video_list),
-            "-c:v",
-            "copy",
-            "-pix_fmt",
-            "yuv420p",
-            str(temp_video),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    from open3d_implementation.core.dialogue_contract import production_dialogue_gate
+
+    dialogue_gate = production_dialogue_gate(
+        summary.get("scenes", []),
+        summary.get("audio_files", []),
+        summary.get("scene_videos", []),
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg_video_concat_failed:{result.stderr[:300]}")
+    if not dialogue_gate.get("passed"):
+        raise RuntimeError(
+            "dialogue_video_gate_blocked:"
+            + ",".join(str(item) for item in dialogue_gate.get("blockers", []))
+        )
+
+    output_dir.mkdir(exist_ok=True)
+    temp_video = output_dir / "curation_temp_video.mp4"
+    pending_final_video = output_dir / "final_video.next.mp4"
+    final_video = output_dir / "final_video.mp4"
+    _normalize_and_concat_video_clips(clip_paths, temp_video)
 
     audio_paths = []
     for scene_id in scene_ids:
@@ -2899,7 +3427,7 @@ def _recompile_final_video_from_attempts(run: dict[str, Any]) -> dict[str, Any]:
                 "-c:a",
                 "aac",
                 "-shortest",
-                str(final_video),
+                str(pending_final_video),
             ],
             capture_output=True,
             text=True,
@@ -2908,10 +3436,15 @@ def _recompile_final_video_from_attempts(run: dict[str, Any]) -> dict[str, Any]:
         if mux_result.returncode != 0:
             raise RuntimeError(f"ffmpeg_mux_failed:{mux_result.stderr[:300]}")
     else:
-        temp_video.replace(final_video)
+        temp_video.replace(pending_final_video)
+
+    pending_artifact = _probe_video_artifact(pending_final_video)
+    if not pending_artifact["valid"]:
+        issues = ", ".join(pending_artifact.get("issues", [])) or "invalid_video"
+        raise RuntimeError(f"final_video_validation_failed:{issues}")
+    pending_final_video.replace(final_video)
 
     for temp_path in (
-        video_list,
         temp_video,
         output_dir / "curation_audio_filelist.txt",
         output_dir / "curation_combined_audio.m4a",
@@ -2936,9 +3469,6 @@ def _recompile_final_video_from_attempts(run: dict[str, Any]) -> dict[str, Any]:
     summary["video_size"] = video_artifact["size_bytes"]
     quality_metrics = summary.setdefault("quality_metrics", {})
     quality_metrics["video"] = video_metric
-    if not video_artifact["valid"]:
-        issues = ", ".join(video_artifact.get("issues", [])) or "invalid_video"
-        raise RuntimeError(f"final_video_validation_failed:{issues}")
     return video_metric
 
 
@@ -2985,6 +3515,95 @@ def _extract_temporal_validation_frames(
     return frames, artifact
 
 
+def _temporal_identity_min_score() -> float:
+    return max(
+        0.0,
+        min(100.0, _safe_float_value(os.getenv("TEMPORAL_IDENTITY_MIN_SCORE"), 75.0)),
+    )
+
+
+def _temporal_identity_frame_floor() -> float:
+    return max(
+        0.0,
+        min(
+            _temporal_identity_min_score(),
+            _safe_float_value(os.getenv("TEMPORAL_IDENTITY_FRAME_FLOOR"), 70.0),
+        ),
+    )
+
+
+def _temporal_identity_frame_accepted(
+    score: float,
+    model_accepted: bool,
+) -> bool:
+    return model_accepted or score >= _temporal_identity_frame_floor()
+
+
+def _temporal_identity_character_gate(
+    frame_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    required_passing_frames = max(
+        1,
+        math.ceil(len(frame_results) * 2 / 3),
+    )
+    strongest_frames = sorted(
+        frame_results,
+        key=lambda item: float(item["score"]),
+        reverse=True,
+    )[:required_passing_frames]
+    character_score = round(
+        sum(float(item["score"]) for item in strongest_frames) / len(strongest_frames),
+        1,
+    )
+    frame_floor = _temporal_identity_frame_floor()
+    passing_frames = sum(
+        1
+        for item in frame_results
+        if item["accepted"] and float(item["score"]) >= frame_floor
+    )
+    return {
+        "score": character_score,
+        "accepted": (
+            character_score >= _temporal_identity_min_score()
+            and passing_frames >= required_passing_frames
+        ),
+        "passing_frames": passing_frames,
+        "required_passing_frames": required_passing_frames,
+    }
+
+
+def _temporal_tracking_boxes(
+    anchor_box: tuple[int, int, int, int],
+    source_size: tuple[int, int],
+    frame_size: tuple[int, int],
+) -> list[tuple[int, int, int, int]]:
+    source_width, source_height = source_size
+    frame_width, frame_height = frame_size
+    if min(source_width, source_height, frame_width, frame_height) <= 0:
+        return []
+    scale_x = frame_width / source_width
+    scale_y = frame_height / source_height
+    left, top, right, bottom = anchor_box
+    scaled_width = max(24, round((right - left) * scale_x))
+    scaled_height = max(24, round((bottom - top) * scale_y))
+    center_x = ((left + right) / 2) * scale_x
+    center_y = ((top + bottom) / 2) * scale_y
+    boxes: list[tuple[int, int, int, int]] = []
+    for vertical_offset in (-1.5, -0.75, 0.0, 0.75, 1.5):
+        for horizontal_offset in (-1.5, -0.75, 0.0, 0.75, 1.5):
+            candidate_center_x = center_x + horizontal_offset * scaled_width
+            candidate_center_y = center_y + vertical_offset * scaled_height
+            candidate = (
+                max(0, round(candidate_center_x - scaled_width / 2)),
+                max(0, round(candidate_center_y - scaled_height / 2)),
+                min(frame_width, round(candidate_center_x + scaled_width / 2)),
+                min(frame_height, round(candidate_center_y + scaled_height / 2)),
+            )
+            if candidate[2] - candidate[0] >= 24 and candidate[3] - candidate[1] >= 24:
+                boxes.append(candidate)
+    return boxes
+
+
 def _evaluate_temporal_identity(
     *,
     clip_path: Path,
@@ -2994,6 +3613,7 @@ def _evaluate_temporal_identity(
 ) -> dict[str, Any]:
     from open3d_implementation.core.local_visual_qa import (
         LocalVisualQAError,
+        detect_local_face_boxes,
         evaluate_local_narrative_identity,
     )
 
@@ -3016,6 +3636,18 @@ def _evaluate_temporal_identity(
             .get("characters", [])
             if character.get("id")
         }
+        scene_review = summary.get("curation", {}).get("scenes", {}).get(scene_id, {})
+        approved_attempt = _find_attempt(
+            summary,
+            scene_id,
+            str(scene_review.get("approved_attempt_id") or ""),
+        )
+        approved_still = _run_path(
+            {"run_dir": str(output_dir.parents[2])},
+            approved_attempt.get("image_path"),
+        )
+        if not approved_still or not approved_still.is_file():
+            raise RuntimeError(f"temporal_approved_still_missing:{scene_id}")
 
         def reference_paths(character: dict[str, Any]) -> list[Path]:
             reference = character.get("reference") or {}
@@ -3035,9 +3667,83 @@ def _evaluate_temporal_identity(
                     paths.append(resolved)
             return paths[:3]
 
-        minimum = _quality_gate_min_score()
+        with Image.open(approved_still) as source_image:
+            source_size = source_image.size
+            detected_anchor_boxes = list(detect_local_face_boxes(source_image))
+
+        anchor_assessments: dict[str, Any] = {}
+        if len(expected_ids) > 1 and len(detected_anchor_boxes) >= len(expected_ids):
+            from itertools import permutations
+
+            candidate_boxes = detected_anchor_boxes[: max(4, len(expected_ids) * 2)]
+            assessment_matrix: dict[str, list[Any]] = {}
+            for character_id in expected_ids:
+                identity_references = reference_paths(characters.get(character_id, {}))
+                if not identity_references:
+                    raise RuntimeError(f"temporal_reference_missing:{character_id}")
+                negative_references = [
+                    path
+                    for other_id, other_character in characters.items()
+                    if other_id != character_id
+                    for path in reference_paths(other_character)
+                ][:12]
+                assessment_matrix[character_id] = [
+                    evaluate_local_narrative_identity(
+                        reference_paths=identity_references,
+                        candidate_path=approved_still,
+                        character_id=character_id,
+                        negative_reference_paths=negative_references,
+                        candidate_boxes_override=[candidate_box],
+                        restrict_candidate_boxes=True,
+                    )
+                    for candidate_box in candidate_boxes
+                ]
+            assignments = permutations(
+                range(len(candidate_boxes)),
+                len(expected_ids),
+            )
+            best_assignment = max(
+                assignments,
+                key=lambda assignment: (
+                    sum(
+                        assessment_matrix[character_id][box_index].accepted
+                        for character_id, box_index in zip(
+                            expected_ids,
+                            assignment,
+                            strict=True,
+                        )
+                    ),
+                    sum(
+                        assessment_matrix[character_id][box_index].score
+                        for character_id, box_index in zip(
+                            expected_ids,
+                            assignment,
+                            strict=True,
+                        )
+                    ),
+                    sum(
+                        assessment_matrix[character_id][box_index].face_similarity
+                        for character_id, box_index in zip(
+                            expected_ids,
+                            assignment,
+                            strict=True,
+                        )
+                    ),
+                ),
+            )
+            anchor_assessments = {
+                character_id: assessment_matrix[character_id][box_index]
+                for character_id, box_index in zip(
+                    expected_ids,
+                    best_assignment,
+                    strict=True,
+                )
+            }
+
+        minimum = _temporal_identity_min_score()
+        frame_floor = _temporal_identity_frame_floor()
         character_results: list[dict[str, Any]] = []
-        all_scores: list[float] = []
+        character_scores: list[float] = []
         for character_id in expected_ids:
             character = characters.get(character_id, {})
             identity_references = reference_paths(character)
@@ -3049,13 +3755,45 @@ def _evaluate_temporal_identity(
                 if other_id != character_id
                 for path in reference_paths(other_character)
             ][:12]
+            anchor_assessment = anchor_assessments.get(character_id)
+            if anchor_assessment is None:
+                anchor_assessment = evaluate_local_narrative_identity(
+                    reference_paths=identity_references,
+                    candidate_path=approved_still,
+                    character_id=character_id,
+                    negative_reference_paths=negative_references,
+                )
             frame_results: list[dict[str, Any]] = []
             for frame in frames:
-                assessment = evaluate_local_narrative_identity(
+                with Image.open(frame) as frame_image:
+                    tracking_boxes = _temporal_tracking_boxes(
+                        anchor_assessment.candidate_box,
+                        source_size,
+                        frame_image.size,
+                    )
+                canonical_assessment = evaluate_local_narrative_identity(
                     reference_paths=identity_references,
                     candidate_path=frame,
                     character_id=character_id,
                     negative_reference_paths=negative_references,
+                    candidate_boxes_override=tracking_boxes,
+                )
+                assessments = [("cast_bible", canonical_assessment)]
+                shot_assessment = evaluate_local_narrative_identity(
+                    reference_paths=[approved_still],
+                    candidate_path=frame,
+                    character_id=character_id,
+                    reference_boxes_override=[anchor_assessment.candidate_box],
+                    candidate_boxes_override=tracking_boxes,
+                )
+                assessments.append(("approved_still", shot_assessment))
+                assessment_source, assessment = max(
+                    assessments,
+                    key=lambda item: (
+                        item[1].accepted,
+                        item[1].score,
+                        item[1].face_similarity,
+                    ),
                 )
                 dimensions = {
                     "face": assessment.score,
@@ -3069,16 +3807,23 @@ def _evaluate_temporal_identity(
                         else 100.0
                     ),
                 }
+                frame_accepted = _temporal_identity_frame_accepted(
+                    float(assessment.score),
+                    bool(assessment.accepted),
+                )
                 frame_results.append(
                     {
                         "frame_path": str(frame),
                         "score": assessment.score,
-                        "accepted": assessment.accepted,
+                        "accepted": frame_accepted,
+                        "model_accepted": assessment.accepted,
                         "dimensions": dimensions,
                         "checks": [
                             {
                                 "code": "identity_face_embedding",
-                                "matched": assessment.accepted,
+                                "matched": frame_accepted,
+                                "model_matched": assessment.accepted,
+                                "reference_source": assessment_source,
                                 "face_similarity": assessment.face_similarity,
                                 "face_threshold": assessment.face_threshold,
                                 "closest_negative_similarity": (
@@ -3092,22 +3837,27 @@ def _evaluate_temporal_identity(
                         ],
                     }
                 )
-                all_scores.append(float(assessment.score))
-            character_score = round(
-                sum(item["score"] for item in frame_results) / len(frame_results),
-                1,
-            )
+            character_gate = _temporal_identity_character_gate(frame_results)
+            character_score = float(character_gate["score"])
+            character_scores.append(character_score)
             character_results.append(
                 {
                     "character_id": character_id,
                     "character_name": character.get("name") or character_id,
                     "score": character_score,
-                    "accepted": character_score >= minimum
-                    and all(item["accepted"] for item in frame_results),
+                    "accepted": character_gate["accepted"],
+                    "passing_frames": character_gate["passing_frames"],
+                    "required_passing_frames": character_gate[
+                        "required_passing_frames"
+                    ],
                     "frames": frame_results,
                 }
             )
-        overall = round(sum(all_scores) / len(all_scores), 1) if all_scores else 0.0
+        overall = (
+            round(sum(character_scores) / len(character_scores), 1)
+            if character_scores
+            else 0.0
+        )
         accepted = overall >= minimum and all(
             character["accepted"] for character in character_results
         )
@@ -3115,6 +3865,7 @@ def _evaluate_temporal_identity(
             "accepted": accepted,
             "score": overall,
             "minimum_score": minimum,
+            "frame_floor": frame_floor,
             "frames": [str(frame) for frame in frames],
             "characters": character_results,
             "video_artifact": artifact,
@@ -3139,8 +3890,11 @@ def _evaluate_temporal_identity(
 def _run_approved_video_generation(run_id: str) -> None:
     from open3d_implementation.core.langgraph_adapter import (
         _generate_real_video_clip,
-        _scene_audio_duration,
         _video_generation_provider,
+    )
+    from open3d_implementation.core.dialogue_contract import (
+        build_speaker_motion_prompt,
+        dialogue_turns,
     )
 
     generated: list[dict[str, Any]] = []
@@ -3154,7 +3908,7 @@ def _run_approved_video_generation(run_id: str) -> None:
             summary = _apply_curation_summary(
                 run.get("summary", {}), Path(run["run_dir"])
             )
-            if not summary.get("curation", {}).get("can_generate_video"):
+            if not _approved_video_worker_gate(summary.get("curation", {})):
                 raise RuntimeError("approved_stills_gate_blocked")
             summary["curation"]["video_generation"] = {
                 "status": "running",
@@ -3180,73 +3934,172 @@ def _run_approved_video_generation(run_id: str) -> None:
             if not image_path or not image_path.is_file():
                 raise RuntimeError(f"approved_still_missing:{scene_id}")
             scene = _summary_scene(snapshot_summary, scene_id)
-            duration = max(
-                3.0,
-                _scene_audio_duration(
-                    snapshot_summary.get("audio_files", []), scene_id
+            expected_turns = dialogue_turns(scene)
+            audio_record = next(
+                (
+                    item
+                    for item in snapshot_summary.get("audio_files", [])
+                    if str(item.get("scene_id")) == scene_id
                 ),
-                _safe_float_value(scene.get("duration"), 5.0),
+                {},
             )
+            rendered_turns = audio_record.get("dialogue_turns", [])
+            if len(rendered_turns) != len(expected_turns):
+                raise RuntimeError(f"dialogue_audio_turn_count_mismatch:{scene_id}")
+            if not rendered_turns:
+                raise RuntimeError(f"dialogue_audio_missing:{scene_id}")
+
             clip_path = (
                 curation_dir / f"scene_{scene_id}_{attempt_id}_{video_provider}.mp4"
             )
-            source = {
-                **scene,
-                "scene_id": scene_id,
-                "image_path": str(image_path),
-                "prompt": attempt.get("prompt") or scene.get("prompt") or "",
-                "base_prompt": attempt.get("prompt") or scene.get("prompt") or "",
-            }
-            existing_clip = _run_path(snapshot, attempt.get("video_path"))
-            existing_temporal = attempt.get("temporal_identity") or {}
-            reuse_existing = bool(
-                attempt.get("video_provider") == video_provider
-                and existing_clip
-                and _probe_video_artifact(existing_clip)["valid"]
-                and existing_temporal.get("accepted") is True
-            )
-            if reuse_existing:
-                clip_path = existing_clip
-                job = dict(attempt.get("video_job") or {})
-                temporal = dict(existing_temporal)
-            else:
-                audio_path = _run_path(snapshot, attempt.get("audio_path"))
-                if not audio_path:
-                    audio_path = _run_path(
-                        snapshot,
-                        next(
-                            (
-                                item.get("audio_path")
-                                for item in snapshot_summary.get("audio_files", [])
-                                if str(item.get("scene_id")) == scene_id
-                            ),
-                            "",
+            segment_paths: list[Path] = []
+            dialogue_segments: list[dict[str, Any]] = []
+            segment_jobs: list[dict[str, Any]] = []
+            for turn_index, turn in enumerate(rendered_turns, 1):
+                lip_sync_required = bool(turn.get("lip_sync_required"))
+                turn_duration = max(
+                    3.0,
+                    _safe_float_value(turn.get("duration_seconds")),
+                )
+                segment_path = curation_dir / (
+                    f"scene_{scene_id}_{attempt_id}_turn_{turn_index}_"
+                    f"{video_provider}.mp4"
+                )
+                recovered_artifact = _probe_video_artifact(segment_path)
+                if recovered_artifact.get("valid"):
+                    segment_job = {
+                        "provider": "fal",
+                        "service": "kling_dialogue_segment",
+                        "scene_id": scene_id,
+                        "turn_id": turn.get("turn_id") or f"turn_{turn_index}",
+                        "status": "COMPLETED",
+                        "output_path": str(segment_path),
+                        "quality_score": 100,
+                        "estimated_cost_usd": 0.0,
+                        "recovered_from_disk": True,
+                        "video_artifact": recovered_artifact,
+                    }
+                else:
+                    turn_audio_path = _run_path(snapshot, turn.get("audio_path"))
+                    if lip_sync_required and not turn_audio_path:
+                        raise RuntimeError(
+                            f"dialogue_turn_audio_missing:{scene_id}:{turn_index}"
+                        )
+                    source = {
+                        **scene,
+                        "scene_id": scene_id,
+                        "image_path": str(image_path),
+                        "dialogue_turn": turn,
+                        "prompt": build_speaker_motion_prompt(scene, turn),
+                        "base_prompt": build_speaker_motion_prompt(scene, turn),
+                    }
+                    segment_job, ok = _generate_real_video_clip(
+                        source,
+                        str(segment_path),
+                        turn_duration,
+                        audio_path=(
+                            str(turn_audio_path)
+                            if lip_sync_required and turn_audio_path
+                            else None
                         ),
+                        visual_bible=snapshot_summary.get("visual_bible"),
+                        enable_lipsync=lip_sync_required,
                     )
-                job, ok = _generate_real_video_clip(
-                    source,
+                    if not ok:
+                        raise RuntimeError(
+                            f"{video_provider}_dialogue_turn_failed:"
+                            f"{scene_id}:{turn_index}:{segment_job.get('error')}"
+                        )
+                segment_job.update(
+                    {
+                        "scene_id": scene_id,
+                        "turn_id": turn.get("turn_id") or f"turn_{turn_index}",
+                        "speaker_id": turn.get("speaker_id"),
+                        "lip_sync_required": lip_sync_required,
+                        "mouth_motion_policy": (
+                            "active_speaker_only"
+                            if lip_sync_required
+                            else "all_mouths_closed"
+                        ),
+                    }
+                )
+                jobs.append(segment_job)
+                segment_jobs.append(segment_job)
+                segment_paths.append(segment_path)
+                dialogue_segments.append(
+                    {
+                        "turn_id": turn.get("turn_id") or f"turn_{turn_index}",
+                        "speaker_id": turn.get("speaker_id"),
+                        "speaker_name": turn.get("speaker_name"),
+                        "mode": turn.get("mode"),
+                        "lip_sync_required": lip_sync_required,
+                        "lipsync_status": segment_job.get("lipsync_status"),
+                        "video_path": str(segment_path),
+                        "job_id": segment_job.get("job_id"),
+                        "duration": turn_duration,
+                    }
+                )
+
+            segment_filelist = curation_dir / (
+                f"scene_{scene_id}_{attempt_id}_dialogue_segments.txt"
+            )
+            _ffmpeg_concat_file(segment_filelist, segment_paths)
+            concat_result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(segment_filelist),
+                    "-c:v",
+                    "copy",
+                    "-an",
                     str(clip_path),
-                    duration,
-                    audio_path=str(audio_path) if audio_path else None,
-                    visual_bible=snapshot_summary.get("visual_bible"),
-                )
-                jobs.append(job)
-                if not ok:
-                    raise RuntimeError(
-                        f"{video_provider}_generation_failed:"
-                        f"{scene_id}:{job.get('error')}"
-                    )
-                temporal = _evaluate_temporal_identity(
-                    clip_path=clip_path,
-                    scene_id=scene_id,
-                    summary=snapshot_summary,
-                    output_dir=curation_dir / f"scene_{scene_id}_{attempt_id}_temporal",
-                )
-            if temporal.get("accepted") is not True:
-                issues = ",".join(temporal.get("issues", []))
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            segment_filelist.unlink(missing_ok=True)
+            if concat_result.returncode != 0:
                 raise RuntimeError(
-                    f"temporal_identity_gate_blocked:{scene_id}:{issues}"
+                    f"dialogue_scene_concat_failed:{scene_id}:"
+                    f"{concat_result.stderr[:300]}"
                 )
+            duration = sum(
+                _safe_float_value(item.get("duration")) for item in dialogue_segments
+            )
+            job = {
+                "provider": "fal",
+                "service": "kling_dialogue_scene",
+                "scene_id": scene_id,
+                "status": "COMPLETED",
+                "output_path": str(clip_path),
+                "quality_score": min(
+                    (
+                        _safe_float_value(item.get("quality_score"))
+                        for item in segment_jobs
+                    ),
+                    default=0.0,
+                ),
+                "estimated_cost_usd": round(
+                    sum(
+                        _safe_float_value(item.get("estimated_cost_usd"))
+                        for item in segment_jobs
+                    ),
+                    6,
+                ),
+                "dialogue_segments": dialogue_segments,
+            }
+            temporal = _evaluate_temporal_identity(
+                clip_path=clip_path,
+                scene_id=scene_id,
+                summary=snapshot_summary,
+                output_dir=curation_dir / f"{clip_path.stem}_temporal",
+            )
             generated.append(
                 {
                     "scene_id": scene_id,
@@ -3257,8 +4110,16 @@ def _run_approved_video_generation(run_id: str) -> None:
                     "video_job": job,
                     "temporal_identity": temporal,
                     "duration": duration,
+                    "dialogue_segments": dialogue_segments,
+                    "language": "pt-BR",
+                    "narration_absent": True,
                 }
             )
+            if temporal.get("accepted") is not True:
+                issues = ",".join(temporal.get("issues", []))
+                raise RuntimeError(
+                    f"temporal_identity_gate_blocked:{scene_id}:{issues}"
+                )
             _append_log(run_id, f"animação real validada para cena {scene_id}")
 
         with RUN_LOCK:
@@ -3785,11 +4646,33 @@ def _run_selective_visual_retry(
         )
 
 
-def _scene_narration_text(summary: dict[str, Any], scene_id: str) -> str:
-    from open3d_implementation.core.langgraph_adapter import _premium_audio_narration
+def _scene_dialogue_text(summary: dict[str, Any], scene_id: str) -> str:
+    from open3d_implementation.core.dialogue_contract import dialogue_turns
 
     scene = _summary_scene(summary, scene_id)
-    return _premium_audio_narration(scene)
+    return " ".join(
+        str(turn.get("text_pt_br") or "").strip()
+        for turn in dialogue_turns(scene)
+        if str(turn.get("text_pt_br") or "").strip()
+    )
+
+
+def _inherited_audio_retry_attempt(
+    attempts: list[dict[str, Any]],
+    previous_active: dict[str, Any],
+) -> dict[str, Any]:
+    visual_attempt = next(
+        (
+            attempt
+            for attempt in reversed(attempts)
+            if attempt.get("image_job") and attempt.get("image_path")
+        ),
+        previous_active,
+    )
+    return {
+        **copy.deepcopy(visual_attempt),
+        **copy.deepcopy(previous_active),
+    }
 
 
 def _run_selective_audio_retry(
@@ -3800,15 +4683,10 @@ def _run_selective_audio_retry(
     scope: str,
 ) -> None:
     from open3d_implementation.core.langgraph_adapter import (
-        _audio_quality_gate,
         _elevenlabs_remaining_characters,
-        _elevenlabs_voice_id_for_scene,
-        _elevenlabs_voice_settings,
-        _enhance_premium_audio,
-        _premium_audio_direction,
-        _probe_media_quality,
-        _response_error_detail,
+        _generate_scene_dialogue_audio,
     )
+    from open3d_implementation.core.dialogue_contract import enrich_scene_performance
 
     with RUN_LOCK:
         run = RUNS.get(run_id)
@@ -3843,70 +4721,47 @@ def _run_selective_audio_retry(
         api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("elevenlabs_api_key_missing")
-        scene = _summary_scene(summary, scene_id)
-        voice_id, voice_role = _elevenlabs_voice_id_for_scene(scene)
-        if not voice_id:
-            raise RuntimeError("elevenlabs_voice_id_missing")
+        scene = enrich_scene_performance(_summary_scene(summary, scene_id))
 
         run_dir = Path(run["run_dir"])
         curation_dir = run_dir / "output" / "curation"
         curation_dir.mkdir(parents=True, exist_ok=True)
         summary = run.get("summary", {})
-        narration_text = _scene_narration_text(summary, scene_id)
-        if not narration_text:
-            raise RuntimeError("scene_narration_text_missing")
-        voice_direction = _premium_audio_direction(scene)
+        dialogue_text = _scene_dialogue_text(summary, scene_id)
+        if not dialogue_text:
+            raise RuntimeError("scene_dialogue_text_missing")
         remaining = _elevenlabs_remaining_characters(api_key)
-        if remaining is not None and len(narration_text) > remaining:
+        if remaining is not None and len(dialogue_text) > remaining:
             raise RuntimeError(
-                f"elevenlabs_insufficient_characters:needed={len(narration_text)},remaining={remaining}"
+                f"elevenlabs_insufficient_characters:needed={len(dialogue_text)},remaining={remaining}"
             )
-
-        audio_path = curation_dir / f"scene_{scene_id}_{attempt_id}_audio.mp3"
-        raw_audio_path = curation_dir / f"scene_{scene_id}_{attempt_id}_audio_raw.mp3"
-        model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
-        response = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-            headers={
-                "Accept": "audio/mpeg",
-                "Content-Type": "application/json",
-                "xi-api-key": api_key,
-            },
-            json={
-                "text": narration_text,
-                "model_id": model_id,
-                "voice_settings": _elevenlabs_voice_settings(),
-            },
-            timeout=60,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"elevenlabs_http_{response.status_code}:{_response_error_detail(response)}"
-            )
-        raw_audio_path.write_bytes(response.content)
-        media_quality = _enhance_premium_audio(
-            str(raw_audio_path),
-            str(audio_path),
-            scene,
-        )
-        if not bool(media_quality.get("valid")):
-            raw_audio_path.replace(audio_path)
-            media_quality = _probe_media_quality(str(audio_path), "audio")
-        else:
-            raw_audio_path.unlink(missing_ok=True)
-        media_quality = _audio_quality_gate(
+        (
+            audio_record,
             media_quality,
-            narration_text,
-            "elevenlabs",
+            scene_voice_metrics,
+            estimated_cost,
+            _remaining,
+        ) = _generate_scene_dialogue_audio(
+            scene,
+            api_key,
+            remaining,
+            output_dir=curation_dir,
+            file_prefix=f"scene_{scene_id}_{attempt_id}",
         )
-        if not bool(media_quality.get("valid")):
-            raise RuntimeError(
-                "elevenlabs_invalid_audio:"
-                + ",".join(str(issue) for issue in media_quality.get("issues", []))
-            )
-
-        usd_per_1k_chars = float(os.getenv("ELEVENLABS_USD_PER_1K_CHARS", "0.30"))
-        estimated_cost = len(narration_text) / 1000 * usd_per_1k_chars
+        audio_path = Path(str(audio_record["audio_path"]))
+        dialogue_turn_records = audio_record.get("dialogue_turns", [])
+        model_id = str(
+            scene_voice_metrics[0].get("model_id") if scene_voice_metrics else ""
+        )
+        voice_roles = [
+            str(item.get("voice_role") or item.get("speaker_id") or "")
+            for item in dialogue_turn_records
+        ]
+        voice_ids = [str(item.get("voice_id") or "") for item in dialogue_turn_records]
+        voice_direction = {
+            "tone": scene.get("dominant_emotion"),
+            "delivery": "diálogo de personagens em português brasileiro",
+        }
         with RUN_LOCK:
             run = RUNS.get(run_id)
             if run is None:
@@ -3922,21 +4777,28 @@ def _run_selective_audio_retry(
             for attempt in attempts:
                 if attempt.get("id") == active_id:
                     attempt["status"] = "superseded"
+            inherited_attempt = _inherited_audio_retry_attempt(
+                attempts,
+                previous_active,
+            )
             attempts.append(
                 {
+                    **inherited_attempt,
                     "id": attempt_id,
                     "status": "active",
                     "created_at": _utc_now_iso(),
                     "image_path": previous_active.get("image_path"),
                     "video_path": previous_active.get("video_path"),
                     "audio_path": str(audio_path),
-                    "audio_text": narration_text,
+                    "audio_text": dialogue_text,
+                    "dialogue_turns": dialogue_turn_records,
                     "voice_direction": voice_direction,
                     "image_provider": previous_active.get("image_provider"),
                     "video_provider": previous_active.get("video_provider"),
                     "audio_provider": "elevenlabs",
-                    "voice_id": voice_id,
-                    "voice_role": voice_role,
+                    "voice_ids": voice_ids,
+                    "voice_roles": voice_roles,
+                    "voice_role": "multiple_characters",
                     "model_id": model_id,
                     "retry_scope": scope,
                     "reason": reason,
@@ -3957,11 +4819,12 @@ def _run_selective_audio_retry(
                     "audio_job": {
                         "provider": "elevenlabs",
                         "model": model_id,
-                        "voice_id": voice_id,
-                        "voice_role": voice_role,
+                        "voice_ids": voice_ids,
+                        "voice_roles": voice_roles,
+                        "dialogue_turns": dialogue_turn_records,
                         "status": "succeeded",
                         "estimated_cost_usd": round(estimated_cost, 6),
-                        "text_characters": len(narration_text),
+                        "text_characters": len(dialogue_text),
                         "voice_direction": voice_direction,
                         "premium_audio": media_quality.get("premium_audio", False),
                         "issues": media_quality.get("issues", []),
@@ -3986,11 +4849,14 @@ def _run_selective_audio_retry(
                 scene_id,
                 {
                     "audio_path": str(audio_path),
-                    "text": narration_text,
+                    "text": dialogue_text,
+                    "dialogue_turns": dialogue_turn_records,
                     "voice_direction": voice_direction,
-                    "voice_id": voice_id,
-                    "voice_role": voice_role,
-                    "generation_method": "elevenlabs",
+                    "voice_ids": voice_ids,
+                    "voice_roles": voice_roles,
+                    "generation_method": "elevenlabs_dialogue",
+                    "language": "pt-BR",
+                    "narration_absent": True,
                 },
             )
             quality_metrics = summary.setdefault("quality_metrics", {})
@@ -3998,7 +4864,7 @@ def _run_selective_audio_retry(
                 quality_metrics.get("audio", []),
                 scene_id,
                 {
-                    "generation_method": "elevenlabs",
+                    "generation_method": "elevenlabs_dialogue",
                     "voice_direction": voice_direction,
                     **media_quality,
                 },
@@ -4007,10 +4873,11 @@ def _run_selective_audio_retry(
                 quality_metrics.get("voices", []),
                 scene_id,
                 {
-                    "voice_id": voice_id,
-                    "voice_role": voice_role,
+                    "voice_ids": voice_ids,
+                    "voice_roles": voice_roles,
+                    "dialogue_turns": dialogue_turn_records,
                     "model_id": model_id,
-                    "text_characters": len(narration_text),
+                    "text_characters": len(dialogue_text),
                     "voice_direction": voice_direction,
                     "premium_audio": media_quality.get("premium_audio", False),
                     "quality_score": media_quality.get("quality_score", 0),
@@ -4028,9 +4895,9 @@ def _run_selective_audio_retry(
                 6,
             )
             _reset_final_gate(summary, "stale_after_audio_retry")
+            _archive_legacy_final_video(summary, run_dir)
             run["summary"] = summary
 
-        video_metric = _recompile_final_video_from_attempts(run)
         with RUN_LOCK:
             run = RUNS.get(run_id)
             if run is None:
@@ -4042,7 +4909,9 @@ def _run_selective_audio_retry(
             _persist_summary(run)
         _append_log(
             run_id,
-            f"retry ElevenLabs concluído: cena {scene_id}, tentativa {attempt_id}, áudio score {media_quality.get('quality_score')}, vídeo score {video_metric.get('quality_score')}",
+            f"retry ElevenLabs concluído: cena {scene_id}, tentativa {attempt_id}, "
+            f"áudio score {media_quality.get('quality_score')}; "
+            "corte final aguarda aprovação humana",
         )
     except (
         OSError,
@@ -4577,7 +5446,47 @@ def _cast_reference_resume_manifest_assets(
 def _validated_cast_reference_resume_assets(
     validated_retry_of: str,
     source_output: Path,
-) -> list[tuple[Path, str]]:
+) -> list[tuple[Path, str, bool]]:
+    source_summary: dict[str, Any] = {}
+    summary_path = source_output.parent / "pipeline_summary.json"
+    if summary_path.is_file():
+        try:
+            loaded_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_summary, dict):
+                source_summary = loaded_summary
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            source_summary = {}
+    cast_bible = source_summary.get("visual_bible", {}).get("cast_bible", {})
+    characters = (
+        cast_bible.get("characters", []) if isinstance(cast_bible, dict) else []
+    )
+    human_rejected_ids = {
+        str(character.get("id") or "")
+        for character in characters
+        if isinstance(character, dict)
+        and (
+            (character.get("reference") or {}).get("status") == "rejected_by_human"
+            or (
+                bool((character.get("reference") or {}).get("human_reviewed_at"))
+                and (character.get("reference") or {}).get("human_approved") is False
+            )
+        )
+    }
+    rejected_draft_ids = {
+        str(character.get("id") or "")
+        for character in characters
+        if isinstance(character, dict)
+        and (
+            str((character.get("reference") or {}).get("status") or "")
+            in {"rejected", "rejected_by_human", "blocked"}
+            or (
+                ((character.get("reference") or {}).get("views") or {})
+                .get("front", {})
+                .get("automatic_approved")
+                is False
+            )
+        )
+    }
     manifest_path = source_output.parent / CAST_REFERENCE_RESUME_MANIFEST
     manifest_assets = (
         _cast_reference_resume_manifest_assets(
@@ -4587,61 +5496,104 @@ def _validated_cast_reference_resume_assets(
         if manifest_path.is_file()
         else []
     )
-    approved_by_destination: dict[str, tuple[Path, str, str]] = {}
+    resume_by_destination: dict[str, tuple[Path, str, str, bool]] = {}
     if manifest_path.is_file():
         if not manifest_assets:
             return []
         for manifest_asset in manifest_assets:
-            approved_by_destination[manifest_asset[1]] = manifest_asset
+            if any(
+                manifest_asset[1].startswith(f"{character_id}_character_reference_")
+                for character_id in human_rejected_ids
+            ):
+                continue
+            resume_by_destination[manifest_asset[1]] = (*manifest_asset, True)
     else:
-        summary_path = source_output.parent / "pipeline_summary.json"
-        if summary_path.is_file():
-            try:
-                source_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-                source_summary = {}
-            cast_bible = (
-                source_summary.get("visual_bible", {}).get("cast_bible", {})
-                if isinstance(source_summary, dict)
-                else {}
-            )
-            characters = cast_bible.get("characters", [])
-            if isinstance(characters, list):
-                for character in characters[:64]:
-                    if not isinstance(character, dict):
+        if isinstance(characters, list):
+            for character in characters[:64]:
+                if not isinstance(character, dict):
+                    continue
+                character_id = str(character.get("id") or "")
+                if character_id in human_rejected_ids:
+                    continue
+                views = (character.get("reference") or {}).get("views", {})
+                if not isinstance(views, dict):
+                    continue
+                for view_id, view in list(views.items())[:16]:
+                    if not isinstance(view, dict):
                         continue
-                    character_id = str(character.get("id") or "")
-                    views = (character.get("reference") or {}).get("views", {})
-                    if not isinstance(views, dict):
-                        continue
-                    for view_id, view in list(views.items())[:16]:
-                        if not isinstance(view, dict):
-                            continue
-                        raw_path = str(view.get("path") or "")
-                        checksum = str(view.get("checksum") or "").lower()
-                        source_name = Path(raw_path).name
-                        destination_name = (
-                            f"{character_id}_character_reference_{view_id}.png"
+                    raw_path = str(view.get("path") or "")
+                    checksum = str(view.get("checksum") or "").lower()
+                    source_name = Path(raw_path).name
+                    destination_name = (
+                        f"{character_id}_character_reference_{view_id}.png"
+                    )
+                    if (
+                        view.get("automatic_approved") is True
+                        and CAST_REFERENCE_RESUME_SOURCE_PATTERN.fullmatch(source_name)
+                        and CAST_REFERENCE_RESUME_DESTINATION_PATTERN.fullmatch(
+                            destination_name
                         )
-                        if (
-                            view.get("automatic_approved") is True
-                            and CAST_REFERENCE_RESUME_SOURCE_PATTERN.fullmatch(
-                                source_name
-                            )
-                            and CAST_REFERENCE_RESUME_DESTINATION_PATTERN.fullmatch(
-                                destination_name
-                            )
-                            and re.fullmatch(r"[0-9a-f]{64}", checksum)
-                        ):
-                            approved_by_destination[destination_name] = (
-                                source_output / source_name,
+                        and re.fullmatch(r"[0-9a-f]{64}", checksum)
+                    ):
+                        resume_by_destination[destination_name] = (
+                            source_output / source_name,
+                            destination_name,
+                            checksum,
+                            True,
+                        )
+
+        trust_path = source_output / CAST_REFERENCE_RESUME_TRUST_FILE
+        if trust_path.is_file():
+            try:
+                trust_payload = json.loads(trust_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                trust_payload = {}
+            if (
+                isinstance(trust_payload, dict)
+                and trust_payload.get("schema_version")
+                == CAST_REFERENCE_RESUME_SCHEMA_VERSION
+                and isinstance(trust_payload.get("source_run_id"), str)
+                and RUN_ID_PATTERN.fullmatch(str(trust_payload.get("source_run_id")))
+            ):
+                trust_assets = trust_payload.get("assets", [])
+                if isinstance(trust_assets, list):
+                    for asset in trust_assets[:128]:
+                        if not isinstance(asset, dict):
+                            continue
+                        destination_name = str(asset.get("name") or "")
+                        checksum = str(asset.get("sha256") or "").lower()
+                        if CAST_REFERENCE_RESUME_DESTINATION_PATTERN.fullmatch(
+                            destination_name
+                        ) and re.fullmatch(r"[0-9a-f]{64}", checksum):
+                            resume_by_destination[destination_name] = (
+                                source_output / destination_name,
                                 destination_name,
                                 checksum,
+                                True,
                             )
 
-    validated_assets: list[tuple[Path, str]] = []
-    for source, destination_name, expected_checksum in sorted(
-        approved_by_destination.values(),
+    manifest_draft_allowlist = {
+        destination_name for _source, destination_name, _checksum in manifest_assets
+    }
+    for character_id in sorted(rejected_draft_ids):
+        for view_id in CAST_REFERENCE_VIEW_IDS:
+            draft_name = f"{character_id}_character_reference_{view_id}.png"
+            if not CAST_REFERENCE_RESUME_DESTINATION_PATTERN.fullmatch(draft_name):
+                continue
+            if manifest_path.is_file() and draft_name not in manifest_draft_allowlist:
+                continue
+            draft_source = source_output / draft_name
+            if draft_source.is_file():
+                resume_by_destination[draft_name] = (
+                    draft_source,
+                    draft_name,
+                    _file_sha256(draft_source),
+                    False,
+                )
+
+    validated_assets: list[tuple[Path, str, bool]] = []
+    for source, destination_name, expected_checksum, trusted in sorted(
+        resume_by_destination.values(),
         key=lambda asset: asset[1],
     ):
         resolved_source = source.resolve()
@@ -4654,7 +5606,7 @@ def _validated_cast_reference_resume_assets(
             continue
         if _file_sha256(resolved_source) != expected_checksum:
             continue
-        validated_assets.append((resolved_source, destination_name))
+        validated_assets.append((resolved_source, destination_name, trusted))
     return validated_assets
 
 
@@ -4671,19 +5623,21 @@ def _copy_cast_reference_resume_assets(
 
     copied: list[str] = []
     trusted_assets: list[dict[str, str]] = []
-    for resolved_source, destination_name in _validated_cast_reference_resume_assets(
-        validated_retry_of,
-        source_output,
-    ):
+    for (
+        resolved_source,
+        destination_name,
+        trusted,
+    ) in _validated_cast_reference_resume_assets(validated_retry_of, source_output):
         destination = output_dir / destination_name
         shutil.copy2(resolved_source, destination)
         copied.append(destination_name)
-        trusted_assets.append(
-            {
-                "name": destination_name,
-                "sha256": _file_sha256(destination),
-            }
-        )
+        if trusted:
+            trusted_assets.append(
+                {
+                    "name": destination_name,
+                    "sha256": _file_sha256(destination),
+                }
+            )
     if trusted_assets:
         trust_path = output_dir / CAST_REFERENCE_RESUME_TRUST_FILE
         trust_temp_path = trust_path.with_suffix(".json.tmp")
@@ -4703,6 +5657,137 @@ def _copy_cast_reference_resume_assets(
     return copied
 
 
+def _copy_narrative_image_resume_assets(
+    retry_of: str | None,
+    output_dir: Path,
+) -> list[str]:
+    validated_retry_of = _validated_retry_run_id(retry_of)
+    if validated_retry_of is None:
+        return []
+    source_output = (RUNS_ROOT / validated_retry_of / "output").resolve()
+    if not source_output.is_dir():
+        return []
+
+    copied: list[str] = []
+    for source in sorted(source_output.iterdir()):
+        if not NARRATIVE_IMAGE_RESUME_PATTERN.fullmatch(source.name):
+            continue
+        resolved_source = source.resolve()
+        if resolved_source.parent != source_output or not resolved_source.is_file():
+            continue
+        size = resolved_source.stat().st_size
+        if size <= 1000 or size > 40 * 1024 * 1024:
+            continue
+        try:
+            with Image.open(resolved_source) as image:
+                image.verify()
+                width, height = image.size
+                if (
+                    width < 512
+                    or height < 512
+                    or width * height > MAX_CAST_REFERENCE_UPLOAD_PIXELS
+                ):
+                    continue
+        except (OSError, ValueError, UnidentifiedImageError):
+            continue
+        destination = output_dir / source.name
+        shutil.copy2(resolved_source, destination)
+        copied.append(source.name)
+    return copied
+
+
+def _scene_resume_payload_from_lineage(
+    retry_of: str | None,
+    *,
+    story_text: str,
+    image_style: str,
+    max_scenes: int,
+) -> dict[str, Any] | None:
+    from open3d_implementation.core.langgraph_adapter import (
+        _validate_structured_scenes,
+    )
+
+    current_run_id = _validated_retry_run_id(retry_of)
+    if current_run_id is None:
+        return None
+    story_sha256 = hashlib.sha256(story_text.encode("utf-8")).hexdigest()
+    visited: list[str] = []
+    for _depth in range(24):
+        if current_run_id in visited:
+            raise ValueError("scene_resume_lineage_cycle")
+        visited.append(current_run_id)
+        run_dir = (RUNS_ROOT / current_run_id).resolve()
+        if run_dir.parent != RUNS_ROOT or not run_dir.is_dir():
+            raise ValueError("scene_resume_lineage_run_missing")
+        story_path = run_dir / "historia.txt"
+        summary_path = run_dir / "pipeline_summary.json"
+        if story_path.is_file() and summary_path.is_file():
+            try:
+                source_story = story_path.read_text(encoding="utf-8")
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("scene_resume_lineage_invalid_summary") from exc
+            source_story_sha256 = hashlib.sha256(
+                source_story.encode("utf-8")
+            ).hexdigest()
+            if (
+                source_story_sha256 == story_sha256
+                and summary.get("image_style") == image_style
+            ):
+                scenes = _validate_structured_scenes(
+                    summary.get("scenes"),
+                    max_scenes,
+                )
+                return {
+                    "schema_version": SCENE_RESUME_SCHEMA_VERSION,
+                    "source_run_id": str(retry_of),
+                    "canonical_run_id": current_run_id,
+                    "lineage": visited,
+                    "story_sha256": story_sha256,
+                    "image_style": image_style,
+                    "max_scenes": max_scenes,
+                    "scenes": scenes,
+                }
+        trust_path = run_dir / "output" / CAST_REFERENCE_RESUME_TRUST_FILE
+        if not trust_path.is_file():
+            return None
+        try:
+            trust_payload = json.loads(trust_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("scene_resume_lineage_invalid_trust") from exc
+        next_run_id = str(trust_payload.get("source_run_id") or "").strip()
+        if not RUN_ID_PATTERN.fullmatch(next_run_id):
+            raise ValueError("scene_resume_lineage_invalid_source")
+        current_run_id = next_run_id
+    raise ValueError("scene_resume_lineage_too_deep")
+
+
+def _copy_scene_resume_manifest(
+    retry_of: str | None,
+    run_dir: Path,
+    *,
+    story_text: str,
+    image_style: str,
+    max_scenes: int,
+) -> Path | None:
+    payload = _scene_resume_payload_from_lineage(
+        retry_of,
+        story_text=story_text,
+        image_style=image_style,
+        max_scenes=max_scenes,
+    )
+    if payload is None:
+        return None
+    destination = run_dir / SCENE_RESUME_MANIFEST
+    temporary = destination.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
+    return destination
+
+
 def _can_resume_cast_references_locally(
     retry_of: str | None,
     runpod_preflight: Mapping[str, Any],
@@ -4718,10 +5803,10 @@ def _can_resume_cast_references_locally(
     source_output = (RUNS_ROOT / validated_retry_of / "output").resolve()
     if not source_output.is_dir():
         return False
-    return bool(
-        _validated_cast_reference_resume_assets(
-            validated_retry_of,
-            source_output,
+    return any(
+        trusted
+        for _source, _destination, trusted in _validated_cast_reference_resume_assets(
+            validated_retry_of, source_output
         )
     )
 
@@ -4846,6 +5931,33 @@ def _run_pipeline(
             run_id,
             f"retomando {len(resumed_cast_assets)} referências da Cast Bible de {retry_of}",
         )
+    resumed_scene_assets = _copy_narrative_image_resume_assets(retry_of, output_dir)
+    if resumed_scene_assets:
+        _append_log(
+            run_id,
+            f"retomando {len(resumed_scene_assets)} imagens narrativas de {retry_of}",
+        )
+    max_scenes = max(
+        1,
+        min(
+            24,
+            _safe_int_value(os.getenv("AI_FILM_MAX_SCENES", "8"), 8),
+        ),
+    )
+    scene_resume_manifest_path = _copy_scene_resume_manifest(
+        retry_of,
+        run_dir,
+        story_text=story_text,
+        image_style=image_style,
+        max_scenes=max_scenes,
+    )
+    if resumed_scene_assets and scene_resume_manifest_path is None:
+        raise RuntimeError("scene_resume_manifest_unavailable_for_resumed_images")
+    if scene_resume_manifest_path is not None:
+        _append_log(
+            run_id,
+            "retomando contrato canônico de cenas com hash validado",
+        )
     if cast_resume_local_only:
         _append_log(
             run_id,
@@ -4877,18 +5989,15 @@ def _run_pipeline(
                         "story_input": story_text,
                         "story_file_path": str(story_file_path),
                         "input_type": "ui",
-                        "max_scenes": max(
-                            1,
-                            min(
-                                24,
-                                _safe_int_value(
-                                    os.getenv("AI_FILM_MAX_SCENES", "8"), 8
-                                ),
-                            ),
-                        ),
+                        "max_scenes": max_scenes,
                         "image_style": image_style,
                         "image_quality_preset": image_quality_preset,
                         "cast_resume_local_only": cast_resume_local_only,
+                        "scene_resume_manifest_path": (
+                            str(scene_resume_manifest_path)
+                            if scene_resume_manifest_path is not None
+                            else ""
+                        ),
                         "quality_threshold": 0.7,
                         "enable_structured_logging": True,
                         "log_level": "INFO",
@@ -5211,9 +6320,16 @@ def set_cast_reference_approval(run_id: str) -> Response:
         if character is None:
             return jsonify({"error": "cast character not found"}), 404
         try:
-            _set_cast_reference_human_approval(character, approved)
+            _set_cast_reference_human_approval(
+                character,
+                approved,
+                base_dir=Path(run["run_dir"]),
+            )
             _invalidate_assets_for_cast_change(summary)
-            stage = _refresh_cast_stage(summary)
+            stage = _refresh_cast_stage(
+                summary,
+                base_dir=Path(run["run_dir"]),
+            )
             registry_path = _persist_cast_bible_registry(
                 summary,
                 Path(run["run_dir"]),
@@ -5230,6 +6346,204 @@ def set_cast_reference_approval(run_id: str) -> Response:
         return jsonify(run)
 
 
+@app.post("/api/runs/<run_id>/cast-front-reference")
+def upload_cast_front_reference(run_id: str) -> Response:
+    from open3d_implementation.core.langgraph_adapter import (
+        _begin_cast_reference_revision,
+        _build_character_reference_scene,
+        _build_image_prompt,
+        _character_reference_accepted,
+        _combine_image_quality,
+        _evaluate_image_semantics,
+        _probe_image_quality,
+        _reconcile_cast_reference_semantic_false_negatives,
+        _update_cast_reference,
+    )
+
+    if (
+        request.content_length is not None
+        and request.content_length > MAX_CAST_REFERENCE_UPLOAD_BYTES + 1024 * 1024
+    ):
+        return jsonify({"error": "cast_reference_upload_too_large"}), 413
+    character_id = str(request.form.get("character_id") or "").strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", character_id):
+        return jsonify({"error": "invalid_character_id"}), 400
+    uploaded = request.files.get("reference")
+    if uploaded is None:
+        return jsonify({"error": "reference file is required"}), 400
+    raw = uploaded.stream.read(MAX_CAST_REFERENCE_UPLOAD_BYTES + 1)
+    try:
+        image = _decode_cast_reference_upload(raw)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with RUN_LOCK:
+        current_run = RUNS.get(run_id)
+        if current_run is None:
+            return jsonify({"error": "run not found"}), 404
+        if current_run.get("status") == "running":
+            return jsonify({"error": "run is still running"}), 409
+        summary = copy.deepcopy(current_run.get("summary") or {})
+        if not summary:
+            return jsonify({"error": "run summary is not ready"}), 409
+        run_updated_at = str(current_run.get("updated_at") or "")
+        run_dir = Path(current_run["run_dir"]).resolve()
+
+    cast_bible = summary.get("visual_bible", {}).get("cast_bible") or {}
+    character = next(
+        (
+            item
+            for item in cast_bible.get("characters", [])
+            if str(item.get("id")) == character_id
+        ),
+        None,
+    )
+    if character is None:
+        return jsonify({"error": "cast character not found"}), 404
+    if str(character.get("kind") or "").lower() != "human":
+        return jsonify({"error": "manual front upload supports human cast only"}), 409
+
+    output_dir = (run_dir / "output").resolve()
+    if output_dir.parent != run_dir:
+        return jsonify({"error": "invalid run output directory"}), 409
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_path = output_dir / (
+        f"{character_id}_character_reference_front_upload_candidate.png"
+    )
+    try:
+        image.save(candidate_path, format="PNG", optimize=True)
+    except OSError as exc:
+        return jsonify({"error": f"cast_reference_upload_save_failed:{exc}"}), 409
+
+    visual_bible = summary["visual_bible"]
+    reference_scene = _build_character_reference_scene(
+        visual_bible,
+        character_id,
+        "front",
+    )
+    style_key = str(
+        summary.get("image_style") or visual_bible.get("style_key") or "comic_storybook"
+    )
+    reference_prompt = _build_image_prompt(
+        reference_scene,
+        style_key,
+        visual_bible,
+    )
+    technical_metrics = _probe_image_quality(
+        str(candidate_path),
+        scene=reference_scene,
+    )
+    semantic_metrics = _evaluate_image_semantics(
+        str(candidate_path),
+        reference_scene,
+        reference_prompt,
+        style_key,
+        visual_bible,
+    )
+    image_metric = {
+        "scene_id": reference_scene["scene_id"],
+        "path": str(candidate_path),
+        "generation_method": "human_uploaded_cast_anchor",
+        "attempt": 0,
+        "style": style_key,
+        **_combine_image_quality(technical_metrics, semantic_metrics),
+    }
+    _reconcile_cast_reference_semantic_false_negatives(
+        image_metric=image_metric,
+        candidate_path=str(candidate_path),
+        view_id="front",
+        identity_accepted=True,
+        composition_similarity=0.0,
+    )
+    accepted = _character_reference_accepted(image_metric)
+    upload_audit = {
+        "character_id": character_id,
+        "view_id": "front",
+        "accepted": accepted,
+        "quality_score": image_metric.get("quality_score"),
+        "semantic_score": image_metric.get("semantic_score"),
+        "issues": list(image_metric.get("issues", []))[:20],
+        "checksum": _file_sha256(candidate_path),
+        "uploaded_at": _utc_now_iso(),
+    }
+    quality_metrics = summary.setdefault("quality_metrics", {})
+    upload_history = list(quality_metrics.get("cast_reference_uploads") or [])
+    quality_metrics["cast_reference_uploads"] = [*upload_history[-19:], upload_audit]
+
+    with RUN_LOCK:
+        run = RUNS.get(run_id)
+        if run is None:
+            candidate_path.unlink(missing_ok=True)
+            return jsonify({"error": "run not found"}), 404
+        if str(run.get("updated_at") or "") != run_updated_at:
+            candidate_path.unlink(missing_ok=True)
+            return jsonify({"error": "run changed during upload validation"}), 409
+
+        if not accepted:
+            reference = character.setdefault("reference", {})
+            reference["upload_candidate"] = {
+                **upload_audit,
+                "path": str(candidate_path),
+            }
+            run["summary"] = summary
+            run["updated_at"] = _utc_now_iso()
+            _persist_summary(run)
+            run.setdefault("log", []).append(
+                f"Frente canônica {character_id} bloqueada pelo gate automático"
+            )
+            return (
+                jsonify(
+                    {
+                        "error": "uploaded_cast_reference_failed_quality_gate",
+                        "metrics": upload_audit,
+                        "run": run,
+                    }
+                ),
+                422,
+            )
+
+        canonical_path = output_dir / f"{character_id}_character_reference_front.png"
+        backup_path = output_dir / (
+            f".{character_id}_character_reference_front_{uuid.uuid4().hex}.bak"
+        )
+        had_canonical = canonical_path.is_file()
+        try:
+            if had_canonical:
+                shutil.copy2(canonical_path, backup_path)
+            candidate_path.replace(canonical_path)
+            _begin_cast_reference_revision(character)
+            _update_cast_reference(
+                character,
+                str(canonical_path),
+                {**image_metric, "path": str(canonical_path)},
+                view_id="front",
+                human_approved=True,
+            )
+            reference = character["reference"]
+            reference.pop("upload_candidate", None)
+            reference["anchor_source"] = "human_upload"
+            reference["anchor_uploaded_at"] = upload_audit["uploaded_at"]
+            reference["views"]["front"]["source"] = "human_upload"
+            _invalidate_assets_for_cast_change(summary)
+            stage = _refresh_cast_stage(summary, base_dir=run_dir)
+            summary = _apply_curation_summary(summary, run_dir)
+            run["summary"] = summary
+            run["updated_at"] = _utc_now_iso()
+            _persist_summary(run)
+        except (OSError, ValueError) as exc:
+            if backup_path.is_file():
+                backup_path.replace(canonical_path)
+            elif not had_canonical:
+                canonical_path.unlink(missing_ok=True)
+            return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 409
+        finally:
+            backup_path.unlink(missing_ok=True)
+        run.setdefault("log", []).append(
+            f"Frente canônica {character_id} aceita; vistas derivadas invalidadas; estágio {stage}"
+        )
+        return jsonify(run)
+
+
 @app.post("/api/runs/<run_id>/cast-lora-export")
 def export_cast_lora_packs(run_id: str) -> Response:
     from scripts.export_cast_bible_lora_manifest import export_training_packs
@@ -5241,6 +6555,10 @@ def export_cast_lora_packs(run_id: str) -> Response:
         summary = run.get("summary") or {}
         if not summary:
             return jsonify({"error": "run summary is not ready"}), 409
+        _refresh_cast_stage(
+            summary,
+            base_dir=Path(run["run_dir"]),
+        )
         cast_status = (
             summary.get("visual_bible", {}).get("cast_bible", {}).get("status")
         )
@@ -5278,7 +6596,10 @@ def continue_after_cast(run_id: str) -> Response:
         if not summary:
             return jsonify({"error": "run summary is not ready"}), 409
         try:
-            stage = _refresh_cast_stage(summary)
+            stage = _refresh_cast_stage(
+                summary,
+                base_dir=Path(run["run_dir"]),
+            )
             if stage != "ready_to_generate_scenes":
                 blockers = (
                     summary.get("visual_bible", {})
@@ -5372,7 +6693,11 @@ def generate_approved_videos(run_id: str) -> Response:
         if not summary:
             return jsonify({"error": "run summary is not ready"}), 409
         summary = _apply_curation_summary(summary, Path(run["run_dir"]))
+        _archive_legacy_final_video(summary, Path(run["run_dir"]))
         curation = summary.setdefault("curation", {})
+        run["summary"] = summary
+        run["updated_at"] = _utc_now_iso()
+        _persist_summary(run)
         if not curation.get("can_generate_video"):
             return (
                 jsonify(
@@ -5414,13 +6739,17 @@ def mark_final_video_viewed(run_id: str) -> Response:
         summary = run.get("summary")
         if not summary:
             return jsonify({"error": "run summary is not ready"}), 409
-        video_artifact = _validated_video_artifact(Path(run["run_dir"]), summary)
-        if not video_artifact.get("valid"):
+        summary = _apply_curation_summary(summary, Path(run["run_dir"]))
+        video_artifact = summary.get("video_artifact", {})
+        if summary.get("video_current") is not True:
             return (
                 jsonify(
                     {
-                        "error": "final video is not valid",
+                        "error": "final video is not current and dialogue-compliant",
                         "issues": video_artifact.get("issues", []),
+                        "dialogue_blockers": summary.get("curation", {}).get(
+                            "dialogue_blockers", []
+                        ),
                     }
                 ),
                 409,

@@ -33,13 +33,32 @@ vision-qa = [
 dev = [
     "black==24.10.0",
     "pytest>=8.3,<9",
+    "ruff==0.15.22",
 ]
 
 [dependency-groups]
 dev = [
     "black==24.10.0",
     "pytest>=8.3,<9",
+    "ruff==0.15.22",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+extend-exclude = [
+    ".playwright-cli",
+    "archive",
+    "ComfyUI",
+    "data",
+    "htmlcov",
+    "mcp_logs",
+    "output",
+]
+
+[tool.ruff.lint]
+select = ["B", "E4", "E7", "E9", "F", "RUF"]
+ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

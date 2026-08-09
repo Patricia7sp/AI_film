@@ -585,11 +585,12 @@ def test_cast_reference_strategy_uses_schnell_only_without_anchor():
     )
     assert (
         langgraph_adapter._fal_cast_reference_strategy(
-            character_kind="animal",
-            derived_reference_view=True,
-            has_anchor=True,
+            character_kind="human",
+            derived_reference_view=False,
+            has_anchor=False,
+            repair_rejected_front=True,
         )
-        == "nano_banana_edit"
+        == "flux_schnell"
     )
 
 

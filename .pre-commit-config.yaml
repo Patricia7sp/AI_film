@@ -146,34 +146,9 @@ repos:
           - --strict
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.4
+    rev: v0.15.22
     hooks:
-      - id: ruff
+      - id: ruff-check
         name: ruff
         description: 'Linter rápido para Python escrito em Rust'
-        entry: ruff check --fix --show-fixes
-        language: python
-        language_version: python3.10
-        types: [python]
-        exclude: >-
-          (?x)^(
-            \.eggs|
-            \.git|
-            \.mypy_cache|
-            \.pytest_cache|
-            build|
-            dist|
-            docs|
-            migrations|
-            node_modules|
-            venv
-          )/
-        args:
-          - --fix
-          - --unsafe-fixes
-          - --show-fixes
-          - --target-version=py39
-          - --line-length=88
-          - --ignore=E203
-          - --select=ALL
-          - --unfixable=F401,F841
+        args: [--fix, --show-fixes]
