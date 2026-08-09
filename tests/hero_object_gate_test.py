@@ -478,7 +478,10 @@ def test_profile_eye_detector_rejects_the_known_three_quarter_regression():
     if not regression_image.exists():
         pytest.skip("local generated regression artifact is unavailable")
 
-    assert _detect_profile_eye_count(regression_image) >= 2
+    eye_count = _detect_profile_eye_count(regression_image)
+    if eye_count is None:
+        pytest.skip("profile eye detector dependencies are unavailable")
+    assert eye_count >= 2
 
 
 def test_gemini_text_client_has_bounded_timeout_and_retries(monkeypatch):
@@ -4471,7 +4474,7 @@ def test_local_character_identity_comparison_rejects_any_failed_anchor(
 
 
 def test_local_cast_full_body_identity_compares_detected_faces(monkeypatch):
-    import torch
+    torch = pytest.importorskip("torch")
     from PIL import Image
 
     from open3d_implementation.core import local_visual_qa
@@ -4539,7 +4542,7 @@ def test_local_cast_full_body_identity_compares_detected_faces(monkeypatch):
 def test_local_narrative_identity_uses_contrastive_face_prototypes(
     monkeypatch,
 ):
-    import torch
+    torch = pytest.importorskip("torch")
     from PIL import Image
 
     from open3d_implementation.core import local_visual_qa
@@ -4604,7 +4607,7 @@ def test_local_narrative_identity_uses_contrastive_face_prototypes(
 def test_local_narrative_identity_rejects_face_closer_to_another_character(
     monkeypatch,
 ):
-    import torch
+    torch = pytest.importorskip("torch")
     from PIL import Image
 
     from open3d_implementation.core import local_visual_qa
@@ -4666,7 +4669,7 @@ def test_local_narrative_identity_rejects_face_closer_to_another_character(
 def test_local_narrative_identity_tolerates_small_cartoon_contrastive_overlap(
     monkeypatch,
 ):
-    import torch
+    torch = pytest.importorskip("torch")
     from PIL import Image
 
     from open3d_implementation.core import local_visual_qa

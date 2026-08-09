@@ -116,8 +116,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-cov pytest-xdist pytest-timeout
-          pip install -r open3d_implementation/orchestration/requirements_dagster.txt
+          pip install -e .[dev]
+          pip install pytest-cov pytest-xdist pytest-timeout
 
       - name: Run Unit Tests
         run: |
@@ -130,8 +130,7 @@ jobs:
             printf '%s\n' 'def test_pr_smoke() -> None:' '    assert True' > .ci-smoke/test_pr_smoke.py
             pytest .ci-smoke -v --cov=open3d_implementation --cov-report=xml:open3d_implementation/coverage.xml --cov-report=html --maxfail=1
           else
-            cd open3d_implementation
-            pytest tests/ -v --cov=. --cov-report=xml --cov-report=html --maxfail=3 -n auto
+            pytest tests/ -v --cov=open3d_implementation --cov-report=xml:open3d_implementation/coverage.xml --cov-report=html --maxfail=3 -n auto
           fi
 
       - name: Upload Coverage to Codecov
