@@ -90,7 +90,11 @@ def test_legacy_english_scene_fields_are_migrated_to_portuguese() -> None:
         {
             "scene_id": 8,
             "description": "Alice waits near a window with plum pies.",
-            "main_action": "Alice stands near a window holding a basket of plum pies, looking out at the warm afternoon light, excited for tomorrow's boat trip.",
+            "main_action": (
+                "Alice stands near a window holding a basket of plum pies, "
+                "looking out at the warm afternoon light, excited for tomorrow's "
+                "boat trip."
+            ),
             "required_visual_elements": [
                 "Alice approximately 10 years old",
                 "ivory-white day dress",

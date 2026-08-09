@@ -84,11 +84,43 @@ _LEGACY_VISUAL_PT_BR = {
 }
 
 _LEGACY_MAIN_ACTION_PT_BR = {
-    "alice searches the vast university garden for a safe place to hide the kittens, standing near ancient beech trees with thick, wrinkled trunks.": "Alice procura no vasto jardim da universidade um lugar seguro para esconder os gatinhos, perto de faias antigas com troncos grossos e enrugados.",
-    "alice and her little sister edith peek through a half-open wooden door, spying on the adults having tea in the dining room.": "Alice e sua irmã mais nova, Edith, espiam pela porta de madeira entreaberta enquanto os adultos tomam chá na sala de jantar.",
-    "professor ludovico sits at the tea table, turning his head with a warm, surprised smile as he notices the children peeking in.": "O professor Ludovico está sentado à mesa de chá e vira a cabeça com um sorriso caloroso e surpreso ao notar as meninas espiando.",
-    "alice and professor ludovico sit across a wooden table playing a lively game of chess, surrounded by warm, cozy indoor lighting.": "Alice e o professor Ludovico jogam uma partida animada de xadrez em lados opostos de uma mesa de madeira, sob uma iluminação interna quente e acolhedora.",
-    "alice stands near a window holding a basket of plum pies, looking out at the warm afternoon light, excited for tomorrow's boat trip.": "Alice está perto da janela com uma cesta de tortas de ameixa e observa a luz quente da tarde, animada para o passeio de barco do dia seguinte.",
+    (
+        "alice searches the vast university garden for a safe place to hide the "
+        "kittens, standing near ancient beech trees with thick, wrinkled trunks."
+    ): (
+        "Alice procura no vasto jardim da universidade um lugar seguro para "
+        "esconder os gatinhos, perto de faias antigas com troncos grossos e "
+        "enrugados."
+    ),
+    (
+        "alice and her little sister edith peek through a half-open wooden door, "
+        "spying on the adults having tea in the dining room."
+    ): (
+        "Alice e sua irmã mais nova, Edith, espiam pela porta de madeira "
+        "entreaberta enquanto os adultos tomam chá na sala de jantar."
+    ),
+    (
+        "professor ludovico sits at the tea table, turning his head with a warm, "
+        "surprised smile as he notices the children peeking in."
+    ): (
+        "O professor Ludovico está sentado à mesa de chá e vira a cabeça com um "
+        "sorriso caloroso e surpreso ao notar as meninas espiando."
+    ),
+    (
+        "alice and professor ludovico sit across a wooden table playing a lively "
+        "game of chess, surrounded by warm, cozy indoor lighting."
+    ): (
+        "Alice e o professor Ludovico jogam uma partida animada de xadrez em "
+        "lados opostos de uma mesa de madeira, sob uma iluminação interna quente "
+        "e acolhedora."
+    ),
+    (
+        "alice stands near a window holding a basket of plum pies, looking out at "
+        "the warm afternoon light, excited for tomorrow's boat trip."
+    ): (
+        "Alice está perto da janela com uma cesta de tortas de ameixa e observa "
+        "a luz quente da tarde, animada para o passeio de barco do dia seguinte."
+    ),
 }
 
 

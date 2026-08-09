@@ -513,10 +513,7 @@ def evaluate_local_narrative_identity(
                     max(1, min(reference.width, right)),
                     max(1, min(reference.height, bottom)),
                 )
-                if (
-                    bounded[2] - bounded[0] >= 24
-                    and bounded[3] - bounded[1] >= 24
-                ):
+                if bounded[2] - bounded[0] >= 24 and bounded[3] - bounded[1] >= 24:
                     positive_crops.append(_expanded_face_crop(reference, bounded))
                     reference_boxes.append(bounded)
             continue
@@ -922,9 +919,7 @@ def _evaluate_visual_criteria_batch(
         answer = indexed_answers.get(index)
         raw_response = response[:240]
         requires_confirmation = bool(
-            answer is not None
-            and criterion.critical
-            and answer != criterion.expected
+            answer is not None and criterion.critical and answer != criterion.expected
         )
         if answer is None or requires_confirmation:
             fallback_response = _run_local_visual_prompt(

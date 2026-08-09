@@ -1,6 +1,7 @@
 [flake8]
 max-line-length = 120
 extend-ignore = E203
+exclude = archive
 per-file-ignores =
     open3d_implementation/core/langgraph_adapter.py:E203,E501
     open3d_implementation/ui_server.py:E501

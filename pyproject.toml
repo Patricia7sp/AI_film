@@ -60,6 +60,9 @@ extend-exclude = [
 select = ["B", "E4", "E7", "E9", "F", "RUF"]
 ignore = ["E501"]
 
+[tool.black]
+extend-exclude = "^/archive/"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--strict-markers"]

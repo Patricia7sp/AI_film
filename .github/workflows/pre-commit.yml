@@ -28,7 +28,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git fetch origin "${{ github.base_ref }}" --depth=1
-            CHANGED_FILES="$(git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}"...HEAD)"
+            CHANGED_FILES="$(git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}"...HEAD | sed '/^archive\//d')"
             if [ -z "$CHANGED_FILES" ]; then
               echo "No changed files to validate."
               exit 0

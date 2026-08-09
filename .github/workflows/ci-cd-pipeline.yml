@@ -43,7 +43,7 @@ jobs:
         id: changed-python
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' | tr '\n' ' ')"
+            FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' ':(exclude)archive/**' | tr '\n' ' ')"
           else
             FILES="open3d_implementation/"
           fi
@@ -122,7 +122,7 @@ jobs:
       - name: Run Unit Tests
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' | tr '\n' ' ')"
+            FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' ':(exclude)archive/**' | tr '\n' ' ')"
             if [ -n "$FILES" ]; then
               python -m py_compile $FILES
             fi

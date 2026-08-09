@@ -3888,13 +3888,13 @@ def _evaluate_temporal_identity(
 
 
 def _run_approved_video_generation(run_id: str) -> None:
-    from open3d_implementation.core.langgraph_adapter import (
-        _generate_real_video_clip,
-        _video_generation_provider,
-    )
     from open3d_implementation.core.dialogue_contract import (
         build_speaker_motion_prompt,
         dialogue_turns,
+    )
+    from open3d_implementation.core.langgraph_adapter import (
+        _generate_real_video_clip,
+        _video_generation_provider,
     )
 
     generated: list[dict[str, Any]] = []
@@ -4682,11 +4682,11 @@ def _run_selective_audio_retry(
     reason: str,
     scope: str,
 ) -> None:
+    from open3d_implementation.core.dialogue_contract import enrich_scene_performance
     from open3d_implementation.core.langgraph_adapter import (
         _elevenlabs_remaining_characters,
         _generate_scene_dialogue_audio,
     )
-    from open3d_implementation.core.dialogue_contract import enrich_scene_performance
 
     with RUN_LOCK:
         run = RUNS.get(run_id)
