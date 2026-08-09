@@ -1,8 +1,6 @@
 name: 🤖 Full Auto Colab Pipeline (100% Automated)
 
 on:
-  push:
-    branches: [main, develop, automation-only]
   workflow_dispatch:
     inputs:
       force_colab_restart:
@@ -65,12 +63,12 @@ jobs:
         run: |
           URL="${{ steps.agent.outputs.comfyui_url }}"
           echo "🔍 URL capturada: $URL"
-          
+
           if [ -z "$URL" ]; then
             echo "❌ URL não foi capturada pelo agente"
             exit 1
           fi
-          
+
           echo "✅ URL válida capturada!"
 
   # ============================================================
@@ -88,12 +86,12 @@ jobs:
         run: |
           URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
           echo "📝 Atualizando configurações com URL: $URL"
-          
+
           # Criar/atualizar .env
           echo "COMFYUI_URL=$URL" > .env.auto
           echo "COMFYUI_SOURCE=colab_automated" >> .env.auto
           echo "UPDATED_AT=$(date)" >> .env.auto
-          
+
           echo "✅ Configurações atualizadas!"
 
   # ============================================================
@@ -122,7 +120,7 @@ jobs:
         run: |
           echo "🧪 Testando integração com ComfyUI..."
           echo "URL: $COMFYUI_URL"
-          
+
           # Criar teste
           cat > test_comfyui_auto.py << 'EOF'
           import os
@@ -131,7 +129,7 @@ jobs:
           def test_comfyui_available():
               url = os.getenv('COMFYUI_URL')
               assert url, "COMFYUI_URL not set"
-              
+
               print(f"🔍 Testando URL: {url}")
               response = requests.get(url, timeout=10)
               assert response.status_code == 200, f"ComfyUI not accessible: {response.status_code}"
@@ -140,7 +138,7 @@ jobs:
           if __name__ == "__main__":
               test_comfyui_available()
           EOF
-          
+
           python test_comfyui_auto.py
 
   # ============================================================
@@ -181,10 +179,10 @@ jobs:
           echo "🎬 Iniciando pipeline de geração de conteúdo..."
           echo "URL do ComfyUI: $COMFYUI_URL"
           echo "🤖 LLM: Gemini 2.0 Flash (Principal)"
-          
+
           # Criar diretório output se não existir
           mkdir -p output
-          
+
           # Salvar história do payload em arquivo (preservando quebras de linha)
           if [ ! -z "$STORY_INPUT" ]; then
             echo "📝 História recebida do Colab"
@@ -203,24 +201,24 @@ jobs:
               echo "Uma jornada épica através de um mundo cyberpunk futurista" > output/story_latest.txt
             fi
           fi
-          
+
           # Instalar dependências Python e FFmpeg
           echo "📦 Instalando dependências Python..."
           pip install langchain langchain-openai langchain-google-genai langgraph dagster python-dotenv requests pillow
-          
+
           echo "🎬 Instalando FFmpeg..."
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          
+
           # Verificar ambiente
           python .github/scripts/check_env.py
           python .github/scripts/check_deps.py
           python .github/scripts/test_env.py
           python .github/scripts/diagnose_env.py
-          
+
           # Executar pipeline real
           python .github/scripts/run_ai_pipeline.py
-          
+
           echo "✅ Pipeline de conteúdo executado!"
 
   # ============================================================
@@ -240,10 +238,10 @@ jobs:
           URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
           echo "🔐 Atualizando secret do Kubernetes..."
           echo "URL: $URL"
-          
+
           # Aqui você configuraria kubectl e atualizaria o secret
           # kubectl create secret generic comfyui-url --from-literal=url="$URL" --dry-run=client -o yaml | kubectl apply -f -
-          
+
           echo "✅ Secret atualizado (simulado)"
 
   # ============================================================
@@ -259,14 +257,14 @@ jobs:
         run: |
           STATUS="${{ needs.generate-content.result }}"
           URL="${{ needs.orchestrate-colab.outputs.comfyui_url }}"
-          
+
           echo "📢 Enviando notificação..."
           echo "Status: $STATUS"
           echo "URL: $URL"
-          
+
           # Aqui você pode enviar para Slack, Discord, etc
           # curl -X POST $WEBHOOK_URL -d "Pipeline status: $STATUS"
-          
+
           echo "✅ Notificação enviada!"
 
   # ============================================================
@@ -281,8 +279,8 @@ jobs:
       - name: Cleanup temporary resources
         run: |
           echo "🧹 Limpando recursos temporários..."
-          
+
           # Aqui você pode limpar recursos temporários
           # Exemplo: parar Colab se necessário, limpar caches, etc
-          
+
           echo "✅ Limpeza concluída!"

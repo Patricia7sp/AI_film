@@ -39,7 +39,7 @@ jobs:
         if [ "${{ github.event_name }}" = "pull_request" ]; then
           FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' ':(exclude)archive/**' | tr '\n' ' ')"
         else
-          FILES="."
+          FILES="$(git diff --name-only --diff-filter=ACMR "${{ github.event.before }}" "${{ github.sha }}" -- '*.py' ':(exclude)archive/**' | tr '\n' ' ')"
         fi
         echo "files=$FILES" >> "$GITHUB_OUTPUT"
 
