@@ -75,7 +75,7 @@ jobs:
           printf '%s\n' 'def test_pr_smoke() -> None:' '    assert True' > .ci-smoke/test_pr_smoke.py
           pytest .ci-smoke -v --cov=. --cov-report=xml
         else
-          pytest --cov=app --cov-report=xml
+          pytest --cov=open3d_implementation --cov-report=xml
         fi
 
     - name: Upload coverage to Codecov

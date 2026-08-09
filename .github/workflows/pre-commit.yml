@@ -29,18 +29,18 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git fetch origin "${{ github.base_ref }}" --depth=1
             CHANGED_FILES="$(git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}"...HEAD | sed '/^archive\//d')"
-            if [ -z "$CHANGED_FILES" ]; then
-              echo "No changed files to validate."
-              exit 0
-            fi
-            echo "$CHANGED_FILES" > /tmp/changed-files.txt
-            xargs pre-commit run trailing-whitespace --files < /tmp/changed-files.txt
-            xargs pre-commit run end-of-file-fixer --files < /tmp/changed-files.txt
-            xargs pre-commit run check-added-large-files --files < /tmp/changed-files.txt
-            xargs pre-commit run check-merge-conflict --files < /tmp/changed-files.txt
-            xargs pre-commit run check-yaml --files < /tmp/changed-files.txt
-            xargs pre-commit run check-json --files < /tmp/changed-files.txt
-            xargs pre-commit run check-toml --files < /tmp/changed-files.txt
           else
-            pre-commit run --all-files
+            CHANGED_FILES="$(git diff --name-only --diff-filter=ACMR "${{ github.event.before }}" "${{ github.sha }}" | sed '/^archive\//d')"
           fi
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No changed files to validate."
+            exit 0
+          fi
+          echo "$CHANGED_FILES" > /tmp/changed-files.txt
+          xargs pre-commit run trailing-whitespace --files < /tmp/changed-files.txt
+          xargs pre-commit run end-of-file-fixer --files < /tmp/changed-files.txt
+          xargs pre-commit run check-added-large-files --files < /tmp/changed-files.txt
+          xargs pre-commit run check-merge-conflict --files < /tmp/changed-files.txt
+          xargs pre-commit run check-yaml --files < /tmp/changed-files.txt
+          xargs pre-commit run check-json --files < /tmp/changed-files.txt
+          xargs pre-commit run check-toml --files < /tmp/changed-files.txt
