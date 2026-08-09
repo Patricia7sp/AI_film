@@ -1,8 +1,6 @@
 name: 🤖 Full Auto Colab Pipeline (100% Automated)
 
 on:
-  push:
-    branches: [main, develop, automation-only]
   workflow_dispatch:
     inputs:
       force_colab_restart:

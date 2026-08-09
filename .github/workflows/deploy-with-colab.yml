@@ -1,11 +1,6 @@
 name: Deploy with Colab ComfyUI
 
 on:
-  push:
-    branches:
-      - main
-      - develop
-      - 'feature/**'
   workflow_dispatch:
     inputs:
       force_colab_restart:
