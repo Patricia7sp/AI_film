@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 from open3d_implementation.core import fal_provider  # noqa: E402
 from open3d_implementation.core.fal_provider import (  # noqa: E402
+    FalAuthenticationError,
     FalJobResult,
     FalOutputError,
     FalQueueClient,
@@ -122,6 +123,19 @@ class FakeSession:
         del headers, timeout
         self.puts.append(url)
         return FakeResponse({"status": "CANCELLED"})
+
+
+def test_authentication_error_preserves_safe_provider_detail():
+    response = FakeResponse(
+        {"detail": "Exhausted balance"},
+        status_code=403,
+    )
+
+    with pytest.raises(
+        FalAuthenticationError,
+        match="fal_authentication_failed:http_403:Exhausted balance",
+    ):
+        fal_provider._raise_for_fal_status(response)
 
 
 def test_queue_client_uses_key_header_and_bounded_polling(monkeypatch):

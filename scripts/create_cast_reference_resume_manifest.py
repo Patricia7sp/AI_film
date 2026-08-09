@@ -62,10 +62,12 @@ def _summary_assets(summary_path: Path, output_dir: Path) -> list[dict[str, Any]
         ):
             if not isinstance(view, dict) or view.get("automatic_approved") is not True:
                 continue
-            name = Path(str(view.get("path") or "")).name
             destination_name = f"{character_id}_character_reference_{view_id}.png"
             if not DESTINATION_PATTERN.fullmatch(destination_name):
                 raise ValueError(f"summary_destination_invalid:{destination_name}")
+            name = Path(str(view.get("path") or "")).name
+            if not SOURCE_PATTERN.fullmatch(name):
+                name = destination_name
             path = _validated_output_asset(output_dir, name)
             expected = str(view.get("checksum") or "").lower()
             actual = _sha256(path)

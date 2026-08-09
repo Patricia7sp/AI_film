@@ -258,11 +258,13 @@ ENV/
 .Trashes
 ehthumbs.db
 Thumbs.db
+.playwright-cli/
 
 # Scripts de teste (ignorar)
 test_*.py
 *_test.py
 !tests/hero_object_gate_test.py
+!tests/dialogue_contract_test.py
 !tests/conftest.py
 !tests/test_audio.py
 !tests/test_fal_pipeline_integration.py

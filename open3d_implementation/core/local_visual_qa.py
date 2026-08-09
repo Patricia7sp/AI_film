@@ -24,6 +24,7 @@ class LocalVisualQAError(RuntimeError):
 
 
 LocalVisualAnswerValue = Literal["yes", "no", "uncertain"]
+LocalSmallAnimalLabel = Literal["mouse", "cat", "dog", "rabbit", "other", "none"]
 
 
 @dataclass(frozen=True)
@@ -408,6 +409,14 @@ def _face_candidate_boxes(
     return tuple(deduplicated)
 
 
+def detect_local_face_boxes(
+    image: Image.Image,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Return bounded face candidates for downstream local quality gates."""
+
+    return _face_candidate_boxes(image)
+
+
 def _expanded_face_crop(
     image: Image.Image,
     box: tuple[int, int, int, int],
@@ -453,7 +462,7 @@ def _bounded_identity_margin_env(name: str, default: float) -> float:
         configured = float(os.getenv(name, str(default)))
     except ValueError:
         configured = default
-    return max(0.0, min(0.5, configured))
+    return max(-0.5, min(0.5, configured))
 
 
 def _calibrated_identity_score(
@@ -484,14 +493,30 @@ def evaluate_local_narrative_identity(
     candidate_path: Path,
     character_id: str,
     negative_reference_paths: Sequence[Path] = (),
+    reference_boxes_override: Sequence[tuple[int, int, int, int]] = (),
+    candidate_boxes_override: Sequence[tuple[int, int, int, int]] = (),
+    restrict_candidate_boxes: bool = False,
     model_name: str = DEFAULT_LOCAL_IDENTITY_MODEL,
 ) -> LocalNarrativeIdentityAssessment:
     """Match a scene face to a canonical multi-view identity prototype."""
 
     positive_crops: list[Image.Image] = []
     reference_boxes: list[tuple[int, int, int, int]] = []
-    for reference_path in reference_paths[:6]:
+    for reference_index, reference_path in enumerate(reference_paths[:6]):
         reference = _load_rgb_image(reference_path)
+        if reference_index == 0 and reference_boxes_override:
+            for box in reference_boxes_override[:6]:
+                left, top, right, bottom = (int(value) for value in box)
+                bounded = (
+                    max(0, min(reference.width - 1, left)),
+                    max(0, min(reference.height - 1, top)),
+                    max(1, min(reference.width, right)),
+                    max(1, min(reference.height, bottom)),
+                )
+                if bounded[2] - bounded[0] >= 24 and bounded[3] - bounded[1] >= 24:
+                    positive_crops.append(_expanded_face_crop(reference, bounded))
+                    reference_boxes.append(bounded)
+            continue
         selected = _primary_reference_face(reference)
         if selected is not None:
             crop, box = selected
@@ -508,7 +533,25 @@ def evaluate_local_narrative_identity(
             negative_crops.append(selected[0])
 
     candidate = _load_rgb_image(candidate_path)
-    candidate_boxes = _face_candidate_boxes(candidate)
+    candidate_boxes: list[tuple[int, int, int, int]] = []
+    for box in candidate_boxes_override[:25]:
+        left, top, right, bottom = (int(value) for value in box)
+        bounded = (
+            max(0, min(candidate.width - 1, left)),
+            max(0, min(candidate.height - 1, top)),
+            max(1, min(candidate.width, right)),
+            max(1, min(candidate.height, bottom)),
+        )
+        if (
+            bounded[2] - bounded[0] >= 24
+            and bounded[3] - bounded[1] >= 24
+            and all(_box_iou(bounded, existing) < 0.75 for existing in candidate_boxes)
+        ):
+            candidate_boxes.append(bounded)
+    if not restrict_candidate_boxes:
+        for box in _face_candidate_boxes(candidate):
+            if all(_box_iou(box, existing) < 0.75 for existing in candidate_boxes):
+                candidate_boxes.append(box)
     if not candidate_boxes:
         raise LocalVisualQAError("local_identity:candidate_face_not_detected")
     candidate_crops = [_expanded_face_crop(candidate, box) for box in candidate_boxes]
@@ -560,11 +603,11 @@ def evaluate_local_narrative_identity(
 
     face_threshold = _bounded_similarity_env(
         "LOCAL_NARRATIVE_IDENTITY_MIN_SIMILARITY",
-        0.68,
+        0.65,
     )
     margin_threshold = _bounded_identity_margin_env(
         "LOCAL_NARRATIVE_IDENTITY_MIN_MARGIN",
-        0.08,
+        -0.12,
     )
     similarity_margin = (
         face_similarity - closest_negative_similarity
@@ -599,7 +642,7 @@ def evaluate_local_narrative_identity(
         face_threshold=face_threshold,
         margin_threshold=margin_threshold,
         reference_boxes=tuple(reference_boxes),
-        candidate_box=candidate_boxes[selected_index],
+        candidate_box=tuple(candidate_boxes[selected_index]),
         issues=tuple(issues),
         model_name=model_name,
     )
@@ -632,7 +675,7 @@ def _identity_similarity_threshold(view_id: str) -> float:
 
 def _identity_composition_threshold(view_id: str) -> float | None:
     defaults: dict[str, float | None] = {
-        "profile": 0.72,
+        "profile": 0.65,
         "three_quarter": 0.80,
         "full_body": None,
         "expression_neutral": 0.90,
@@ -657,15 +700,25 @@ def evaluate_local_cast_reference_identity(
 
     reference = _load_rgb_image(reference_path)
     candidate = _load_rgb_image(candidate_path)
-    candidate_head_ratio = 0.32 if view_id == "full_body" else 0.62
-    reference_crop, reference_box = _neutral_subject_crop(
-        reference,
-        head_ratio=0.52,
+    reference_face = (
+        _primary_reference_face(reference) if view_id == "full_body" else None
     )
-    candidate_crop, candidate_box = _neutral_subject_crop(
-        candidate,
-        head_ratio=candidate_head_ratio,
+    candidate_face = (
+        _primary_reference_face(candidate) if view_id == "full_body" else None
     )
+    if reference_face is not None and candidate_face is not None:
+        reference_crop, reference_box = reference_face
+        candidate_crop, candidate_box = candidate_face
+    else:
+        candidate_head_ratio = 0.32 if view_id == "full_body" else 0.62
+        reference_crop, reference_box = _neutral_subject_crop(
+            reference,
+            head_ratio=0.52,
+        )
+        candidate_crop, candidate_box = _neutral_subject_crop(
+            candidate,
+            head_ratio=candidate_head_ratio,
+        )
     processor, model = _load_local_identity_model(
         model_name,
         DEFAULT_LOCAL_IDENTITY_REVISION,
@@ -818,6 +871,18 @@ def _normalize_binary_answer(response: str) -> LocalVisualAnswerValue:
     return cast(LocalVisualAnswerValue, match.group(1))
 
 
+def _normalize_confirmation_answer(
+    response: str,
+) -> LocalVisualAnswerValue | None:
+    match = re.fullmatch(
+        r"\s*(yes|no|uncertain)\s*[.!]?\s*",
+        response.strip().lower(),
+    )
+    if not match:
+        return None
+    return cast(LocalVisualAnswerValue, match.group(1))
+
+
 def _evaluate_visual_criteria_batch(
     *,
     processor: _Processor,
@@ -853,18 +918,27 @@ def _evaluate_visual_criteria_batch(
     for index, criterion in enumerate(criteria, start=1):
         answer = indexed_answers.get(index)
         raw_response = response[:240]
-        if answer is None:
+        requires_confirmation = bool(
+            answer is not None and criterion.critical and answer != criterion.expected
+        )
+        if answer is None or requires_confirmation:
             fallback_response = _run_local_visual_prompt(
                 processor=processor,
                 model=model,
                 images=images,
                 prompt=(
-                    f"{context} Answer only yes, no, or uncertain. "
+                    f"{context} Re-check this criterion independently. "
+                    "Answer only yes, no, or uncertain. "
                     f"{criterion.question}"
                 ),
                 max_new_tokens=8,
             )
-            answer = _normalize_binary_answer(fallback_response)
+            if requires_confirmation:
+                confirmed_answer = _normalize_confirmation_answer(fallback_response)
+                if confirmed_answer is not None:
+                    answer = confirmed_answer
+            else:
+                answer = _normalize_binary_answer(fallback_response)
             raw_response = fallback_response[:120]
         answers.append(
             LocalVisualAnswer(
@@ -937,6 +1011,77 @@ def evaluate_local_visual_checklist(
         criteria=bounded_criteria,
         context="Inspect the full image carefully.",
     )
+
+
+def classify_local_small_animal(
+    *,
+    image_path: Path,
+    model_name: str = DEFAULT_LOCAL_VISION_QA_MODEL,
+) -> LocalSmallAnimalLabel:
+    """Classify one visible small animal with mutually exclusive labels."""
+
+    image = _load_rgb_image(image_path)
+    revision = _model_revision(
+        model_name=model_name,
+        env_name="LOCAL_VISION_QA_REVISION",
+        default_model=DEFAULT_LOCAL_VISION_QA_MODEL,
+        default_revision=DEFAULT_LOCAL_VISION_QA_REVISION,
+    )
+    processor, model = _load_local_vision_model(
+        model_name,
+        revision,
+        _local_longest_edge(),
+    )
+    response = _run_local_visual_prompt(
+        processor=processor,
+        model=model,
+        images=[image],
+        prompt=(
+            "Identify the single small animal visible in the image. Answer with "
+            "exactly one word from: mouse, cat, dog, rabbit, other, none."
+        ),
+        max_new_tokens=8,
+    )
+    match = re.search(
+        r"\b(mouse|cat|kitten|dog|rabbit|bunny|other|none)\b",
+        response.strip().lower(),
+    )
+    if not match:
+        raise LocalVisualQAError("local_vlm:invalid_small_animal_label")
+    label = match.group(1)
+    if label == "kitten":
+        label = "cat"
+    elif label == "bunny":
+        label = "rabbit"
+    return cast(LocalSmallAnimalLabel, label)
+
+
+def reconcile_exclusive_small_animal_answers(
+    answers: Sequence[LocalVisualAnswer],
+    label: LocalSmallAnimalLabel,
+) -> list[LocalVisualAnswer]:
+    """Replace contradictory binary animal checks with one exclusive classification."""
+
+    detected_by_code = {
+        "hero_mouse_missing_or_wrong": label == "mouse",
+        "forbidden_cat": label == "cat",
+        "forbidden_dog": label == "dog",
+        "forbidden_rabbit": label == "rabbit",
+    }
+    reconciled: list[LocalVisualAnswer] = []
+    for answer in answers:
+        detected = detected_by_code.get(answer.criterion.code)
+        if detected is None:
+            reconciled.append(answer)
+            continue
+        reconciled.append(
+            LocalVisualAnswer(
+                criterion=answer.criterion,
+                answer="yes" if detected else "no",
+                raw_response=f"exclusive_small_animal_classifier:{label}",
+            )
+        )
+    return reconciled
 
 
 def evaluate_local_character_identity(

@@ -37,7 +37,7 @@ jobs:
       id: changed-python
       run: |
         if [ "${{ github.event_name }}" = "pull_request" ]; then
-          FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' | tr '\n' ' ')"
+          FILES="$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- '*.py' ':(exclude)archive/**' | tr '\n' ' ')"
         else
           FILES="."
         fi

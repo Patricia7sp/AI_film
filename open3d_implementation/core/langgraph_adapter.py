@@ -23,6 +23,16 @@ from typing import Any, Dict, List, Literal, Mapping, Sequence, TypedDict
 
 import requests
 
+from open3d_implementation.core.dialogue_contract import (
+    build_speaker_motion_prompt,
+    dialogue_turns,
+    enrich_scene_performance,
+    is_narrator_role,
+    normalize_character_id,
+    production_dialogue_gate,
+    scene_performance_schema,
+    validate_scene_performance,
+)
 from open3d_implementation.core.fal_provider import (
     FalProviderError,
     FalQueueClient,
@@ -59,6 +69,7 @@ class Open3DAgentState(TypedDict, total=False):
     image_style: str
     image_quality_preset: str
     cast_resume_local_only: bool
+    scene_resume_manifest_path: str
     visual_bible: Dict[str, Any]
     enhanced_multimodal_input_asset: Dict[str, Any]
     cinematic_prompt: str
@@ -129,6 +140,7 @@ IMAGE_STYLE_PRESETS: Dict[str, Dict[str, str]] = {
 
 DEFAULT_IMAGE_STYLE = "comic_storybook"
 CAST_BIBLE_SCHEMA_VERSION = "2.0"
+SCENE_RESUME_SCHEMA_VERSION = "1.0"
 CAST_REFERENCE_VIEWS: Dict[str, str] = {
     "front": (
         "front-facing close identity portrait from top of head to mid-torso only, "
@@ -154,8 +166,9 @@ CAST_REFERENCE_VIEWS: Dict[str, str] = {
         "expression, face occupies at least 40 percent of image height, no full body"
     ),
     "expression_warm": (
-        "tight front close-up from top of head to upper chest only with a subtle warm "
-        "expression, face occupies at least 40 percent of image height, no full body"
+        "tight front close-up from top of head to upper chest only with a clearly visible "
+        "gentle closed-mouth smile, both mouth corners slightly raised and warm friendly "
+        "eyes, face occupies at least 40 percent of image height, no full body"
     ),
     "expression_concerned": (
         "tight front close-up from top of head to upper chest only with a restrained "
@@ -633,17 +646,20 @@ def _merge_canonical_scenes(
         merged.append({**scene, "scene_id": len(merged) + 1})
 
     return [
-        {
-            **scene,
-            "scene_id": index,
-            "camera_motion": scene.get("camera_motion")
-            or _motion_plan({"scene_id": index})["description"],
-        }
+        enrich_scene_performance(
+            {
+                **scene,
+                "scene_id": index,
+                "camera_motion": scene.get("camera_motion")
+                or _motion_plan({"scene_id": index})["description"],
+            }
+        )
         for index, scene in enumerate(merged[:max_scenes], 1)
     ]
 
 
 def _scene_response_json_schema(max_scenes: int) -> Dict[str, Any]:
+    performance_properties = scene_performance_schema()
     scene_schema: Dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
@@ -666,6 +682,7 @@ def _scene_response_json_schema(max_scenes: int) -> Dict[str, Any]:
             },
             "source_excerpt": {"type": "string", "minLength": 8},
             "camera_motion": {"type": "string", "minLength": 8},
+            **performance_properties,
         },
         "required": [
             "scene_id",
@@ -676,6 +693,14 @@ def _scene_response_json_schema(max_scenes: int) -> Dict[str, Any]:
             "must_not_include",
             "source_excerpt",
             "camera_motion",
+            "location",
+            "main_action",
+            "dominant_emotion",
+            "characters_present",
+            "required_visual_elements",
+            "dialogue",
+            "language",
+            "narration_allowed",
         ],
     }
     return {
@@ -692,12 +717,48 @@ def _validate_structured_scenes(
     if not isinstance(payload, list) or len(payload) != max_scenes:
         raise ValueError("structured_scenes_count_mismatch")
     required_keys = set(_scene_response_json_schema(max_scenes)["items"]["required"])
+    # Resume manifests created before the dialogue-film contract are migrated
+    # deterministically below instead of being discarded and regenerated at cost.
+    required_keys.difference_update(scene_performance_schema())
     scenes: List[Dict[str, Any]] = []
     for index, item in enumerate(payload, 1):
         if not isinstance(item, dict) or not required_keys.issubset(item):
             raise ValueError(f"structured_scene_invalid:{index}")
-        scenes.append({**item, "scene_id": index})
+        scene = enrich_scene_performance({**item, "scene_id": index})
+        performance = validate_scene_performance(scene)
+        if not performance["passed"]:
+            raise ValueError(
+                f"structured_scene_performance_invalid:{index}:"
+                + ",".join(str(item) for item in performance["blockers"])
+            )
+        scenes.append(scene)
     return scenes
+
+
+def _load_scene_resume_manifest(
+    manifest_path: str,
+    *,
+    story_text: str,
+    image_style: str,
+    max_scenes: int,
+) -> List[Dict[str, Any]]:
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError("scene_resume_manifest_missing_or_oversized")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("scene_resume_manifest_invalid_json") from exc
+    expected_story_hash = hashlib.sha256(story_text.encode("utf-8")).hexdigest()
+    if payload.get("schema_version") != SCENE_RESUME_SCHEMA_VERSION:
+        raise ValueError("scene_resume_manifest_schema_mismatch")
+    if payload.get("story_sha256") != expected_story_hash:
+        raise ValueError("scene_resume_manifest_story_mismatch")
+    if payload.get("image_style") != image_style:
+        raise ValueError("scene_resume_manifest_style_mismatch")
+    if _safe_int(payload.get("max_scenes")) != max_scenes:
+        raise ValueError("scene_resume_manifest_count_mismatch")
+    return _validate_structured_scenes(payload.get("scenes"), max_scenes)
 
 
 def _scene_text(scene: Dict[str, Any]) -> str:
@@ -752,6 +813,16 @@ def _hero_object_requirements(scene: Dict[str, Any]) -> List[Dict[str, str]]:
                 "placement": "dominant foreground detail in grass or soil",
                 "minimum_legibility": "individual mound texture and Alice looking at it must be readable without zooming",
                 "camera": "low ground-level object-first composition",
+            }
+        )
+
+    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
+        hero_objects.append(
+            {
+                "name": "rabbit hole",
+                "placement": "large dark hollow opening cut into a grassy earth bank",
+                "minimum_legibility": "the deep opening and surrounding bank must be readable without zooming",
+                "camera": "wider side-profile discovery shot with the hole as the primary focal point",
             }
         )
 
@@ -991,7 +1062,7 @@ def _build_scene_contract(scene: Dict[str, Any]) -> Dict[str, Any]:
 
 def _scene_negative_prompt(scene: Dict[str, Any]) -> str:
     contract = _build_scene_contract(scene)
-    scene_text = _scene_text(scene)
+    scene_text = _scene_positive_text(scene)
     color_forbidden: List[str] = []
     if _text_has_any_phrase(
         scene_text,
@@ -1198,19 +1269,22 @@ def _cast_profile_registry() -> List[Dict[str, Any]]:
             "kind": "human",
             "role": "supporting",
             "identity_prompt": (
-                "same Lóri in every scene: Alice's older adolescent sister, taller than Alice, "
-                "dark chestnut hair pinned back, composed oval face, muted sage Victorian day dress"
+                "same Lóri in every scene: Alice's 16-year-old older adolescent sister, "
+                "clearly taller and visibly older than 10-year-old Alice, mature teenage facial "
+                "proportions and natural adolescent body proportions, dark chestnut hair pinned "
+                "back, composed oval face, muted sage Victorian day dress"
             ),
             "must_include": [
-                "exactly one adolescent Lóri",
-                "older and taller than Alice",
+                "exactly one 16-year-old adolescent Lóri",
+                "mature teenage face and adolescent body proportions",
+                "visibly older and taller than 10-year-old Alice",
                 "dark chestnut hair pinned back",
                 "muted sage Victorian day dress",
                 "plain neutral backdrop",
             ],
             "must_not_include": [
                 "second Lóri",
-                "same face or age as Alice",
+                "child face, oversized child eyes, or same age as Alice",
                 "adult mother",
                 "modern clothing",
                 "props or story action",
@@ -1718,9 +1792,9 @@ def _cast_reference_qwen_denoise(view_id: str) -> float:
         "three_quarter": 0.95,
         "profile": 0.90,
         "full_body": 1.0,
-        "expression_neutral": 0.35,
-        "expression_warm": 0.35,
-        "expression_concerned": 0.35,
+        "expression_neutral": 0.2,
+        "expression_warm": 0.2,
+        "expression_concerned": 0.2,
     }
     if view_id not in defaults:
         raise ValueError(f"unknown_cast_reference_view:{view_id}")
@@ -2032,6 +2106,30 @@ def _build_character_reference_scene(
     character_name = str(character["name"])
     character_kind = str(character.get("kind") or "human").strip().lower()
     identity_prompt = str(character["identity_prompt"])
+    age_priority_contract = ""
+    reference_rendering_medium = style_prompt
+    age_match = re.search(r"\b(\d{1,2})-year-old\b", identity_prompt.lower())
+    if character_kind == "human" and age_match:
+        character_age = int(age_match.group(1))
+        if 13 <= character_age <= 19:
+            age_priority_contract = (
+                f"NON-NEGOTIABLE AGE DESIGN: {character_name} is exactly "
+                f"{character_age} years old, a visibly older adolescent, never a child "
+                "or chibi child. Use age-appropriate medium-sized eyes, a longer facial "
+                "plane, defined adolescent chin, narrower cheeks, longer neck and natural "
+                "teenage shoulder-to-head proportions while retaining the requested "
+                "cartoon illustration style. "
+            )
+            reference_rendering_medium = re.sub(
+                r"large readable eyes",
+                "age-appropriate medium-sized readable eyes",
+                style_prompt,
+                flags=re.IGNORECASE,
+            )
+            reference_rendering_medium += (
+                ", non-chibi western animated feature character design, natural "
+                "adolescent anatomy, elegant age-appropriate facial structure"
+            )
     view_prompt = CAST_REFERENCE_VIEWS[view_id]
     if view_id == "full_body":
         if character_kind == "human":
@@ -2114,12 +2212,15 @@ def _build_character_reference_scene(
             f"Character reference {view_id} for {character_name} only, used to preserve identity across the film."
         ),
         "prompt": (
-            f"{style_prompt}. Production reference image for {character_name} only: "
+            f"{age_priority_contract}{reference_rendering_medium}. Production reference "
+            f"image for {character_name} only: "
             f"{identity_prompt}. Render exactly this reference view: {view_prompt}. "
             "One subject and one image only, complete identity anchors readable, plain warm gray "
             "studio backdrop. No contact sheet, no split panels, no story action, no props, no "
             "other people or animals, no text."
         ),
+        "age_priority_contract": age_priority_contract.strip(),
+        "reference_rendering_medium": reference_rendering_medium,
         "duration": 0,
         "composition_notes": (
             f"technical character reference, {view_prompt}, plain backdrop"
@@ -2215,6 +2316,105 @@ def _normalize_cast_reference_canvas_border(path: str) -> bool:
     return True
 
 
+def _normalize_cast_reference_front_portrait(
+    path: str,
+    scene: Mapping[str, Any],
+) -> bool:
+    if (
+        scene.get("scene_role") != "character_reference"
+        or scene.get("reference_view_id") != "front"
+        or str(scene.get("character_kind") or "").strip().lower() != "human"
+    ):
+        return False
+    try:
+        import numpy as np
+        from PIL import Image
+
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+    except (FileNotFoundError, ImportError, OSError, ValueError):
+        return False
+    if image.width < 256 or image.height < 256:
+        return False
+
+    pixels = np.asarray(image).astype(np.int16)
+    border_width = max(3, min(12, image.width // 32, image.height // 32))
+    border = np.concatenate(
+        [
+            pixels[:border_width].reshape(-1, 3),
+            pixels[-border_width:].reshape(-1, 3),
+            pixels[:, :border_width].reshape(-1, 3),
+            pixels[:, -border_width:].reshape(-1, 3),
+        ]
+    )
+    background = np.median(border, axis=0)
+    foreground = np.linalg.norm(pixels - background, axis=2) > 42
+    substantive_rows = np.where(
+        foreground.sum(axis=1) >= max(8, int(image.width * 0.02))
+    )[0]
+    substantive_columns = np.where(
+        foreground.sum(axis=0) >= max(8, int(image.height * 0.02))
+    )[0]
+    if len(substantive_rows) < 2 or len(substantive_columns) < 2:
+        return False
+
+    subject_top = int(substantive_rows.min())
+    subject_bottom = int(substantive_rows.max() + 1)
+    subject_left = int(substantive_columns.min())
+    subject_right = int(substantive_columns.max() + 1)
+    subject_height = subject_bottom - subject_top
+    subject_width = subject_right - subject_left
+    if subject_height < image.height * 0.55:
+        return False
+    if subject_width / max(1, subject_height) >= 0.70:
+        return False
+
+    upper_bottom = min(
+        image.height,
+        subject_top + max(1, int(subject_height * 0.56)),
+    )
+    upper_foreground = foreground[subject_top:upper_bottom]
+    upper_columns = np.where(
+        upper_foreground.sum(axis=0) >= max(5, int(upper_foreground.shape[0] * 0.02))
+    )[0]
+    if len(upper_columns) >= 2:
+        upper_left = int(upper_columns.min())
+        upper_right = int(upper_columns.max() + 1)
+    else:
+        upper_left, upper_right = subject_left, subject_right
+
+    canvas_aspect = image.width / image.height
+    target_height = max(1, int(subject_height * 0.58))
+    target_width = max(
+        int(target_height * canvas_aspect),
+        int((upper_right - upper_left) * 1.22),
+    )
+    target_height = max(target_height, int(target_width / canvas_aspect))
+    target_width = min(image.width, target_width)
+    target_height = min(image.height, target_height)
+    if target_width >= image.width * 0.90 or target_height >= image.height * 0.90:
+        return False
+
+    center_x = (upper_left + upper_right) / 2
+    crop_left = round(center_x - target_width / 2)
+    crop_left = max(0, min(image.width - target_width, crop_left))
+    crop_top = max(0, subject_top - int(subject_height * 0.025))
+    crop_top = min(image.height - target_height, crop_top)
+    crop = image.crop(
+        (
+            crop_left,
+            crop_top,
+            crop_left + target_width,
+            crop_top + target_height,
+        )
+    )
+    try:
+        crop.resize(image.size, Image.Resampling.LANCZOS).save(path, format="PNG")
+    except OSError:
+        return False
+    return True
+
+
 def _reconcile_cast_reference_semantic_false_negatives(
     *,
     image_metric: Dict[str, Any],
@@ -2254,8 +2454,23 @@ def _reconcile_cast_reference_semantic_false_negatives(
         )
 
     eye_count: int | None = None
-    if view_id == "three_quarter":
+    if view_id in {"front", "three_quarter"}:
         eye_count = _detect_profile_eye_count(candidate_path)
+    if (
+        view_id == "front"
+        and eye_count is not None
+        and eye_count >= 2
+        and background_variation is not None
+        and background_variation <= background_threshold
+    ):
+        overridden_codes.update(
+            str(item.get("code") or "")
+            for item in evidence
+            if item.get("matched") is False
+            and "front-facing close identity portrait"
+            in str(item.get("question") or "").lower()
+        )
+    if view_id == "three_quarter":
         maximum_composition_similarity = max(
             0.90,
             min(
@@ -2275,6 +2490,32 @@ def _reconcile_cast_reference_semantic_false_negatives(
             and composition_similarity <= maximum_composition_similarity
         ):
             overridden_codes.add("cast_three_quarter_pose_missing")
+
+    matched_codes = {
+        str(item.get("code") or "") for item in evidence if item.get("matched") is True
+    }
+    age_requirement_failures = [
+        item
+        for item in evidence
+        if item.get("matched") is False
+        and "exactly one " in str(item.get("question") or "").lower()
+        and "year-old" in str(item.get("question") or "").lower()
+    ]
+    subject_count_failed = any(
+        item.get("matched") is False
+        and (
+            "two or more distinct people" in str(item.get("question") or "").lower()
+            or "second " in str(item.get("question") or "").lower()
+        )
+        for item in evidence
+    )
+    if (
+        "cast_identity_proportions_mismatch" in matched_codes
+        and not subject_count_failed
+    ):
+        overridden_codes.update(
+            str(item.get("code") or "") for item in age_requirement_failures
+        )
 
     overridden_codes.discard("")
     if not overridden_codes:
@@ -2502,28 +2743,55 @@ def _required_production_cast(
     return required
 
 
-def _approved_cast_reference_path(character: Dict[str, Any]) -> str | None:
+def _approved_cast_reference_path(
+    character: Dict[str, Any],
+    *,
+    base_dir: Path | None = None,
+) -> str | None:
     reference = character.get("reference") or {}
     path = str(reference.get("path") or "").strip()
     required_views = reference.get("required_views") or list(CAST_REFERENCE_VIEWS)
     views = reference.get("views") or {}
+    resolved_base_dir = base_dir.expanduser().resolve() if base_dir else None
+
+    def valid_asset(raw_path: Any) -> Path | None:
+        candidate_text = str(raw_path or "").strip()
+        if not candidate_text:
+            return None
+        candidate = Path(candidate_text).expanduser()
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute() or resolved_base_dir is None
+            else (resolved_base_dir / candidate).resolve()
+        )
+        if resolved_base_dir is not None and not (
+            resolved == resolved_base_dir or resolved_base_dir in resolved.parents
+        ):
+            return None
+        try:
+            return (
+                resolved
+                if resolved.is_file() and resolved.stat().st_size > 1000
+                else None
+            )
+        except OSError:
+            return None
+
     views_valid = bool(required_views) and all(
         isinstance(views.get(view_id), dict)
         and views[view_id].get("approved") is True
         and views[view_id].get("checksum")
-        and os.path.isfile(str(views[view_id].get("path") or ""))
-        and os.path.getsize(str(views[view_id].get("path") or "")) > 1000
+        and valid_asset(views[view_id].get("path")) is not None
         for view_id in required_views
     )
+    approved_path = valid_asset(path)
     if (
         reference.get("approved") is True
         and reference.get("checksum")
         and views_valid
-        and path
-        and os.path.isfile(path)
-        and os.path.getsize(path) > 1000
+        and approved_path is not None
     ):
-        return path
+        return str(approved_path)
     return None
 
 
@@ -2602,6 +2870,14 @@ def _update_cast_reference(
 ) -> bool:
     if view_id not in CAST_REFERENCE_VIEWS:
         raise ValueError(f"unknown_cast_reference_view:{view_id}")
+    if view_id == "front" and image_metric is not None:
+        _reconcile_cast_reference_semantic_false_negatives(
+            image_metric=image_metric,
+            candidate_path=reference_path,
+            view_id=view_id,
+            identity_accepted=True,
+            composition_similarity=0.0,
+        )
     accepted = bool(
         _character_reference_accepted(image_metric)
         and os.path.isfile(reference_path)
@@ -2745,22 +3021,38 @@ def _scene_cast_reference_versions(
 
 
 def _set_cast_reference_human_approval(
-    character: Dict[str, Any], approved: bool
+    character: Dict[str, Any],
+    approved: bool,
+    *,
+    base_dir: Path | None = None,
 ) -> Dict[str, Any]:
     reference = character.get("reference") or {}
     required_views = list(reference.get("required_views") or [])
     views = reference.get("views") or {}
     if not required_views or reference.get("automatic_approved") is not True:
         raise ValueError("cast_reference_automatic_gate_not_passed")
+    resolved_base_dir = base_dir.expanduser().resolve() if base_dir else None
     for view_id in required_views:
         view = views.get(view_id) or {}
         path = str(view.get("path") or "")
+        candidate = Path(path).expanduser()
+        resolved_path = (
+            candidate.resolve()
+            if candidate.is_absolute() or resolved_base_dir is None
+            else (resolved_base_dir / candidate).resolve()
+        )
+        path_is_allowed = bool(
+            resolved_base_dir is None
+            or resolved_path == resolved_base_dir
+            or resolved_base_dir in resolved_path.parents
+        )
         if (
             view.get("automatic_approved") is not True
             or not path
-            or not os.path.isfile(path)
-            or os.path.getsize(path) <= 1000
-            or _file_sha256(path) != view.get("checksum")
+            or not path_is_allowed
+            or not resolved_path.is_file()
+            or resolved_path.stat().st_size <= 1000
+            or _file_sha256(str(resolved_path)) != view.get("checksum")
         ):
             raise ValueError(f"cast_reference_view_invalid:{view_id}")
         view.update(
@@ -2785,13 +3077,16 @@ def _set_cast_reference_human_approval(
 
 
 def _refresh_cast_bible_status(
-    visual_bible: Dict[str, Any], required_characters: List[Dict[str, Any]]
+    visual_bible: Dict[str, Any],
+    required_characters: List[Dict[str, Any]],
+    *,
+    base_dir: Path | None = None,
 ) -> Dict[str, Any]:
     cast_bible = visual_bible.setdefault("cast_bible", {})
     approved_ids = [
         str(character["id"])
         for character in required_characters
-        if _approved_cast_reference_path(character)
+        if _approved_cast_reference_path(character, base_dir=base_dir)
     ]
     missing_ids = [
         str(character["id"])
@@ -2924,6 +3219,74 @@ def _contrastive_identity_reference_paths(
     return list(dict.fromkeys(references))[:12]
 
 
+def _narrative_identity_face_resolution(
+    image_path: Path,
+    candidate_box: tuple[int, int, int, int],
+) -> Dict[str, Any]:
+    """Report whether a scene face has enough source pixels for embedding QA."""
+
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            image_width, image_height = image.size
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise SemanticQAProviderError(
+            f"local_identity:candidate_image_unreadable:{type(exc).__name__}"
+        ) from exc
+
+    left, top, right, bottom = candidate_box
+    face_width = max(0, right - left)
+    face_height = max(0, bottom - top)
+    face_area_ratio = (face_width * face_height) / max(
+        1,
+        image_width * image_height,
+    )
+    minimum_side = max(
+        48,
+        min(
+            256,
+            _safe_int(
+                os.getenv("LOCAL_NARRATIVE_IDENTITY_MIN_FACE_PIXELS"),
+                96,
+            ),
+        ),
+    )
+    try:
+        minimum_area_ratio = float(
+            os.getenv("LOCAL_NARRATIVE_IDENTITY_MIN_FACE_AREA_RATIO", "0.005")
+        )
+    except ValueError:
+        minimum_area_ratio = 0.005
+    minimum_area_ratio = max(0.001, min(0.05, minimum_area_ratio))
+    return {
+        "automatically_scorable": (
+            min(face_width, face_height) >= minimum_side
+            and face_area_ratio >= minimum_area_ratio
+        ),
+        "face_width": face_width,
+        "face_height": face_height,
+        "face_area_ratio": round(face_area_ratio, 6),
+        "minimum_face_side": minimum_side,
+        "minimum_face_area_ratio": minimum_area_ratio,
+        "image_width": image_width,
+        "image_height": image_height,
+    }
+
+
+def _narrative_identity_human_review_min_score() -> float:
+    return max(
+        0.0,
+        min(
+            100.0,
+            _safe_float(
+                os.getenv("LOCAL_NARRATIVE_IDENTITY_HUMAN_REVIEW_MIN_SCORE"),
+                70.0,
+            ),
+        ),
+    )
+
+
 def _fal_reference_label(
     reference_image_path: str,
     visual_bible: Dict[str, Any],
@@ -2936,6 +3299,48 @@ def _fal_reference_label(
             if path and os.path.abspath(path) == normalized_path:
                 return f"{character.get('name') or character.get('id')} ({view_id})"
     return Path(reference_image_path).stem
+
+
+def _narrative_attempt_order(
+    *,
+    image_provider: str,
+    image_path: str,
+    max_attempts: int,
+) -> List[int]:
+    """Evaluate cached Fal assets before allowing one fresh retry generation."""
+
+    ordered = list(range(1, max_attempts + 1))
+    if image_provider != "fal":
+        return ordered
+
+    final_path = Path(image_path)
+    stem = final_path.stem.removesuffix("_image")
+    existing_attempts: List[int] = []
+    for candidate in final_path.parent.glob(f"{stem}_fal_attempt_*.png"):
+        match = re.fullmatch(
+            rf"{re.escape(stem)}_fal_attempt_([1-9])\.png",
+            candidate.name,
+        )
+        if match and candidate.is_file():
+            existing_attempts.append(int(match.group(1)))
+    existing_attempts = sorted(set(existing_attempts))
+
+    if final_path.is_file():
+        cached_order = [
+            max_attempts,
+            *(attempt for attempt in existing_attempts if attempt != max_attempts),
+        ]
+        next_attempt = max([max_attempts, *existing_attempts]) + 1
+        if next_attempt <= 9:
+            cached_order.append(next_attempt)
+        return cached_order
+
+    if existing_attempts:
+        return [
+            *existing_attempts,
+            *(attempt for attempt in ordered if attempt not in existing_attempts),
+        ]
+    return ordered
 
 
 def _reference_character_name(
@@ -3076,6 +3481,7 @@ def _build_image_prompt(
     retry_instruction: str = "",
 ) -> str:
     style = _resolve_image_style(style_key)
+    active_visual_bible = visual_bible or {}
     base_prompt = str(scene.get("prompt") or scene.get("description") or "").strip()
     description = str(scene.get("description") or "").strip()
     composition_notes = str(scene.get("composition_notes") or "").strip()
@@ -3085,12 +3491,68 @@ def _build_image_prompt(
     must_not_include = ", ".join(
         str(item) for item in scene.get("must_not_include", []) if item
     )
+    forbidden_visual_terms = [
+        str(item).strip().lower()
+        for item in scene.get("must_not_include", [])
+        if str(item).strip()
+    ]
+    visual_description = description
+    if any(
+        _text_has_phrase(description.lower(), term) for term in forbidden_visual_terms
+    ):
+        visual_description = base_prompt
+    forbidden_named_children = {
+        term
+        for term in forbidden_visual_terms
+        if term in {"alice", "edith", "lori", "lóri"}
+    }
+    if forbidden_named_children and _text_has_any_phrase(
+        visual_description.lower(),
+        [
+            "child",
+            "children",
+            "girl",
+            "girls",
+            "criança",
+            "crianças",
+            "menina",
+            "meninas",
+        ],
+    ):
+        visual_description = base_prompt
+    if any(
+        _text_has_phrase(visual_description.lower(), term)
+        for term in forbidden_visual_terms
+    ):
+        visual_description = must_include or "the exact required visual elements"
     if scene.get("scene_role") == "character_reference":
         view_id = str(scene.get("reference_view_id") or "three_quarter")
         view_contract = CAST_REFERENCE_VIEWS.get(
             view_id,
             CAST_REFERENCE_VIEWS["three_quarter"],
         )
+        age_priority_contract = str(scene.get("age_priority_contract") or "").strip()
+        age_priority_clause = (
+            f"{age_priority_contract} " if age_priority_contract else ""
+        )
+        reference_rendering_medium = str(
+            scene.get("reference_rendering_medium") or style["prompt"]
+        )
+        if scene.get("cast_front_repair"):
+            reference_contract = (
+                "When an input image is supplied, it is a rejected design draft, not a "
+                "canonical age reference. Preserve hairstyle, hair color, wardrobe "
+                "construction, palette and illustration medium, but do not preserve its "
+                "apparent age, facial proportions or body proportions. Correct those traits "
+                "from the written age and identity contract. "
+            )
+        else:
+            reference_contract = (
+                "When an input image is supplied, it is the canonical identity anchor: "
+                "preserve the exact same fictional character, apparent age, face geometry, "
+                "hair, eye color, wardrobe, body proportions, linework and palette. Change "
+                "only the requested camera angle, framing, pose or expression. "
+            )
         retry_clause = (
             f" Correct only these previous QA failures: {retry_instruction.strip()}."
             if retry_instruction.strip()
@@ -3100,17 +3562,15 @@ def _build_image_prompt(
             r"\s+",
             " ",
             (
+                f"{age_priority_clause}"
                 "Production character turnaround reference, not a narrative scene. "
                 "This is a technical Cast Bible asset, never a film still or story frame. "
                 f"Target view: {view_contract}. "
                 f"Identity and wardrobe contract: {base_prompt[:900]}. "
                 f"Must include: {must_include[:500]}. "
                 f"Must not include: {must_not_include[:420]}. "
-                f"Rendering medium: {style['prompt'][:260]}. "
-                "When an input image is supplied, it is the canonical identity anchor: "
-                "preserve the exact same fictional character, apparent age, face geometry, "
-                "hair, eye color, wardrobe, body proportions, linework and palette. Change "
-                "only the requested camera angle, framing, pose or expression. "
+                f"Rendering medium: {reference_rendering_medium[:420]}. "
+                f"{reference_contract}"
                 "Show exactly one subject centered in one vertical 9:16 image. Use a flat, "
                 "uniform, plain warm-gray studio backdrop with no scenery. No landscape, "
                 "garden, trees, architecture, furniture, room, props, story action, contact "
@@ -3118,7 +3578,7 @@ def _build_image_prompt(
                 f"{retry_clause}"
             ),
         ).strip()[:3000]
-    scene_text = _scene_text(scene)
+    scene_text = _scene_positive_text(scene)
     scene_contract = _build_scene_contract(scene)
     shot_plan = _shot_plan(scene)
     hero_objects = scene_contract.get("hero_objects", [])
@@ -3147,8 +3607,9 @@ def _build_image_prompt(
         contract_rules.append(
             "If Ludovico or the professor appears, he is one adult male mathematics professor, never a second girl or young woman."
         )
+    visual_object_text = _scene_visual_object_text(scene)
     if any(
-        term in scene_text
+        term in visual_object_text
         for term in ("gato", "gatos", "gatinho", "gatinhos", "cat", "kitten")
     ):
         contract_rules.append(
@@ -3181,15 +3642,27 @@ def _build_image_prompt(
         "; ".join(scene_contract["animal_rules"])
         or "only show animals and objects explicitly requested by this scene"
     )[:350]
-    scene_identity = _scene_cast_identity_text(scene, visual_bible)
+    scene_identity = _scene_cast_identity_text(scene, active_visual_bible)
+    performance_scene = enrich_scene_performance(scene)
+    dialogue_actions = "; ".join(
+        f"{turn.get('speaker_name') or turn.get('speaker_id')}: {turn.get('action')} ({turn.get('emotion')})"
+        for turn in dialogue_turns(performance_scene)
+    )
+    performance_clause = (
+        f"Dramatic action: {performance_scene.get('main_action')}. "
+        f"Dominant emotion: {performance_scene.get('dominant_emotion')}. "
+        f"Required visible evidence: {', '.join(str(item) for item in performance_scene.get('required_visual_elements', []))}. "
+        f"Character acting and blocking: {dialogue_actions}. "
+        "Stage the speaking characters with readable unobstructed faces and listeners in reaction poses; this still must support one-speaker-at-a-time lip sync. "
+    )[:900]
     compact_bible = (
-        f"Film style: {visual_bible.get('style_label', style['label'])}; "
+        f"Film style: {active_visual_bible.get('style_label', style['label'])}; "
         f"medium: {style['prompt'][:180]}; "
         f"scene cast identity: {scene_identity[:420]}; "
-        f"palette: {str(visual_bible.get('palette', ''))[:100]}."
+        f"palette: {str(active_visual_bible.get('palette', ''))[:100]}."
     )[:820]
     return (
-        f"Scene-first instruction: {description[:360]}. "
+        f"Scene-first instruction: {visual_description[:360]}. "
         f"Visual prompt: {base_prompt[:520]}. "
         f"Must include: {(must_include or 'the exact subject and objects described by the scene')[:360]}. "
         f"Must not include: {(must_not_include or 'duplicate characters, wrong animals, unrelated people, fantasy costumes')[:220]}. "
@@ -3199,6 +3672,7 @@ def _build_image_prompt(
         f"Composition direction: {(composition_notes or 'distinct scene composition, same film identity')[:260]}. "
         f"{hero_object_clause}"
         f"{hero_object_composition}"
+        f"{performance_clause}"
         f"{compact_bible} "
         "One finished narrative story frame, one continuous environment, one camera angle, one moment in time, one clear focal subject. "
         "Full-bleed clean film still, no typography, no border, no watermark. "
@@ -3674,8 +4148,9 @@ def _fal_cast_reference_strategy(
     character_kind: str,
     derived_reference_view: bool,
     has_anchor: bool,
+    repair_rejected_front: bool = False,
 ) -> Literal["flux_schnell", "nano_banana_edit"]:
-    del character_kind
+    del character_kind, repair_rejected_front
     if not derived_reference_view or not has_anchor:
         return "flux_schnell"
     return "nano_banana_edit"
@@ -6128,6 +6603,105 @@ def _run_fal_flux_image_attempt(
     return job_monitor, image_record, image_metric
 
 
+def _run_resumed_local_image_attempt(
+    *,
+    scene: Dict[str, Any],
+    image_path: str,
+    directed_prompt: str,
+    image_style: str,
+    quality_preset_key: str,
+    scene_seed: int,
+    visual_bible: Dict[str, Any],
+    attempt: int,
+) -> tuple[Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    path = Path(image_path)
+    if not path.is_file() or path.stat().st_size <= 1000:
+        return (
+            {
+                "scene_id": scene["scene_id"],
+                "provider": "local_cache",
+                "service": "resumed_local_qa",
+                "job_id": None,
+                "status": "LOCAL_ASSET_MISSING",
+                "attempt": attempt,
+                "image_path": None,
+                "estimated_cost_usd": 0.0,
+                "cost_estimate_status": "external_generation_not_called",
+            },
+            None,
+            None,
+        )
+
+    started_at = time.monotonic()
+    technical_metrics = _probe_image_quality(image_path, scene=scene)
+    semantic_metrics = _evaluate_image_semantics(
+        image_path,
+        scene,
+        directed_prompt,
+        image_style,
+        visual_bible,
+    )
+    combined_metrics = _combine_image_quality(technical_metrics, semantic_metrics)
+    generation_method = "fal_resumed_local_qa"
+    image_record = {
+        "scene_id": scene["scene_id"],
+        "image_path": image_path,
+        "source_url": None,
+        "prompt": directed_prompt,
+        "base_prompt": scene["prompt"],
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": _fal_reference_edit_model(),
+        "seed": scene_seed,
+        "duration": scene.get("duration", 6),
+        "camera_motion": scene.get(
+            "camera_motion",
+            _motion_plan(scene)["description"],
+        ),
+        "runpod_job_id": None,
+        "fal_request_id": None,
+        "generation_method": generation_method,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
+    }
+    image_metric = {
+        "scene_id": scene["scene_id"],
+        "path": image_path,
+        "generation_method": generation_method,
+        "attempt": attempt,
+        "style": image_style,
+        "quality_preset": quality_preset_key,
+        "model": _fal_reference_edit_model(),
+        "seed": scene_seed,
+        "fal_request_id": None,
+        "cast_reference_versions": _scene_cast_reference_versions(
+            scene,
+            visual_bible,
+        ),
+        "resumed_local_asset": True,
+        **combined_metrics,
+    }
+    job_monitor = {
+        "scene_id": scene["scene_id"],
+        "provider": "local_cache",
+        "service": "resumed_local_qa",
+        "job_id": None,
+        "status": "RESUMED_LOCAL_QA",
+        "attempt": attempt,
+        "image_path": image_path,
+        "elapsed_seconds": round(time.monotonic() - started_at, 3),
+        "estimated_cost_usd": 0.0,
+        "cost_estimate_status": "reused_local_asset",
+        "semantic_score": combined_metrics.get("semantic_score"),
+        "quality_score": combined_metrics.get("quality_score"),
+        "semantic_accepted": combined_metrics.get("semantic_accepted"),
+        "quality_issues": combined_metrics.get("issues", []),
+    }
+    return job_monitor, image_record, image_metric
+
+
 def _fal_nano_banana_aspect_ratio(width: int, height: int) -> str:
     target = width / max(1, height)
     candidates = {
@@ -6226,13 +6800,22 @@ def _run_fal_reference_edit_attempt(
         f"input image {index} = {label}"
         for index, label in enumerate(reference_labels, start=1)
     )
-    canonical_lock = (
-        "CANONICAL REFERENCE LOCK: Supplied inputs that are not explicitly labelled as "
-        "pose guides are immutable identity and wardrobe references, not layouts to copy. "
-        "Preserve each named character's face, age, hair, body proportions, outfit "
-        "construction, colors and illustration style exactly. Do not blend characters "
-        "or exchange clothes. "
-    )
+    if scene.get("cast_front_repair"):
+        canonical_lock = (
+            "REJECTED FRONT REPAIR CONTRACT: Input image 1 is a design draft, not an "
+            "approved canonical reference. Preserve its hair color, hairstyle, wardrobe "
+            "construction, palette and illustration style. Correct the subject's age, facial "
+            "proportions and body proportions exactly as specified by the text prompt; do not "
+            "preserve childlike anatomy when the prompt requires an adolescent. "
+        )
+    else:
+        canonical_lock = (
+            "CANONICAL REFERENCE LOCK: Supplied inputs that are not explicitly labelled as "
+            "pose guides are immutable identity and wardrobe references, not layouts to copy. "
+            "Preserve each named character's face, age, hair, body proportions, outfit "
+            "construction, colors and illustration style exactly. Do not blend characters "
+            "or exchange clothes. "
+        )
     pose_guide_labels = [
         label for label in reference_labels if label.endswith("_pose_guide")
     ]
@@ -6278,7 +6861,9 @@ def _run_fal_reference_edit_attempt(
             f"{directed_prompt}\n\n"
             f"{canonical_lock}"
             "Create exactly one new narrative frame matching the requested action, setting "
-            "and camera composition. Never output a contact sheet, split screen, model "
+            "and camera composition. Treat every must-not-include item as an absolute visual "
+            "exclusion; a noun that appears only in negative constraints must never be rendered. "
+            "Never output a contact sheet, split screen, model "
             f"sheet, text, caption or border. Reference mapping: {mapping}."
         )
     inputs: Dict[str, Any] = {
@@ -6868,22 +7453,27 @@ def _runway_clip_duration(seconds: float) -> int:
 
 
 def _build_runway_motion_prompt(scene_image: Dict[str, Any]) -> str:
-    source_prompt = str(
-        scene_image.get("base_prompt")
-        or scene_image.get("prompt")
-        or scene_image.get("description")
-        or ""
-    ).strip()
     camera_motion = str(scene_image.get("camera_motion") or "subtle cinematic push-in")
-    prompt = (
-        f"{source_prompt}\n\n"
-        "Animate this exact frame as a premium cinematic story scene. "
-        f"Camera motion: {camera_motion}. "
-        "Preserve the same characters, wardrobe, faces, setting, composition, era, and art style. "
-        "Use natural breathing, cloth movement, atmospheric motion, and gentle parallax only. "
-        "No new characters, no identity drift, no morphing, no text, no logos, no captions."
+    dialogue_turn = scene_image.get("dialogue_turn")
+    performance = (
+        build_speaker_motion_prompt(scene_image, dialogue_turn)
+        if isinstance(dialogue_turn, dict)
+        else ""
     )
-    return prompt[:950]
+    prompt = (
+        "Animate the approved start frame as a premium cinematic story scene. "
+        f"Camera motion: {camera_motion}. "
+        f"{performance} "
+        "The first frame is the authoritative inventory for the entire shot. "
+        "Preserve every visible character, animal, object, prop, opening, background element, "
+        "wardrobe detail, face, setting, composition, era, and art style exactly as shown. "
+        "Animate only subjects and objects already visible in the first frame, using subtle "
+        "natural breathing, minimal cloth movement, atmospheric motion, and gentle parallax. "
+        "Do not add, reveal, spawn, remove, replace, transform, or duplicate any person, animal, "
+        "object, prop, or story event. Empty and dark areas must remain empty and dark. "
+        "No identity drift, no morphing, no text, no logos, no captions."
+    )
+    return prompt[:1200]
 
 
 def _download_runway_output(url: str, clip_path: str) -> None:
@@ -6942,13 +7532,14 @@ def _generate_runway_clip(
         OSError,
         requests.RequestException,
         RuntimeError,
-    ) + _runway_error_types(runway_module)
+        *_runway_error_types(runway_module),
+    )
     try:
         client_args: Dict[str, Any] = {"api_key": api_key}
         base_url = os.getenv("RUNWAY_BASE_URL", "").strip()
         if base_url:
             client_args["base_url"] = base_url
-        client = getattr(runway_module, "RunwayML")(**client_args)
+        client = runway_module.RunwayML(**client_args)
 
         with open(image_path, "rb") as image_file:
             encoded = base64.b64encode(image_file.read()).decode("ascii")
@@ -7051,7 +7642,145 @@ def _fal_kling_elements(
 
 def _fal_kling_duration(duration_seconds: float, *, lipsync_enabled: bool) -> int:
     maximum = 10 if lipsync_enabled else 15
-    return max(3, min(maximum, int(math.ceil(max(0.0, duration_seconds)))))
+    return max(3, min(maximum, math.ceil(max(0.0, duration_seconds))))
+
+
+def _prepare_fal_kling_lipsync_audio(
+    audio_path: str,
+    output_path: str,
+) -> Dict[str, Any]:
+    """Create a Kling-only audio derivative when its duration is out of bounds."""
+    source_quality = _probe_media_quality(audio_path, "audio")
+    source_duration = _safe_float(source_quality.get("duration_seconds"))
+    result: Dict[str, Any] = {
+        "valid": bool(source_quality.get("valid")),
+        "source_path": audio_path,
+        "path": audio_path,
+        "original_duration_seconds": round(source_duration, 3),
+        "duration_seconds": round(source_duration, 3),
+        "adjusted": False,
+        "mode": "original",
+        "tempo_factor": 1.0,
+        "issues": list(source_quality.get("issues", [])),
+    }
+    if not result["valid"]:
+        return result
+    if 2.0 <= source_duration <= 10.0:
+        return result
+    if not shutil.which("ffmpeg"):
+        result.update(
+            {
+                "valid": False,
+                "issues": [*result["issues"], "ffmpeg_unavailable_for_kling_audio"],
+            }
+        )
+        return result
+
+    target_duration = 9.8 if source_duration > 10.0 else 2.1
+    filter_parts: List[str]
+    if source_duration > 10.0:
+        tempo_factor = source_duration / target_duration
+        maximum_tempo = max(
+            1.0,
+            min(
+                2.0,
+                _safe_float(os.getenv("FAL_KLING_MAX_AUDIO_TEMPO"), 1.2),
+            ),
+        )
+        if tempo_factor > maximum_tempo:
+            result.update(
+                {
+                    "valid": False,
+                    "tempo_factor": round(tempo_factor, 6),
+                    "issues": [
+                        *result["issues"],
+                        "fal_lipsync_audio_requires_excessive_tempo",
+                    ],
+                }
+            )
+            return result
+        filter_parts = [f"atempo={tempo_factor:.6f}"]
+        mode = "tempo_compressed"
+    else:
+        tempo_factor = 1.0
+        filter_parts = [f"apad=pad_dur={target_duration - source_duration:.6f}"]
+        mode = "silence_padded"
+    filter_parts.extend(
+        [
+            (f"loudnorm=I={_audio_loudness_target_lufs():.1f}:" "TP=-1.5:LRA=11"),
+            "aresample=44100",
+        ]
+    )
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        audio_path,
+        "-map",
+        "0:a:0",
+        "-filter:a",
+        ",".join(filter_parts),
+        "-t",
+        f"{target_duration:.3f}",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "128k",
+        "-ar",
+        "44100",
+        str(output),
+    ]
+    try:
+        rendered = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        result.update(
+            {
+                "valid": False,
+                "issues": [
+                    *result["issues"],
+                    f"kling_audio_render_error:{type(exc).__name__}",
+                ],
+            }
+        )
+        return result
+    if rendered.returncode != 0:
+        result.update(
+            {
+                "valid": False,
+                "issues": [*result["issues"], "kling_audio_render_failed"],
+                "error": rendered.stderr[:500],
+            }
+        )
+        return result
+
+    derived_quality = _probe_media_quality(str(output), "audio")
+    derived_duration = _safe_float(derived_quality.get("duration_seconds"))
+    valid = bool(derived_quality.get("valid")) and 2.0 <= derived_duration <= 10.0
+    result.update(
+        {
+            "valid": valid,
+            "path": str(output),
+            "duration_seconds": round(derived_duration, 3),
+            "adjusted": True,
+            "mode": mode,
+            "tempo_factor": round(tempo_factor, 6),
+            "issues": list(derived_quality.get("issues", [])),
+        }
+    )
+    if not valid:
+        result["issues"].append("kling_audio_derived_duration_invalid")
+    return result
 
 
 def _generate_fal_kling_clip(
@@ -7061,10 +7790,13 @@ def _generate_fal_kling_clip(
     *,
     audio_path: str | None = None,
     visual_bible: Dict[str, Any] | None = None,
+    enable_lipsync: bool | None = None,
 ) -> tuple[Dict[str, Any], bool]:
     started_at = time.monotonic()
     scene_id = scene_image.get("scene_id")
-    lipsync_enabled = _fal_lipsync_enabled()
+    lipsync_enabled = (
+        _fal_lipsync_enabled() if enable_lipsync is None else enable_lipsync
+    )
     duration = _fal_kling_duration(
         duration_seconds,
         lipsync_enabled=lipsync_enabled,
@@ -7120,21 +7852,23 @@ def _generate_fal_kling_clip(
             return job_monitor, False
 
     audio_duration = 0.0
+    prepared_audio_path = str(audio_path or "")
     if lipsync_enabled:
         if not audio_path or not Path(audio_path).is_file():
             job_monitor["status"] = "FAILED"
             job_monitor["error"] = "fal_lipsync_audio_missing"
             return job_monitor, False
-        audio_quality = _probe_media_quality(audio_path, "audio")
-        audio_duration = _safe_float(audio_quality.get("duration_seconds"))
-        if not bool(audio_quality.get("valid")):
+        prepared_audio = _prepare_fal_kling_lipsync_audio(
+            audio_path,
+            str(Path(clip_path).with_name(f"{Path(clip_path).stem}_lipsync.mp3")),
+        )
+        job_monitor["lipsync_audio"] = prepared_audio
+        audio_duration = _safe_float(prepared_audio.get("duration_seconds"))
+        prepared_audio_path = str(prepared_audio.get("path") or "")
+        if not bool(prepared_audio.get("valid")) or not prepared_audio_path:
             job_monitor["status"] = "FAILED"
-            job_monitor["error"] = "fal_lipsync_audio_invalid"
-            return job_monitor, False
-        if not 2.0 <= audio_duration <= 10.0:
-            job_monitor["status"] = "FAILED"
-            job_monitor["error"] = (
-                f"fal_lipsync_scene_audio_duration_unsupported:{audio_duration:.3f}s"
+            job_monitor["error"] = "fal_lipsync_audio_preparation_failed:" + ",".join(
+                str(issue) for issue in prepared_audio.get("issues", [])
             )
             return job_monitor, False
 
@@ -7160,9 +7894,11 @@ def _generate_fal_kling_clip(
         "generate_audio": False,
         "shot_type": "customize",
         "negative_prompt": (
-            "identity drift, face morphing, age change, wardrobe change, extra limbs, "
-            "extra fingers, duplicated characters, blur, distortion, low quality, "
-            "text, captions, logos"
+            "newly appearing subject, newly appearing person, newly appearing animal, "
+            "newly appearing object, animal emerging from an empty opening, object emerging "
+            "from a dark area, identity drift, face morphing, age change, wardrobe change, "
+            "extra limbs, extra fingers, duplicated characters, disappearing subject, "
+            "replacement character, blur, distortion, low quality, text, captions, logos"
         ),
         "cfg_scale": max(
             0.0,
@@ -7191,7 +7927,7 @@ def _generate_fal_kling_clip(
         final_url = animation_url
         if lipsync_enabled:
             audio_url = file_to_data_uri(
-                str(audio_path),
+                prepared_audio_path,
                 max_bytes=5 * 1024 * 1024,
                 allowed_mime_types=(
                     "audio/mpeg",
@@ -7277,6 +8013,7 @@ def _generate_real_video_clip(
     *,
     audio_path: str | None = None,
     visual_bible: Dict[str, Any] | None = None,
+    enable_lipsync: bool | None = None,
 ) -> tuple[Dict[str, Any], bool]:
     provider = _video_generation_provider()
     if provider == "fal_kling":
@@ -7286,6 +8023,7 @@ def _generate_real_video_clip(
             duration_seconds,
             audio_path=audio_path,
             visual_bible=visual_bible,
+            enable_lipsync=enable_lipsync,
         )
     return _generate_runway_clip(scene_image, clip_path, duration_seconds)
 
@@ -7455,8 +8193,24 @@ def _local_required_visual_question(requirement: str) -> str:
             "Is the background a plain single-color neutral studio backdrop, "
             "without a room, landscape or decorative scenery?"
         )
+    if "university garden" in normalized:
+        return (
+            "Is an expansive landscaped institutional or university garden visible, with "
+            "green lawn and mature old trees? A university building may remain off-camera "
+            "unless the requirement explicitly asks for a building or facade."
+        )
+    if any(term in normalized for term in ("rabbit hole", "toca de coelho")):
+        return (
+            "Is one large deep dark hollow opening clearly cut into a grassy earth bank? "
+            "It must read as a rabbit hole, not as a small loose-soil mound or anthill."
+        )
     if any(term in normalized for term in ("teaspoon", "colher")):
         return "Is exactly one metal spoon clearly visible anywhere on the table?"
+    if any(term in normalized for term in ("plum pie", "plum pies", "torta de ameixa")):
+        return (
+            "Is purple plum filling or purple fruit clearly visible inside at least one "
+            "baked pie in the wicker basket? Answer yes when purple filling is visible."
+        )
     if any(term in normalized for term in ("separate sugar bowl lid", "tampa")):
         return "Is one separate matching lid clearly visible lying beside the bowl?"
     if any(term in normalized for term in ("white mouse", "ratinho")):
@@ -7518,6 +8272,32 @@ def _local_forbidden_visual_question(exclusion: str) -> str:
         )
     if any(term in normalized for term in ("text", "logo", "watermark")):
         return "Is any readable text, logo or watermark visible in the image?"
+    if "anthill" in normalized or "formigueiro" in normalized:
+        return (
+            "Is a small above-ground mound of loose soil visible, optionally with ants? "
+            "Do not count a large deep dark hollow cut into a grassy bank as an anthill."
+        )
+    if "cat" in normalized or "kitten" in normalized:
+        return (
+            "Is a real feline visible, with triangular cat ears, a feline muzzle and a "
+            "cat body? Do not count a small round-eared mouse as a cat or kitten."
+        )
+    if "dog" in normalized:
+        return (
+            "Is a real dog visible, with canine ears, muzzle and body? Do not count a "
+            "small round-eared mouse, cat or rabbit as a dog."
+        )
+    if "rabbit" in normalized or "bunny" in normalized:
+        return (
+            "Is a real rabbit visible, with unmistakably long rabbit ears and a rabbit "
+            "body? Do not count a small round-eared mouse as a rabbit."
+        )
+    if "princess gown" in normalized:
+        return (
+            "Is the girl wearing an ornate fantasy princess ball gown with a very "
+            "voluminous layered skirt, sparkling decoration, crown or tiara? Do not count "
+            "a plain modest ankle-length ivory Victorian day dress as a princess gown."
+        )
     return f"Is this forbidden element visible in the image: {exclusion[:260]}?"
 
 
@@ -7531,6 +8311,14 @@ def _local_forbidden_visual_code(exclusion: str, index: int) -> str:
         return "cast_human_animal_anatomy"
     if "malformed hands or feet" in normalized:
         return "cast_malformed_hands_or_feet"
+    if "anthill" in normalized or "formigueiro" in normalized:
+        return "forbidden_anthill"
+    if "cat" in normalized or "kitten" in normalized:
+        return "forbidden_cat"
+    if "dog" in normalized:
+        return "forbidden_dog"
+    if "rabbit" in normalized or "bunny" in normalized:
+        return "forbidden_rabbit"
     return f"forbidden_{index}"
 
 
@@ -7589,6 +8377,8 @@ def _local_required_visual_code(requirement: str, index: int) -> str:
         return "cast_three_quarter_pose_missing"
     if "full-body turnaround" in normalized or "head to both feet" in normalized:
         return "cast_full_body_pose_missing"
+    if any(term in normalized for term in ("rabbit hole", "toca de coelho")):
+        return "hero_rabbit_hole_missing"
     if any(term in normalized for term in ("teaspoon", "colher")):
         return "hero_teaspoon_missing"
     if any(term in normalized for term in ("separate sugar bowl lid", "tampa")):
@@ -7602,6 +8392,8 @@ def _local_required_visual_code(requirement: str, index: int) -> str:
         for term in ("proportions", "older and taller", "younger and shorter")
     ):
         return "cast_identity_proportions_mismatch"
+    if "university garden" in normalized:
+        return "environment_university_garden_missing"
     if any(term in normalized for term in ("professor", "ludovico")):
         return "wrong_ludovico_age"
     if "alice" in normalized:
@@ -7633,9 +8425,11 @@ def _evaluate_semantic_qa_with_local_vlm(
         from open3d_implementation.core.local_visual_qa import (
             LocalVisualCriterion,
             LocalVisualQAError,
+            classify_local_small_animal,
             evaluate_local_age_classification,
             evaluate_local_narrative_identity,
             evaluate_local_visual_checklist,
+            reconcile_exclusive_small_animal_answers,
         )
     except ImportError as exc:
         raise SemanticQAProviderError("local_vlm:module_unavailable") from exc
@@ -7662,6 +8456,27 @@ def _evaluate_semantic_qa_with_local_vlm(
         "tampa",
         "teaspoon",
         "colher",
+        "anthill",
+        "formigueiro",
+        "ants",
+        "formigas",
+        "rabbit hole",
+        "toca de coelho",
+        "key",
+        "chave",
+        "letter",
+        "carta",
+        "watch",
+        "relógio",
+        "relogio",
+        "bottle",
+        "frasco",
+        "vial",
+        "coin",
+        "moeda",
+        "card",
+        "cartão",
+        "cartao",
     }
     is_character_reference = scene.get("scene_role") == "character_reference"
     criteria = []
@@ -7688,13 +8503,22 @@ def _evaluate_semantic_qa_with_local_vlm(
             )
         )
     if not is_character_reference:
+        style_question = (
+            "Does the image use a coherent premium comic-storybook illustration style, "
+            "with visible hand-inked outlines, simplified animated character design and "
+            "a painted background? Detailed lighting and shading still count as comic "
+            "storybook; answer no only for a photograph, engraving, monochrome sketch, "
+            "watercolor-only image or unrelated anime style."
+            if style_key == "comic_storybook"
+            else (
+                "Does the image consistently use this visual style: "
+                f"{_resolve_image_style(style_key)['label']}?"
+            )
+        )
         criteria.append(
             LocalVisualCriterion(
                 code="style_match",
-                question=(
-                    "Does the image consistently use this visual style: "
-                    f"{_resolve_image_style(style_key)['label']}?"
-                ),
+                question=style_question,
                 expected="yes",
                 weight=1.5,
                 critical=True,
@@ -7707,6 +8531,17 @@ def _evaluate_semantic_qa_with_local_vlm(
             criteria=criteria,
             model_name=model,
         )
+        if any(
+            answer.criterion.code == "hero_mouse_missing_or_wrong" for answer in answers
+        ):
+            small_animal_label = classify_local_small_animal(
+                image_path=image_path,
+                model_name=model,
+            )
+            answers = reconcile_exclusive_small_animal_answers(
+                answers,
+                small_animal_label,
+            )
     except LocalVisualQAError as exc:
         raise SemanticQAProviderError(
             f"local_vlm:{type(exc).__name__}:{str(exc)[:300]}"
@@ -7744,6 +8579,7 @@ def _evaluate_semantic_qa_with_local_vlm(
             and answer.answer == "uncertain"
         )
     ]
+    failed_questions = [answer.criterion.question for answer in failed]
     hero_answers = [answer for answer in answers if answer.criterion.hero_object]
     hero_legible = bool(hero_answers) and all(answer.matched for answer in hero_answers)
     style_answers = [
@@ -7752,6 +8588,70 @@ def _evaluate_semantic_qa_with_local_vlm(
     style_accepted = is_character_reference or (
         bool(style_answers) and all(answer.matched for answer in style_answers)
     )
+    style_human_review_required = (
+        not is_character_reference
+        and style_key == "comic_storybook"
+        and not style_accepted
+    )
+    if style_human_review_required:
+        earned_weight += sum(
+            answer.criterion.weight for answer in style_answers if not answer.matched
+        )
+        critical_failures = [
+            code for code in critical_failures if code != "style_match"
+        ]
+    animal_review_codes = {
+        "forbidden_cat",
+        "forbidden_dog",
+        "forbidden_rabbit",
+    }
+    animal_review_answers = [
+        answer for answer in failed if answer.criterion.code in animal_review_codes
+    ]
+    positive_visual_objects = _scene_visual_object_text(scene)
+    animal_human_review_required = bool(animal_review_answers) and not (
+        _text_has_any_phrase(
+            positive_visual_objects,
+            [
+                "cat",
+                "cats",
+                "kitten",
+                "kittens",
+                "gato",
+                "gatos",
+                "gatinho",
+                "gatinhos",
+                "dog",
+                "dogs",
+                "cachorro",
+                "cachorros",
+                "rabbit",
+                "rabbits",
+                "coelho",
+                "coelhos",
+            ],
+        )
+    )
+    if animal_human_review_required:
+        earned_weight += sum(
+            answer.criterion.weight for answer in animal_review_answers
+        )
+        review_questions = {
+            answer.criterion.question for answer in animal_review_answers
+        }
+        failed = [
+            answer
+            for answer in failed
+            if answer.criterion.code not in animal_review_codes
+        ]
+        critical_failures = [
+            code for code in critical_failures if code not in animal_review_codes
+        ]
+        failed_questions = [
+            question
+            for question in failed_questions
+            if question not in review_questions
+        ]
     style_score = 100 if style_accepted else 0
     evidence = [
         {
@@ -7764,7 +8664,6 @@ def _evaluate_semantic_qa_with_local_vlm(
         }
         for answer in answers
     ]
-    failed_questions = [answer.criterion.question for answer in failed]
     if (
         is_character_reference
         and str(scene.get("reference_view_id") or "") == "profile"
@@ -7877,6 +8776,7 @@ def _evaluate_semantic_qa_with_local_vlm(
                 }
             )
     identity_assessments: List[Dict[str, Any]] = []
+    automatically_verified_character_ids: set[str] = set()
     if (
         visual_bible
         and _local_identity_qa_enabled()
@@ -7926,6 +8826,22 @@ def _evaluate_semantic_qa_with_local_vlm(
                     }
                 )
                 continue
+            face_resolution = _narrative_identity_face_resolution(
+                image_path,
+                assessment.candidate_box,
+            )
+            borderline_identity = bool(
+                not assessment.accepted
+                and assessment.score >= _narrative_identity_human_review_min_score()
+                and (
+                    assessment.similarity_margin is None
+                    or assessment.similarity_margin >= assessment.margin_threshold
+                )
+            )
+            human_review_required = bool(
+                not face_resolution["automatically_scorable"] or borderline_identity
+            )
+            identity_accepted = assessment.accepted or human_review_required
             assessment_evidence = [
                 {
                     "code": f"identity_face_embedding_{character_id}",
@@ -7940,7 +8856,8 @@ def _evaluate_semantic_qa_with_local_vlm(
                         list(box) for box in assessment.reference_boxes
                     ],
                     "candidate_box": list(assessment.candidate_box),
-                    "matched": assessment.accepted,
+                    "candidate_face_resolution": face_resolution,
+                    "matched": identity_accepted,
                 }
             ]
             identity_dimensions = {
@@ -7958,7 +8875,15 @@ def _evaluate_semantic_qa_with_local_vlm(
                 ),
             }
             failed_identity_codes = list(assessment.issues)
-            if not assessment.accepted:
+            if human_review_required:
+                failed_identity_codes.append(
+                    (
+                        "identity_borderline_requires_human_review"
+                        if borderline_identity
+                        else "identity_face_resolution_requires_human_review"
+                    )
+                )
+            if not identity_accepted:
                 critical_failures.append(f"identity_mismatch_{character_id}")
                 failed_questions.append(
                     f"Restore {character['name']} from the approved identity reference."
@@ -7969,17 +8894,89 @@ def _evaluate_semantic_qa_with_local_vlm(
                     "character_name": character["name"],
                     "score": assessment.score,
                     "dimensions": identity_dimensions,
-                    "accepted": assessment.accepted,
+                    "accepted": identity_accepted,
+                    "automatic_verification_passed": assessment.accepted,
+                    "human_review_required": human_review_required,
+                    "verification_status": (
+                        "human_review_required"
+                        if human_review_required
+                        else (
+                            "automatically_verified"
+                            if assessment.accepted
+                            else "rejected"
+                        )
+                    ),
                     "issues": failed_identity_codes,
                     "evidence": assessment_evidence,
                     "provider": "local_reference_comparison",
                     "model": assessment.model_name,
                 }
             )
+            if assessment.accepted:
+                automatically_verified_character_ids.add(character_id)
+
+    if automatically_verified_character_ids and visual_bible:
+        reconciled_character_codes: Dict[str, str] = {}
+        for character in _scene_cast_characters(scene, visual_bible):
+            character_id = str(character["id"])
+            if character_id not in automatically_verified_character_ids:
+                continue
+            canonical_names = {
+                str(character.get("name") or "").strip().casefold(),
+                *(
+                    str(alias).strip().casefold()
+                    for alias in character.get("aliases", [])
+                ),
+            }
+            canonical_names.discard("")
+            for index, requirement in enumerate(required, start=1):
+                if requirement.strip().casefold() in canonical_names:
+                    code = _local_required_visual_code(requirement, index)
+                    if code.startswith("required_"):
+                        reconciled_character_codes[code] = character_id
+
+        if reconciled_character_codes:
+            answer_by_code = {answer.criterion.code: answer for answer in answers}
+            for code in reconciled_character_codes:
+                answer = answer_by_code.get(code)
+                if answer is None or answer.matched:
+                    continue
+                earned_weight += answer.criterion.weight
+                failed_questions = [
+                    question
+                    for question in failed_questions
+                    if question != answer.criterion.question
+                ]
+                for item in evidence:
+                    if item.get("code") == code:
+                        item.update(
+                            {
+                                "answer": "yes",
+                                "matched": True,
+                                "raw_response": (
+                                    "identity_reference_comparison:"
+                                    + reconciled_character_codes[code]
+                                ),
+                                "provider": "local_reference_comparison",
+                            }
+                        )
+                        break
+            failed = [
+                answer
+                for answer in failed
+                if answer.criterion.code not in reconciled_character_codes
+            ]
+            critical_failures = [
+                code
+                for code in critical_failures
+                if code not in reconciled_character_codes
+            ]
 
     critical_failures = list(dict.fromkeys(critical_failures))
     score = round((earned_weight / total_weight) * 100) if total_weight else 0
     issues = [f"{answer.criterion.code}_{answer.answer}" for answer in failed]
+    if animal_human_review_required:
+        issues.append("animal_presence_human_review_required")
     issues.extend(f"{code}_age_classifier" for code in age_failure_codes)
     issues.extend(code for code in critical_failures if code.startswith("identity_"))
     return {
@@ -7987,6 +8984,8 @@ def _evaluate_semantic_qa_with_local_vlm(
         "accepted": score >= _image_semantic_min_score() and not critical_failures,
         "style_score": style_score,
         "style_accepted": style_accepted,
+        "style_human_review_required": style_human_review_required,
+        "animal_human_review_required": animal_human_review_required,
         "hero_object_legibility": hero_legible,
         "hero_object_notes": (
             "All locally checked hero-object requirements passed."
@@ -8055,9 +9054,9 @@ def _evaluate_semantic_qa_with_gemini(
                     return _parse_semantic_qa_response(fallback_response)
                 except ValueError as exc:
                     parse_error = exc
-            raise parse_error or ValueError(
+            raise ValueError(
                 "Semantic QA returned invalid JSON after bounded retries"
-            )
+            ) from parse_error
     except (OSError, ValueError, errors.APIError) as exc:
         raise SemanticQAProviderError(
             f"gemini:{type(exc).__name__}:{str(exc)[:300]}"
@@ -8130,7 +9129,13 @@ def _apply_semantic_qa_result(
         min(100, _safe_int(parsed.get("style_score"), score)),
     )
     style_accepted = bool(parsed.get("style_accepted", parsed.get("accepted")))
-    if not style_accepted and "style_mismatch" not in critical_codes:
+    style_human_review_required = bool(parsed.get("style_human_review_required"))
+    animal_human_review_required = bool(parsed.get("animal_human_review_required"))
+    if (
+        not style_accepted
+        and not style_human_review_required
+        and "style_mismatch" not in critical_codes
+    ):
         critical_codes.append("style_mismatch")
     if hero_objects and hero_object_legibility is False:
         if "hero_object_illegible" not in critical_codes:
@@ -8148,11 +9153,13 @@ def _apply_semantic_qa_result(
         {
             "semantic_score": score,
             "accepted": bool(parsed.get("accepted"))
-            and style_accepted
+            and (style_accepted or style_human_review_required)
             and not critical_codes
             and score >= _image_semantic_min_score(),
             "style_score": style_score,
             "style_accepted": style_accepted,
+            "style_human_review_required": style_human_review_required,
+            "animal_human_review_required": animal_human_review_required,
             "issues": [*issue_codes, *critical_codes],
             "critical_failures": critical_codes,
             "hero_objects": hero_objects,
@@ -8164,6 +9171,7 @@ def _apply_semantic_qa_result(
             "hero_object_notes": hero_object_notes,
             "retry_prompt": str(parsed.get("retry_prompt", ""))[:1000],
             "evidence": parsed.get("evidence", []),
+            "character_identity": parsed.get("character_identity", []),
         }
     )
 
@@ -8484,6 +9492,12 @@ def _combine_image_quality(
         "semantic_qa_evidence": semantic_metrics.get("evidence", []),
         "style_score": _safe_float(semantic_metrics.get("style_score"), 0.0),
         "style_accepted": semantic_metrics.get("style_accepted") is True,
+        "style_human_review_required": (
+            semantic_metrics.get("style_human_review_required") is True
+        ),
+        "animal_human_review_required": (
+            semantic_metrics.get("animal_human_review_required") is True
+        ),
         "identity_score": identity_score,
         "identity_accepted": identity_accepted,
         "character_identity": identity_assessments,
@@ -8851,6 +9865,48 @@ def _probe_image_quality(
                 )
                 metrics["focal_edge_sharpness"] = round(sharpness_for_gate, 2)
                 metrics["sharpness_gate_scope"] = "hero_object"
+            elif scene and scene.get("cast_character_ids"):
+                try:
+                    from open3d_implementation.core.local_visual_qa import (
+                        LocalVisualQAError,
+                        detect_local_face_boxes,
+                    )
+
+                    face_boxes = detect_local_face_boxes(image)
+                except (ImportError, LocalVisualQAError):
+                    face_boxes = ()
+                if face_boxes:
+                    left, top, right, bottom = max(
+                        face_boxes,
+                        key=lambda box: (box[2] - box[0]) * (box[3] - box[1]),
+                    )
+                    face_width = right - left
+                    face_height = bottom - top
+                    subject = grayscale.crop(
+                        (
+                            max(0, left - round(face_width * 0.35)),
+                            max(0, top - round(face_height * 0.45)),
+                            min(image.width, right + round(face_width * 0.35)),
+                            min(image.height, bottom + round(face_height * 0.55)),
+                        )
+                    )
+                    subject_edge_stat = ImageStat.Stat(
+                        subject.filter(ImageFilter.FIND_EDGES)
+                    )
+                    sharpness_for_gate = (
+                        subject_edge_stat.stddev[0] if subject_edge_stat.stddev else 0.0
+                    )
+                    metrics["focal_edge_sharpness"] = round(
+                        sharpness_for_gate,
+                        2,
+                    )
+                    metrics["sharpness_gate_scope"] = "primary_face_subject"
+                    metrics["sharpness_face_box"] = [
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    ]
 
         pixel_count = int(metrics["width"]) * int(metrics["height"])
         min_edge_sharpness = _image_min_edge_sharpness()
@@ -9111,65 +10167,6 @@ def _elevenlabs_remaining_characters(api_key: str) -> int | None:
     return max(0, character_limit - character_count)
 
 
-def _premium_audio_narration(scene: Dict[str, Any]) -> str:
-    scene_text = _scene_text(scene)
-    description = str(scene.get("description") or scene.get("prompt") or "").strip()
-
-    if _text_has_any_phrase(scene_text, ["açucareiro", "ratinho", "white mouse"]):
-        return (
-            "À mesa de chá, Ludovico ergue a tampa do açucareiro. "
-            "Alice prende a respiração quando um ratinho branco surge, pequeno e vivo, "
-            "no brilho da prata."
-        )
-    if _text_has_any_phrase(scene_text, ["formigueiro", "anthill", "ants"]):
-        return (
-            "No jardim silencioso, Alice se aproxima das raízes antigas. "
-            "Ali, quase escondido na grama, um pequeno formigueiro transforma o mundo "
-            "em descoberta."
-        )
-    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
-        return (
-            "Entre a grama e as raízes, Alice encontra uma abertura escura no barranco. "
-            "A toca parece pequena demais para guardar um segredo tão grande."
-        )
-
-    cleaned = re.sub(r"^\s*cena\s+\d+\s*[:.-]\s*", "", description, flags=re.I)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if not cleaned:
-        return "Alice observa o mundo ao redor como se cada detalhe pudesse abrir uma porta."
-    if len(cleaned) <= 230:
-        return cleaned
-    cutoff = cleaned[:230].rsplit(" ", 1)[0].strip(" ,;:")
-    return f"{cutoff}."
-
-
-def _premium_audio_direction(scene: Dict[str, Any]) -> Dict[str, Any]:
-    scene_text = _scene_text(scene)
-    if _text_has_any_phrase(scene_text, ["açucareiro", "ratinho", "white mouse"]):
-        return {
-            "tone": "wonder, suspense leve, calor íntimo de sala de chá",
-            "pace": "pausado, com pausa antes da revelação do ratinho",
-            "delivery": "narrador cinematográfico em português brasileiro, expressivo sem teatralizar",
-        }
-    if _text_has_any_phrase(scene_text, ["formigueiro", "anthill", "ants"]):
-        return {
-            "tone": "curiosidade delicada, observação infantil, assombro quieto",
-            "pace": "lento e contemplativo",
-            "delivery": "narrador cinematográfico em português brasileiro, voz próxima e precisa",
-        }
-    if _text_has_any_phrase(scene_text, ["toca de coelho", "rabbit hole"]):
-        return {
-            "tone": "mistério, convite para aventura, tensão suave",
-            "pace": "crescendo discreto",
-            "delivery": "narrador cinematográfico em português brasileiro, íntimo e envolvente",
-        }
-    return {
-        "tone": "cinematográfico, técnico, premium",
-        "pace": "natural, com pausas curtas entre imagens importantes",
-        "delivery": "narrador cinematográfico em português brasileiro, claro e elegante",
-    }
-
-
 def _elevenlabs_voice_settings() -> Dict[str, Any]:
     return {
         "stability": _safe_float(os.getenv("ELEVENLABS_STABILITY", "0.62")),
@@ -9187,30 +10184,18 @@ def _elevenlabs_voice_settings() -> Dict[str, Any]:
     }
 
 
-def _scene_voice_role(scene: Dict[str, Any]) -> str:
-    explicit_role = str(
-        scene.get("voice_role")
-        or scene.get("speaker")
-        or scene.get("character_voice")
-        or ""
-    ).strip()
-    if explicit_role:
-        return explicit_role
-    return "narrator"
-
-
 def _voice_env_key(role: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9]+", "_", role).strip("_").upper()
-    return f"ELEVENLABS_VOICE_ID_{normalized or 'NARRATOR'}"
+    normalized = normalize_character_id(role).upper()
+    return f"ELEVENLABS_VOICE_ID_{normalized}"
 
 
-def _elevenlabs_voice_id_for_scene(scene: Dict[str, Any]) -> tuple[str, str]:
-    role = _scene_voice_role(scene)
+def _elevenlabs_voice_id_for_turn(turn: Mapping[str, Any]) -> tuple[str, str]:
+    role = str(turn.get("speaker_name") or turn.get("speaker_id") or "").strip()
+    if not role or is_narrator_role(role):
+        return "", role
     voice_id = os.getenv(_voice_env_key(role), "").strip()
-    if not voice_id and role.lower() != "narrator":
-        voice_id = os.getenv("ELEVENLABS_VOICE_ID_NARRATOR", "").strip()
-    if not voice_id:
-        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us").strip()
+    if not voice_id and role.lower() == "alice":
+        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
     return voice_id, role
 
 
@@ -9403,7 +10388,7 @@ def _enhance_premium_audio(
 
 def _audio_quality_gate(
     media_quality: Dict[str, Any],
-    narration_text: str,
+    spoken_text: str,
     generation_method: str,
 ) -> Dict[str, Any]:
     gated = {**media_quality}
@@ -9417,14 +10402,14 @@ def _audio_quality_gate(
     if audio_path and not gated.get("waveform"):
         gated["waveform"] = _audio_waveform_samples(audio_path)
 
-    if re.match(r"^\s*cena\s+\d+\s*[:.-]", narration_text, flags=re.I):
-        issues.append("debug_scene_label_in_narration")
+    if re.match(r"^\s*cena\s+\d+\s*[:.-]", spoken_text, flags=re.I):
+        issues.append("debug_scene_label_in_dialogue")
         gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 82.0)
     if generation_method != "elevenlabs":
         issues.append("non_premium_voice_provider")
         gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 72.0)
     if duration < 2.5:
-        issues.append("audio_too_short_for_premium_narration")
+        issues.append("audio_too_short_for_premium_dialogue")
         gated["quality_score"] = min(_safe_float(gated.get("quality_score")), 78.0)
     if bit_rate and bit_rate < 96000:
         issues.append("premium_audio_bitrate_below_96k")
@@ -9445,25 +10430,29 @@ def _audio_quality_gate(
     return gated
 
 
-def _local_tts_enabled() -> bool:
-    return os.getenv("AUDIO_LOCAL_TTS_ENABLED", "true").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-    }
-
-
-def _generate_placeholder_audio(
-    narration_text: str,
-    audio_path: str,
-    reason: str,
+def _assemble_dialogue_audio(
+    scene_id: Any,
+    rendered_turns: List[Dict[str, Any]],
+    output_path: str,
 ) -> Dict[str, Any]:
-    metrics = _probe_media_quality(audio_path, "audio")
+    result: Dict[str, Any] = {
+        "path": output_path,
+        "valid": False,
+        "issues": [],
+        "dialogue_turns": rendered_turns,
+    }
+    if not rendered_turns:
+        result["issues"].append("dialogue_turns_missing")
+        return result
     if not shutil.which("ffmpeg"):
-        metrics["issues"].append("ffmpeg_unavailable")
-        return metrics
-    duration = max(4.0, min(12.0, len(narration_text) / 18.0))
-    result = subprocess.run(
+        result["issues"].append("ffmpeg_unavailable_for_dialogue_assembly")
+        return result
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    silence_path = output.with_name(f"scene_{scene_id}_dialogue_gap.mp3")
+    filelist_path = output.with_name(f"scene_{scene_id}_dialogue_filelist.txt")
+    silence = subprocess.run(
         [
             "ffmpeg",
             "-y",
@@ -9472,132 +10461,242 @@ def _generate_placeholder_audio(
             "-i",
             "anullsrc=channel_layout=mono:sample_rate=44100",
             "-t",
-            f"{duration:.2f}",
-            "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            "96k",
-            audio_path,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        metrics["issues"].append("placeholder_audio_failed")
-        metrics["error"] = result.stderr[:500]
-        return metrics
-    metrics = _probe_media_quality(audio_path, "audio")
-    metrics["quality_score"] = min(_safe_float(metrics.get("quality_score")), 55.0)
-    metrics["issues"] = [
-        *metrics.get("issues", []),
-        "voice_provider_unavailable",
-        reason,
-    ]
-    return metrics
-
-
-def _generate_local_tts_audio(
-    narration_text: str,
-    audio_path: str,
-) -> Dict[str, Any]:
-    metrics: Dict[str, Any] = {
-        "path": audio_path,
-        "type": "audio",
-        "exists": False,
-        "size_bytes": 0,
-        "valid": False,
-        "duration_seconds": 0.0,
-        "bit_rate": 0,
-        "quality_score": 0,
-        "issues": [],
-    }
-    if not _local_tts_enabled():
-        metrics["issues"].append("local_tts_disabled")
-        return metrics
-    if not shutil.which("say"):
-        return _generate_placeholder_audio(
-            narration_text,
-            audio_path,
-            "macos_say_unavailable",
-        )
-    if not shutil.which("ffmpeg"):
-        metrics["issues"].append("ffmpeg_unavailable")
-        return metrics
-
-    output_path = Path(audio_path)
-    aiff_path = output_path.with_suffix(".aiff")
-    voice_name = os.getenv("AUDIO_LOCAL_TTS_VOICE", "Luciana").strip()
-    say_commands = []
-    if voice_name:
-        say_commands.append(
-            ["say", "-v", voice_name, "-o", str(aiff_path), narration_text]
-        )
-    say_commands.append(["say", "-o", str(aiff_path), narration_text])
-
-    say_result: subprocess.CompletedProcess[str] | None = None
-    for command in say_commands:
-        say_result = subprocess.run(
-            command, capture_output=True, text=True, check=False
-        )
-        if (
-            say_result.returncode == 0
-            and aiff_path.exists()
-            and aiff_path.stat().st_size > 1000
-        ):
-            break
-    if (
-        say_result is None
-        or say_result.returncode != 0
-        or not aiff_path.exists()
-        or aiff_path.stat().st_size <= 1000
-    ):
-        metrics = _generate_placeholder_audio(
-            narration_text,
-            audio_path,
-            "macos_say_failed",
-        )
-        if say_result and say_result.stderr:
-            metrics["error"] = say_result.stderr[:500]
-        return metrics
-
-    ffmpeg_result = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(aiff_path),
-            "-codec:a",
+            "0.35",
+            "-c:a",
             "libmp3lame",
             "-b:a",
             "128k",
-            str(output_path),
+            str(silence_path),
         ],
         capture_output=True,
         text=True,
         check=False,
     )
-    try:
-        aiff_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    if ffmpeg_result.returncode != 0:
-        metrics = _generate_placeholder_audio(
-            narration_text,
-            audio_path,
-            "local_tts_transcode_failed",
+    if silence.returncode != 0:
+        result["issues"].append("dialogue_gap_render_failed")
+        result["error"] = silence.stderr[:500]
+        return result
+
+    lines: List[str] = []
+    cursor = 0.0
+    for index, turn in enumerate(rendered_turns):
+        turn_path = Path(str(turn.get("audio_path") or ""))
+        if not turn_path.is_file():
+            result["issues"].append(f"dialogue_turn_audio_missing:{index + 1}")
+            continue
+        duration = _safe_float(turn.get("duration_seconds"))
+        turn["start_seconds"] = round(cursor, 3)
+        turn["end_seconds"] = round(cursor + duration, 3)
+        cursor += duration
+        lines.append(f"file '{turn_path.resolve()}'")
+        if index < len(rendered_turns) - 1:
+            lines.append(f"file '{silence_path.resolve()}'")
+            cursor += 0.35
+    if len([line for line in lines if str(silence_path.resolve()) not in line]) != len(
+        rendered_turns
+    ):
+        return result
+    filelist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assembled = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(filelist_path),
+            "-af",
+            f"loudnorm=I={_audio_loudness_target_lufs():.1f}:TP=-1.5:LRA=11",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "160k",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for temporary in (silence_path, filelist_path):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if assembled.returncode != 0:
+        result["issues"].append("dialogue_audio_assembly_failed")
+        result["error"] = assembled.stderr[:500]
+        return result
+    media_quality = _probe_media_quality(str(output), "audio")
+    media_quality.update(
+        {
+            "dialogue_turns": rendered_turns,
+            "loudness": _measure_audio_loudness(str(output)),
+            "waveform": _audio_waveform_samples(str(output)),
+            "premium_audio": all(
+                bool(turn.get("premium_audio")) for turn in rendered_turns
+            ),
+        }
+    )
+    return media_quality
+
+
+def _generate_scene_dialogue_audio(
+    scene: Dict[str, Any],
+    api_key: str,
+    remaining_characters: int | None,
+    *,
+    output_dir: Path | None = None,
+    file_prefix: str | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], float, int | None]:
+    scene_id = scene.get("scene_id")
+    contract = validate_scene_performance(scene)
+    if not contract["passed"]:
+        raise ValueError(
+            "dialogue_contract_blocked:"
+            + ",".join(str(item) for item in contract["blockers"])
         )
-        if ffmpeg_result.stderr:
-            metrics["error"] = ffmpeg_result.stderr[:500]
-        return metrics
-    metrics = _probe_media_quality(audio_path, "audio")
-    if not bool(metrics.get("valid")):
-        return _generate_placeholder_audio(
-            narration_text,
-            audio_path,
-            "local_tts_invalid_audio",
+    if not api_key:
+        raise ValueError("elevenlabs_api_key_missing")
+
+    turns = dialogue_turns(scene)
+    voice_assignments: Dict[str, str] = {}
+    rendered_turns: List[Dict[str, Any]] = []
+    voice_metrics: List[Dict[str, Any]] = []
+    estimated_cost = 0.0
+    usd_per_1k_chars = _safe_float(os.getenv("ELEVENLABS_USD_PER_1K_CHARS", "0.30"))
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+    active_output_dir = output_dir or Path("output")
+    active_output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = file_prefix or f"scene_{scene_id}"
+
+    for index, turn in enumerate(turns, 1):
+        voice_id, voice_role = _elevenlabs_voice_id_for_turn(turn)
+        speaker_id = str(turn.get("speaker_id") or "").strip()
+        if not voice_id:
+            raise ValueError(f"character_voice_missing:{speaker_id}")
+        prior_speaker = next(
+            (
+                key
+                for key, assigned_voice in voice_assignments.items()
+                if assigned_voice == voice_id and key != speaker_id
+            ),
+            None,
         )
-    return metrics
+        if prior_speaker:
+            raise ValueError(f"character_voice_not_unique:{speaker_id}:{prior_speaker}")
+        voice_assignments[speaker_id] = voice_id
+        text_pt_br = str(turn.get("text_pt_br") or "").strip()
+        text_characters = len(text_pt_br)
+        if remaining_characters is not None and text_characters > remaining_characters:
+            raise ValueError(
+                "elevenlabs_insufficient_characters:"
+                f"needed={text_characters},remaining={remaining_characters}"
+            )
+
+        raw_path = active_output_dir / f"{prefix}_turn_{index}_raw.mp3"
+        turn_path = active_output_dir / f"{prefix}_turn_{index}_audio.mp3"
+        response = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": api_key,
+            },
+            json={
+                "text": text_pt_br,
+                "model_id": model_id,
+                "voice_settings": _elevenlabs_voice_settings(),
+            },
+            timeout=60,
+        )
+        if response.status_code != 200:
+            raise ValueError(
+                f"elevenlabs_http_{response.status_code}:"
+                f"{_response_error_detail(response)}"
+            )
+        raw_path.write_bytes(response.content)
+        media_quality = _enhance_premium_audio(
+            str(raw_path),
+            str(turn_path),
+            scene,
+        )
+        try:
+            raw_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        media_quality = _audio_quality_gate(
+            media_quality,
+            text_pt_br,
+            "elevenlabs",
+        )
+        if not bool(media_quality.get("valid")):
+            raise ValueError(
+                f"elevenlabs_invalid_dialogue_turn:{index}:"
+                + ",".join(str(item) for item in media_quality.get("issues", []))
+            )
+        rendered = {
+            **turn,
+            "audio_path": str(turn_path),
+            "voice_id": voice_id,
+            "voice_role": voice_role,
+            "model_id": model_id,
+            "duration_seconds": _safe_float(media_quality.get("duration_seconds")),
+            "premium_audio": bool(media_quality.get("premium_audio")),
+            "quality_score": media_quality.get("quality_score", 0),
+            "issues": media_quality.get("issues", []),
+        }
+        rendered_turns.append(rendered)
+        voice_metrics.append(
+            {
+                "scene_id": scene_id,
+                "turn_id": turn.get("turn_id") or f"turn_{index}",
+                "speaker_id": speaker_id,
+                "voice_id": voice_id,
+                "voice_role": voice_role,
+                "model_id": model_id,
+                "text_characters": text_characters,
+                "premium_audio": media_quality.get("premium_audio", False),
+                "quality_score": media_quality.get("quality_score", 0),
+                "issues": media_quality.get("issues", []),
+            }
+        )
+        estimated_cost += text_characters / 1000 * usd_per_1k_chars
+        if remaining_characters is not None:
+            remaining_characters = max(0, remaining_characters - text_characters)
+
+    scene_audio_path = str(active_output_dir / f"{prefix}_audio.mp3")
+    assembled = _assemble_dialogue_audio(scene_id, rendered_turns, scene_audio_path)
+    if not bool(assembled.get("valid")):
+        raise ValueError(
+            "dialogue_audio_assembly_invalid:"
+            + ",".join(str(item) for item in assembled.get("issues", []))
+        )
+    audio_record = {
+        "scene_id": scene_id,
+        "audio_path": scene_audio_path,
+        "text": " ".join(str(turn.get("text_pt_br") or "") for turn in turns),
+        "dialogue_turns": rendered_turns,
+        "voice_roles": sorted(voice_assignments),
+        "generation_method": "elevenlabs_dialogue",
+        "language": "pt-BR",
+        "narration_absent": True,
+    }
+    audio_metric = {
+        "scene_id": scene_id,
+        "generation_method": "elevenlabs_dialogue",
+        "dialogue_turns": rendered_turns,
+        "dialogue_contract": contract,
+        **assembled,
+    }
+    return (
+        audio_record,
+        audio_metric,
+        voice_metrics,
+        estimated_cost,
+        remaining_characters,
+    )
 
 
 def _aggregate_quality(
@@ -9787,10 +10886,22 @@ def create_open3d_workflow():
                 story_text,
                 image_style,
             )
+            scene_resume_manifest_path = str(
+                state.get("scene_resume_manifest_path") or ""
+            ).strip()
 
-            print(f"🎬 Gerando cenas com estilo visual: {style_label}...")
+            if scene_resume_manifest_path:
+                scenes = _load_scene_resume_manifest(
+                    scene_resume_manifest_path,
+                    story_text=story_text,
+                    image_style=image_style,
+                    max_scenes=max_scenes,
+                )
+                print(
+                    f"♻️ {len(scenes)} cenas canônicas retomadas do manifesto validado"
+                )
 
-            if not story_text:
+            elif not story_text:
                 print("⚠️ História vazia, usando cenas mock")
                 scenes = [
                     {
@@ -9816,6 +10927,7 @@ def create_open3d_workflow():
                     },
                 ]
             else:
+                print(f"🎬 Gerando cenas com estilo visual: {style_label}...")
                 # Generate real scenes using LLM
                 try:
                     llm = get_llm()
@@ -9841,6 +10953,23 @@ Para cada cena, forneça:
 6. must_not_include: lista curta de elementos proibidos para manter fidelidade à história
 7. source_excerpt: trecho literal curto da história que prova que a cena existe
 8. camera_motion: movimento de câmera discreto para animar a imagem no vídeo
+9. location, main_action e dominant_emotion
+10. characters_present e required_visual_elements
+11. dialogue: falas curtas em português brasileiro com speaker_id, speaker_name,
+    text_pt_br, emotion, delivery, action, addressee_id, mode e lip_sync_required
+12. language exatamente "pt-BR" e narration_allowed exatamente false
+
+Regras dramáticas obrigatórias:
+- É proibido narrador, narração, locução e voice-over. A história avança por diálogo,
+  ações visíveis e reações. Quando Alice estiver sozinha, use no máximo um pensamento
+  interno curto com mode="internal_thought" e lip_sync_required=false.
+- Cada personagem recorrente fala com sua própria identidade. O speaker precisa estar
+  em characters_present e executar a action descrita na mesma cena.
+- Falas devem soar naturais para crianças e estar integralmente em português brasileiro.
+- Em diálogo, lip_sync_required=true. Apenas o personagem daquela fala move a boca;
+  ouvintes reagem com olhos e corpo, mantendo a boca fechada.
+- required_visual_elements deve conter pessoas, objetos e ações citados na fala.
+- Cada fala deve caber naturalmente em 2 a 8 segundos, sem discursos expositivos.
 
 Regras visuais obrigatórias:
 - Cada prompt deve descrever uma única imagem, não uma sequência.
@@ -9912,11 +11041,37 @@ Regras visuais obrigatórias:
                     )
                     print(f"✅ {len(scenes)} cenas criadas (fallback)")
 
+            scenes = [enrich_scene_performance(scene) for scene in scenes]
+            performance_gates = [
+                {
+                    "scene_id": scene.get("scene_id"),
+                    **validate_scene_performance(scene),
+                }
+                for scene in scenes
+            ]
+            blocked_performance = [
+                gate for gate in performance_gates if not bool(gate.get("passed"))
+            ]
+            if blocked_performance:
+                raise ValueError(
+                    "scene_performance_gate_blocked:"
+                    + json.dumps(blocked_performance, ensure_ascii=False)
+                )
+
             state.update(
                 {
                     "scenes": scenes,
                     "scenes_count": len(scenes),
                     "visual_bible": visual_bible,
+                    "quality_metrics": {
+                        **state.get("quality_metrics", {}),
+                        "dialogue_contract": {
+                            "passed": True,
+                            "language": "pt-BR",
+                            "narration_absent": True,
+                            "scenes": performance_gates,
+                        },
+                    },
                     "current_step": "scenes_generated",
                 }
             )
@@ -9987,6 +11142,10 @@ Regras visuais obrigatórias:
                         attempt: int,
                         anchor_path: str | None,
                         retry_issues: Sequence[str] = (),
+                        *,
+                        _character_id: str = character_id,
+                        _character_name: str = character_name,
+                        _character: Dict[str, Any] = character,
                     ) -> tuple[
                         Dict[str, Any],
                         Dict[str, Any] | None,
@@ -9994,17 +11153,17 @@ Regras visuais obrigatórias:
                         str,
                     ]:
                         reference_scene = _build_character_reference_scene(
-                            visual_bible, character_id, view_id
+                            visual_bible, _character_id, view_id
                         )
                         reference_path = _cast_reference_attempt_path(
-                            character_id,
+                            _character_id,
                             view_id,
                             attempt,
                         )
                         reference_seed = _scene_seed(
                             session_id,
                             image_style,
-                            f"{character_id}_character_reference:{view_id}:{image_provider}:{attempt}",
+                            f"{_character_id}_character_reference:{view_id}:{image_provider}:{attempt}",
                         )
                         reference_prompt_builder = (
                             _build_flux2_image_prompt
@@ -10026,6 +11185,14 @@ Regras visuais obrigatórias:
                                 f" Retry {attempt + 1}: correct these failures: {issue_text}. "
                                 f"The mandatory camera contract is: {CAST_REFERENCE_VIEWS[view_id]}."
                             )
+                            if view_id == "front":
+                                reference_prompt += (
+                                    " Treat the supplied image as a rejected design draft. "
+                                    "Preserve hairstyle, hair color, wardrobe construction, "
+                                    "palette and illustration style, but correct age, facial "
+                                    "proportions and body proportions from the written identity "
+                                    "contract. Render a close portrait from head to mid-torso."
+                                )
                         reference_quality_preset = _cast_reference_quality_preset(
                             quality_preset,
                             view_id,
@@ -10036,9 +11203,15 @@ Regras visuais obrigatórias:
                         if _cast_reference_attempt_reusable(reference_path):
                             print(
                                 f"♻️ Reavaliando referência existente: "
-                                f"{character_name} · {view_id}."
+                                f"{_character_name} · {view_id}."
                             )
                             reused_started_at = time.monotonic()
+                            front_portrait_normalized = (
+                                _normalize_cast_reference_front_portrait(
+                                    reference_path,
+                                    reference_scene,
+                                )
+                            )
                             technical_metrics = _probe_image_quality(
                                 reference_path,
                                 scene=reference_scene,
@@ -10078,6 +11251,9 @@ Regras visuais obrigatórias:
                                 "model_family": model_family,
                                 "seed": reference_seed,
                                 "controlled_workflow": derived_reference_view,
+                                "front_portrait_normalized": (
+                                    front_portrait_normalized
+                                ),
                                 **combined_metrics,
                             }
                             reused_monitor = {
@@ -10100,6 +11276,9 @@ Regras visuais obrigatórias:
                                     "scene_id": reference_scene["scene_id"],
                                     "image_path": reference_path,
                                     "generation_method": "resumed_cast_reference",
+                                    "front_portrait_normalized": (
+                                        front_portrait_normalized
+                                    ),
                                 },
                                 reused_metric,
                                 reference_path,
@@ -10138,6 +11317,18 @@ Regras visuais obrigatórias:
                         control_source_path = anchor_path
                         secondary_reference_path = anchor_path
                         pose_guide_path: str | None = None
+                        rejected_front_path: str | None = None
+                        repair_rejected_front = False
+                        if view_id == "front" and attempt == 1:
+                            previous_front_path = _cast_reference_attempt_path(
+                                _character_id,
+                                view_id,
+                                attempt - 1,
+                            )
+                            if _cast_reference_attempt_reusable(previous_front_path):
+                                rejected_front_path = previous_front_path
+                                repair_rejected_front = True
+                                reference_scene["cast_front_repair"] = True
                         if (
                             derived_reference_view
                             and view_id in CAST_REFERENCE_POSE_VIEWS
@@ -10150,7 +11341,7 @@ Regras visuais obrigatórias:
                                 secondary_reference_path = None
                             else:
                                 pose_guide_path = _create_cast_reference_pose_guide(
-                                    character_id=character_id,
+                                    character_id=_character_id,
                                     view_id=view_id,
                                     width=int(reference_quality_preset["width"]),
                                     height=int(reference_quality_preset["height"]),
@@ -10176,9 +11367,10 @@ Regras visuais obrigatórias:
                             )
                         elif image_provider == "fal":
                             fal_reference_strategy = _fal_cast_reference_strategy(
-                                character_kind=str(character.get("kind") or ""),
+                                character_kind=str(_character.get("kind") or ""),
                                 derived_reference_view=derived_reference_view,
                                 has_anchor=bool(anchor_path),
+                                repair_rejected_front=repair_rejected_front,
                             )
                             if fal_reference_strategy == "nano_banana_edit":
                                 fal_reference_runner = _run_fal_reference_edit_attempt
@@ -10196,17 +11388,24 @@ Regras visuais obrigatórias:
                                 "visual_bible": visual_bible,
                                 "attempt": attempt,
                             }
-                            if derived_reference_view and anchor_path:
-                                fal_reference_paths = [anchor_path]
-                                if view_id == "three_quarter":
-                                    profile_path = f"output/{character_id}_character_reference_profile.png"
-                                    if _trusted_resumed_cast_reference(profile_path):
-                                        fal_reference_paths.append(profile_path)
-                                elif pose_guide_path:
-                                    fal_reference_paths.append(pose_guide_path)
-                                fal_reference_kwargs["reference_image_paths"] = (
-                                    fal_reference_paths
-                                )
+                            if fal_reference_strategy == "nano_banana_edit":
+                                if repair_rejected_front and rejected_front_path:
+                                    fal_reference_kwargs["reference_image_paths"] = [
+                                        rejected_front_path
+                                    ]
+                                elif derived_reference_view and anchor_path:
+                                    fal_reference_paths = [anchor_path]
+                                    if view_id == "three_quarter":
+                                        profile_path = f"output/{_character_id}_character_reference_profile.png"
+                                        if _trusted_resumed_cast_reference(
+                                            profile_path
+                                        ):
+                                            fal_reference_paths.append(profile_path)
+                                    elif pose_guide_path:
+                                        fal_reference_paths.append(pose_guide_path)
+                                    fal_reference_kwargs["reference_image_paths"] = (
+                                        fal_reference_paths
+                                    )
                             job_monitor, _image_record, image_metric = (
                                 fal_reference_runner(
                                     **fal_reference_kwargs,
@@ -10255,8 +11454,52 @@ Regras visuais obrigatórias:
                             )
                         else:
                             raise RuntimeError(
-                                f"cast_reference_provider_unavailable:{character_id}"
+                                f"cast_reference_provider_unavailable:{_character_id}"
                             )
+                        front_portrait_normalized = (
+                            _normalize_cast_reference_front_portrait(
+                                reference_path,
+                                reference_scene,
+                            )
+                        )
+                        if front_portrait_normalized and image_metric is not None:
+                            technical_metrics = _probe_image_quality(
+                                reference_path,
+                                scene=reference_scene,
+                            )
+                            with _LOCAL_SEMANTIC_QA_LOCK:
+                                semantic_metrics = _evaluate_image_semantics(
+                                    reference_path,
+                                    reference_scene,
+                                    reference_prompt,
+                                    image_style,
+                                    visual_bible,
+                                )
+                            combined_metrics = _combine_image_quality(
+                                technical_metrics,
+                                semantic_metrics,
+                            )
+                            image_metric.update(combined_metrics)
+                            image_metric["front_portrait_normalized"] = True
+                            job_monitor.update(
+                                {
+                                    "semantic_score": combined_metrics.get(
+                                        "semantic_score"
+                                    ),
+                                    "quality_score": combined_metrics.get(
+                                        "quality_score"
+                                    ),
+                                    "semantic_accepted": combined_metrics.get(
+                                        "semantic_accepted"
+                                    ),
+                                    "quality_issues": combined_metrics.get(
+                                        "issues", []
+                                    ),
+                                    "front_portrait_normalized": True,
+                                }
+                            )
+                            if _image_record is not None:
+                                _image_record["front_portrait_normalized"] = True
                         return (
                             job_monitor,
                             _image_record,
@@ -10273,6 +11516,9 @@ Regras visuais obrigatórias:
                             str,
                         ],
                         anchor_path: str | None,
+                        *,
+                        _character: Dict[str, Any] = character,
+                        _character_name: str = character_name,
                     ) -> bool:
                         job_monitor, _image_record, image_metric, reference_path = (
                             result
@@ -10280,31 +11526,36 @@ Regras visuais obrigatórias:
                         runpod_jobs.append(job_monitor)
                         if view_id != "front" and anchor_path:
                             _apply_cast_reference_identity_gate(
-                                character=character,
+                                character=_character,
                                 anchor_path=anchor_path,
                                 candidate_path=reference_path,
                                 view_id=view_id,
                                 image_metric=image_metric,
                             )
                         _update_cast_reference(
-                            character,
+                            _character,
                             reference_path,
                             image_metric,
                             view_id,
                         )
-                        view_status = character["reference"]["views"][view_id]["status"]
+                        view_status = _character["reference"]["views"][view_id][
+                            "status"
+                        ]
                         print(
                             f"{'✅' if view_status == 'approved' else '⛔'} "
-                            f"{character_name} · {view_id}: {view_status}."
+                            f"{_character_name} · {view_id}: {view_status}."
                         )
                         return bool(
-                            character["reference"]["views"][view_id].get(
+                            _character["reference"]["views"][view_id].get(
                                 "automatic_approved"
                             )
                         )
 
                     front_issues: Sequence[str] = ()
-                    for attempt in range(_cast_reference_max_attempts()):
+                    front_attempt_limit = _cast_reference_max_attempts()
+                    if image_provider == "fal":
+                        front_attempt_limit = min(front_attempt_limit, 2)
+                    for attempt in range(front_attempt_limit):
                         front_result = generate_reference_attempt(
                             "front",
                             attempt,
@@ -10529,7 +11780,7 @@ Regras visuais obrigatórias:
                         "reference"
                     ]["quality"]
 
-            for i, scene in enumerate(scenes):
+            for scene in scenes:
                 try:
                     print(f"🎨 Gerando imagem para cena {scene['scene_id']}...")
                     reference_image_path = _scene_reference_image_path(
@@ -10556,7 +11807,11 @@ Regras visuais obrigatórias:
                             | None
                         ) = None
                         selected_scene = False
-                        for attempt in range(1, max_attempts + 1):
+                        for attempt in _narrative_attempt_order(
+                            image_provider=image_provider,
+                            image_path=image_path,
+                            max_attempts=max_attempts,
+                        ):
                             attempt_seed = _scene_seed(
                                 session_id,
                                 image_style,
@@ -10573,7 +11828,20 @@ Regras visuais obrigatórias:
                                 if attempt == max_attempts
                                 else f"output/scene_{scene['scene_id']}_{image_provider}_attempt_{attempt}.png"
                             )
-                            if image_provider == "fal":
+                            if image_provider == "fal" and Path(attempt_path).is_file():
+                                job_monitor, image_record, image_metric = (
+                                    _run_resumed_local_image_attempt(
+                                        scene=scene,
+                                        image_path=attempt_path,
+                                        directed_prompt=directed_prompt,
+                                        image_style=image_style,
+                                        quality_preset_key=quality_preset_key,
+                                        scene_seed=attempt_seed,
+                                        visual_bible=visual_bible,
+                                        attempt=attempt,
+                                    )
+                                )
+                            elif image_provider == "fal":
                                 if reference_image_paths:
                                     job_monitor, image_record, image_metric = (
                                         _run_fal_reference_edit_attempt(
@@ -11193,300 +12461,46 @@ Regras visuais obrigatórias:
             return state
 
         def generate_audio(state: Open3DAgentState) -> Open3DAgentState:
-            """Generate audio narration using ElevenLabs"""
+            """Generate one premium pt-BR voice track per character turn."""
             if str(state.get("status") or "").startswith("awaiting_"):
                 state.update({"audio_files": [], "audio_count": 0})
                 return state
             scenes = state.get("scenes", [])
+            print("Gerando diálogo pt-BR por personagem com ElevenLabs...")
 
-            print("🎙️ Gerando áudio com ElevenLabs...")
-
-            audio_files = []
-            audio_metrics = []
-            voice_metrics = []
-            elevenlabs_usd_per_1k_chars = _safe_float(
-                os.getenv("ELEVENLABS_USD_PER_1K_CHARS", "0.30")
-            )
+            audio_files: List[Dict[str, Any]] = []
+            audio_metrics: List[Dict[str, Any]] = []
+            voice_metrics: List[Dict[str, Any]] = []
             estimated_elevenlabs_cost = 0.0
-            elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+            elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
             elevenlabs_remaining_chars = (
                 _elevenlabs_remaining_characters(elevenlabs_api_key)
                 if elevenlabs_api_key
                 else None
             )
             elevenlabs_starting_chars = elevenlabs_remaining_chars
-            if elevenlabs_api_key and elevenlabs_remaining_chars is not None:
-                print(
-                    "📊 ElevenLabs caracteres restantes: "
-                    f"{elevenlabs_remaining_chars}"
-                )
-
-            for i, scene in enumerate(scenes):
+            dialogue_failures: List[Dict[str, Any]] = []
+            for scene in scenes:
                 try:
-                    print(f"🎤 Gerando áudio para cena {scene['scene_id']}...")
-
-                    # Create output directory
-                    os.makedirs("output", exist_ok=True)
-                    audio_path = f"output/scene_{scene['scene_id']}_audio.mp3"
-
-                    # Generate premium narration using ElevenLabs
-                    narration_text = _premium_audio_narration(scene)
-                    audio_direction = _premium_audio_direction(scene)
-                    text_characters = len(narration_text)
-                    failure_reason = ""
-
-                    if elevenlabs_api_key:
-                        print(
-                            f"🔑 ElevenLabs API Key: {'✅ Configurada' if elevenlabs_api_key else '❌ Não encontrada'}"
-                        )
-
-                        print(f"📝 Texto para narração: {narration_text[:100]}...")
-
-                        # ElevenLabs API call
-                        headers = {
-                            "Accept": "audio/mpeg",
-                            "Content-Type": "application/json",
-                            "xi-api-key": elevenlabs_api_key,
-                        }
-
-                        data = {
-                            "text": narration_text,
-                            "model_id": os.getenv(
-                                "ELEVENLABS_MODEL_ID",
-                                "eleven_multilingual_v2",
-                            ),
-                            "voice_settings": _elevenlabs_voice_settings(),
-                        }
-
-                        voice_id, voice_role = _elevenlabs_voice_id_for_scene(scene)
-                        voice_url = (
-                            "https://api.elevenlabs.io/v1/text-to-speech/" f"{voice_id}"
-                        )
-
-                        if (
-                            elevenlabs_remaining_chars is not None
-                            and text_characters > elevenlabs_remaining_chars
-                        ):
-                            failure_reason = (
-                                "elevenlabs_insufficient_characters:"
-                                f"needed={text_characters},remaining={elevenlabs_remaining_chars}"
-                            )
-                            print(
-                                "⚠️ Quota ElevenLabs insuficiente para a cena: "
-                                f"{text_characters} chars necessários, "
-                                f"{elevenlabs_remaining_chars} restantes"
-                            )
-                        else:
-                            print("🎤 Chamando ElevenLabs API...")
-                            try:
-                                response = requests.post(
-                                    voice_url,
-                                    headers=headers,
-                                    json=data,
-                                    timeout=45,
-                                )
-
-                                print(f"📊 Status Code: {response.status_code}")
-                                if response.status_code != 200:
-                                    failure_reason = (
-                                        f"elevenlabs_http_{response.status_code}:"
-                                        f"{_response_error_detail(response)}"
-                                    )
-                                    print(
-                                        "❌ Resposta ElevenLabs: "
-                                        f"{_response_error_detail(response)}"
-                                    )
-
-                                if response.status_code == 200:
-                                    # Save real audio
-                                    raw_audio_path = str(
-                                        Path(audio_path).with_name(
-                                            f"{Path(audio_path).stem}_raw.mp3"
-                                        )
-                                    )
-                                    with open(raw_audio_path, "wb") as f:
-                                        f.write(response.content)
-
-                                    media_quality = _enhance_premium_audio(
-                                        raw_audio_path,
-                                        audio_path,
-                                        scene,
-                                    )
-                                    if not bool(media_quality.get("valid")):
-                                        shutil.copyfile(raw_audio_path, audio_path)
-                                        media_quality = _probe_media_quality(
-                                            audio_path, "audio"
-                                        )
-                                        media_quality.update(
-                                            {
-                                                "enhanced": False,
-                                                "loudness": _measure_audio_loudness(
-                                                    audio_path
-                                                ),
-                                                "waveform": _audio_waveform_samples(
-                                                    audio_path
-                                                ),
-                                            }
-                                        )
-                                    try:
-                                        Path(raw_audio_path).unlink(missing_ok=True)
-                                    except OSError:
-                                        pass
-                                    media_quality = _audio_quality_gate(
-                                        media_quality,
-                                        narration_text,
-                                        "elevenlabs",
-                                    )
-                                    if bool(media_quality.get("valid")):
-                                        audio_files.append(
-                                            {
-                                                "scene_id": scene["scene_id"],
-                                                "audio_path": audio_path,
-                                                "text": narration_text,
-                                                "voice_direction": audio_direction,
-                                                "voice_id": voice_id,
-                                                "voice_role": voice_role,
-                                                "generation_method": "elevenlabs",
-                                            }
-                                        )
-                                        audio_metrics.append(
-                                            {
-                                                "scene_id": scene["scene_id"],
-                                                "generation_method": "elevenlabs",
-                                                "voice_direction": audio_direction,
-                                                "voice_id": voice_id,
-                                                "voice_role": voice_role,
-                                                **media_quality,
-                                            }
-                                        )
-                                        voice_metrics.append(
-                                            {
-                                                "scene_id": scene["scene_id"],
-                                                "voice_id": voice_id,
-                                                "voice_role": voice_role,
-                                                "model_id": data["model_id"],
-                                                "text_characters": text_characters,
-                                                "voice_direction": audio_direction,
-                                                "premium_audio": media_quality.get(
-                                                    "premium_audio",
-                                                    False,
-                                                ),
-                                                "quality_score": media_quality.get(
-                                                    "quality_score",
-                                                    0,
-                                                ),
-                                                "issues": media_quality.get(
-                                                    "issues",
-                                                    [],
-                                                ),
-                                            }
-                                        )
-                                        estimated_elevenlabs_cost += (
-                                            text_characters
-                                            / 1000
-                                            * elevenlabs_usd_per_1k_chars
-                                        )
-                                        if elevenlabs_remaining_chars is not None:
-                                            elevenlabs_remaining_chars = max(
-                                                0,
-                                                elevenlabs_remaining_chars
-                                                - text_characters,
-                                            )
-                                        print(
-                                            "✅ Áudio ElevenLabs REAL gerado: "
-                                            f"cena {scene['scene_id']} "
-                                            f"({os.path.getsize(audio_path)} bytes)"
-                                        )
-                                        continue
-                                    failure_reason = (
-                                        "elevenlabs_invalid_audio:"
-                                        f"{','.join(media_quality.get('issues', []))}"
-                                    )
-                                    print("⚠️ Arquivo ElevenLabs não é áudio válido")
-
-                            except (
-                                OSError,
-                                ValueError,
-                                requests.RequestException,
-                            ) as e:
-                                failure_reason = (
-                                    f"elevenlabs_request_error:{type(e).__name__}"
-                                )
-                                print(f"⚠️ Erro na chamada ElevenLabs: {e}")
-                    else:
-                        failure_reason = "elevenlabs_api_key_missing"
-                        print(
-                            "❌ ElevenLabs API Key não encontrada nas variáveis de ambiente"
-                        )
-
-                    print("🎙️ Usando fallback local de TTS para áudio válido...")
-                    media_quality = _generate_local_tts_audio(
-                        narration_text,
-                        audio_path,
+                    (
+                        audio_record,
+                        audio_metric,
+                        scene_voice_metrics,
+                        scene_cost,
+                        elevenlabs_remaining_chars,
+                    ) = _generate_scene_dialogue_audio(
+                        enrich_scene_performance(scene),
+                        elevenlabs_api_key,
+                        elevenlabs_remaining_chars,
                     )
-                    generation_method = (
-                        "local_tts" if media_quality.get("valid") else "failed"
+                    audio_files.append(audio_record)
+                    audio_metrics.append(audio_metric)
+                    voice_metrics.extend(scene_voice_metrics)
+                    estimated_elevenlabs_cost += scene_cost
+                    print(
+                        f"Diálogo concluído: cena {scene.get('scene_id')}, "
+                        f"{len(audio_record.get('dialogue_turns', []))} falas"
                     )
-                    media_quality = _audio_quality_gate(
-                        media_quality,
-                        narration_text,
-                        generation_method,
-                    )
-                    if bool(media_quality.get("valid")):
-                        audio_files.append(
-                            {
-                                "scene_id": scene["scene_id"],
-                                "audio_path": audio_path,
-                                "text": narration_text,
-                                "voice_direction": audio_direction,
-                                "voice_id": os.getenv(
-                                    "AUDIO_LOCAL_TTS_VOICE",
-                                    "Luciana",
-                                ),
-                                "generation_method": "local_tts",
-                                "fallback_reason": failure_reason,
-                            }
-                        )
-                        print(
-                            "✅ Áudio local válido gerado: "
-                            f"cena {scene['scene_id']} "
-                            f"({os.path.getsize(audio_path)} bytes)"
-                        )
-                    else:
-                        print(
-                            "❌ Nenhum áudio válido gerado para cena "
-                            f"{scene['scene_id']}: {failure_reason}"
-                        )
-                    audio_metrics.append(
-                        {
-                            "scene_id": scene["scene_id"],
-                            "generation_method": generation_method,
-                            "fallback_reason": failure_reason,
-                            "voice_direction": audio_direction,
-                            **media_quality,
-                        }
-                    )
-                    voice_metrics.append(
-                        {
-                            "scene_id": scene["scene_id"],
-                            "voice_id": (
-                                os.getenv("AUDIO_LOCAL_TTS_VOICE", "Luciana")
-                                if generation_method == "local_tts"
-                                else "none"
-                            ),
-                            "model_id": generation_method,
-                            "text_characters": text_characters,
-                            "voice_direction": audio_direction,
-                            "premium_audio": media_quality.get(
-                                "premium_audio",
-                                False,
-                            ),
-                            "quality_score": media_quality.get("quality_score", 0),
-                            "issues": media_quality.get("issues", []),
-                            "fallback_reason": failure_reason,
-                        }
-                    )
-
                 except (
                     OSError,
                     ValueError,
@@ -11495,8 +12509,25 @@ Regras visuais obrigatórias:
                     RuntimeError,
                     requests.RequestException,
                 ) as e:
-                    print(f"⚠️ Erro ao gerar áudio para cena {scene['scene_id']}: {e}")
-                    # Continue with next scene
+                    dialogue_failures.append(
+                        {
+                            "scene_id": scene.get("scene_id"),
+                            "error": f"{type(e).__name__}:{e}",
+                        }
+                    )
+                    print(f"Diálogo bloqueado na cena {scene.get('scene_id')}: {e}")
+
+            dialogue_gate = production_dialogue_gate(scenes, audio_files, [])
+            if dialogue_failures:
+                dialogue_gate["passed"] = False
+                dialogue_gate["failures"] = dialogue_failures
+                dialogue_gate["blockers"] = [
+                    *dialogue_gate.get("blockers", []),
+                    *(
+                        f"scene_{item['scene_id']}:{item['error']}"
+                        for item in dialogue_failures
+                    ),
+                ]
 
             state.update(
                 {
@@ -11506,6 +12537,7 @@ Regras visuais obrigatórias:
                         **state.get("quality_metrics", {}),
                         "audio": audio_metrics,
                         "voices": voice_metrics,
+                        "dialogue": dialogue_gate,
                     },
                     "cost_estimate": {
                         **state.get("cost_estimate", {}),
@@ -11517,7 +12549,14 @@ Regras visuais obrigatórias:
                 }
             )
 
-            print(f"✅ {len(audio_files)} áudios gerados")
+            if not dialogue_gate["passed"]:
+                state.update(
+                    {
+                        "status": "awaiting_dialogue_fix",
+                        "current_step": "dialogue_gate_blocked",
+                    }
+                )
+            print(f"{len(audio_files)} trilhas de diálogo geradas")
             return state
 
         def compile_video(state: Open3DAgentState) -> Open3DAgentState:
@@ -11607,39 +12646,142 @@ Regras visuais obrigatórias:
                         ):
                             continue
 
-                        audio_duration = _scene_audio_duration(
-                            audio_files,
-                            img.get("scene_id"),
-                        )
-                        duration = max(
-                            3.0,
-                            audio_duration,
-                            _safe_float(img.get("duration"), 5.0),
-                        )
-                        scene_audio_path = next(
+                        scene = next(
                             (
-                                str(audio.get("audio_path") or "")
+                                item
+                                for item in state.get("scenes", [])
+                                if str(item.get("scene_id")) == str(img.get("scene_id"))
+                            ),
+                            {},
+                        )
+                        scene_audio = next(
+                            (
+                                audio
                                 for audio in audio_files
                                 if str(audio.get("scene_id"))
                                 == str(img.get("scene_id"))
                             ),
-                            "",
+                            {},
                         )
+                        rendered_turns = scene_audio.get("dialogue_turns", [])
+                        expected_turns = dialogue_turns(scene)
+                        if len(rendered_turns) != len(expected_turns):
+                            raise RuntimeError(
+                                "dialogue_audio_turn_count_mismatch:"
+                                f"{img.get('scene_id')}"
+                            )
+                        scene_segment_paths: List[str] = []
+                        dialogue_segments: List[Dict[str, Any]] = []
+                        for turn_index, turn in enumerate(rendered_turns, 1):
+                            lip_sync_required = bool(turn.get("lip_sync_required"))
+                            if lip_sync_required and video_provider != "fal_kling":
+                                raise RuntimeError(
+                                    "dialogue_lipsync_requires_fal_kling:"
+                                    f"{img.get('scene_id')}:{turn_index}"
+                                )
+                            turn_duration = max(
+                                3.0,
+                                _safe_float(turn.get("duration_seconds")),
+                            )
+                            segment_path = (
+                                f"output/scene_{img['scene_id']}_turn_{turn_index}_"
+                                f"{video_provider}.mp4"
+                            )
+                            turn_scene_image = {
+                                **scene,
+                                **img,
+                                "dialogue_turn": turn,
+                            }
+                            job_monitor, video_ok = _generate_real_video_clip(
+                                turn_scene_image,
+                                segment_path,
+                                turn_duration,
+                                audio_path=(
+                                    str(turn.get("audio_path") or "")
+                                    if lip_sync_required
+                                    else None
+                                ),
+                                visual_bible=state.get("visual_bible"),
+                                enable_lipsync=lip_sync_required,
+                            )
+                            job_monitor.update(
+                                {
+                                    "turn_id": turn.get("turn_id")
+                                    or f"turn_{turn_index}",
+                                    "speaker_id": turn.get("speaker_id"),
+                                    "lip_sync_required": lip_sync_required,
+                                    "mouth_motion_policy": (
+                                        "active_speaker_only"
+                                        if lip_sync_required
+                                        else "all_mouths_closed"
+                                    ),
+                                }
+                            )
+                            runpod_jobs.append(job_monitor)
+                            if not video_ok or not os.path.exists(segment_path):
+                                raise RuntimeError(
+                                    f"{video_provider}_dialogue_turn_failed:"
+                                    f"{img.get('scene_id')}:{turn_index}:"
+                                    f"{job_monitor.get('error')}"
+                                )
+                            scene_segment_paths.append(segment_path)
+                            dialogue_segments.append(
+                                {
+                                    "turn_id": turn.get("turn_id")
+                                    or f"turn_{turn_index}",
+                                    "speaker_id": turn.get("speaker_id"),
+                                    "speaker_name": turn.get("speaker_name"),
+                                    "mode": turn.get("mode"),
+                                    "lip_sync_required": lip_sync_required,
+                                    "lipsync_status": job_monitor.get("lipsync_status"),
+                                    "video_path": segment_path,
+                                    "job_id": job_monitor.get("job_id"),
+                                    "duration": turn_duration,
+                                }
+                            )
+
                         clip_path = (
                             f"output/scene_{img['scene_id']}_{video_provider}.mp4"
                         )
-                        job_monitor, video_ok = _generate_real_video_clip(
-                            img,
-                            clip_path,
-                            duration,
-                            audio_path=scene_audio_path or None,
-                            visual_bible=state.get("visual_bible"),
+                        scene_filelist = Path(
+                            f"output/scene_{img['scene_id']}_segments.txt"
                         )
-                        runpod_jobs.append(job_monitor)
-                        if not video_ok or not os.path.exists(clip_path):
+                        scene_filelist.write_text(
+                            "".join(
+                                f"file '{Path(path).resolve()}'\n"
+                                for path in scene_segment_paths
+                            ),
+                            encoding="utf-8",
+                        )
+                        scene_concat = subprocess.run(
+                            [
+                                "ffmpeg",
+                                "-y",
+                                "-f",
+                                "concat",
+                                "-safe",
+                                "0",
+                                "-i",
+                                str(scene_filelist),
+                                "-c:v",
+                                "copy",
+                                "-an",
+                                clip_path,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        try:
+                            scene_filelist.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        if scene_concat.returncode != 0 or not os.path.exists(
+                            clip_path
+                        ):
                             raise RuntimeError(
-                                f"{video_provider}_scene_generation_failed:"
-                                f"{img.get('scene_id')}:{job_monitor.get('error')}"
+                                f"dialogue_scene_concat_failed:{img.get('scene_id')}:"
+                                f"{scene_concat.stderr[:300]}"
                             )
                         clip_paths.append(clip_path)
                         scene_videos.append(
@@ -11647,11 +12789,42 @@ Regras visuais obrigatórias:
                                 "scene_id": img.get("scene_id", index),
                                 "video_path": clip_path,
                                 "provider": video_provider,
-                                "job_id": job_monitor.get("job_id"),
-                                "duration": duration,
-                                "quality_score": job_monitor.get("quality_score", 0),
+                                "job_id": dialogue_segments[-1].get("job_id"),
+                                "duration": sum(
+                                    _safe_float(item.get("duration"))
+                                    for item in dialogue_segments
+                                ),
+                                "quality_score": min(
+                                    (
+                                        _safe_float(job.get("quality_score"))
+                                        for job in runpod_jobs
+                                        if str(job.get("scene_id"))
+                                        == str(img.get("scene_id"))
+                                    ),
+                                    default=0.0,
+                                ),
+                                "dialogue_segments": dialogue_segments,
+                                "language": "pt-BR",
+                                "narration_absent": True,
                             }
                         )
+
+                    dialogue_video_gate = production_dialogue_gate(
+                        state.get("scenes", []),
+                        audio_files,
+                        scene_videos,
+                    )
+                    if not dialogue_video_gate["passed"]:
+                        raise RuntimeError(
+                            "dialogue_video_gate_blocked:"
+                            + ",".join(
+                                str(item)
+                                for item in dialogue_video_gate.get("blockers", [])
+                            )
+                        )
+                    state.setdefault("quality_metrics", {})[
+                        "dialogue"
+                    ] = dialogue_video_gate
 
                     filelist_path = "output/filelist.txt"
                     with open(filelist_path, "w") as f:
@@ -11685,7 +12858,7 @@ Regras visuais obrigatórias:
                         result = subprocess.run(cmd, capture_output=True, text=True)
 
                         if result.returncode == 0 and audio_files:
-                            # Concatenate every valid scene narration before muxing.
+                            # Concatenate every validated scene dialogue track before muxing.
                             audio_list_path = "output/audio_filelist.txt"
                             valid_audio_paths = [
                                 audio["audio_path"]

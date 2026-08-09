@@ -7,8 +7,11 @@ MAIN_SCRIPT=script/run_langgraph_story.py
 MONITOR_SCRIPT=monitoring/monitor_mcp.py
 # Caminho para o script de teste MCP
 RUN_MCP=run_mcp.py
+RUFF_PATHS=open3d_implementation orchestration tests scripts/create_cast_reference_resume_manifest.py
+BLACK_PATHS=open3d_implementation/core/dialogue_contract.py open3d_implementation/core/langgraph_adapter.py open3d_implementation/core/local_visual_qa.py tests/dialogue_contract_test.py tests/hero_object_gate_test.py
+ISORT_PATHS=open3d_implementation/ui_server.py
 
-.PHONY: run_full run_graph monitor clean_logs help
+.PHONY: run_full run_graph monitor run_mcp lint format-check import-check test quality clean_logs help
 
 ## Roda o sistema completo (LangGraph + Painel MCP)
 run_full:
@@ -33,6 +36,25 @@ run_mcp:
 	@echo "[INFO] Iniciando execução do script de teste MCP..."
 	python $(RUN_MCP)
 
+## Executa o linter Python configurado no pyproject.toml
+lint:
+	python -m ruff check $(RUFF_PATHS)
+
+## Confere formatação sem modificar arquivos
+format-check:
+	python -m black --check $(BLACK_PATHS)
+
+## Confere ordenação de imports nos módulos validados pelo CI
+import-check:
+	python -m isort --check-only $(ISORT_PATHS)
+
+## Executa a suíte automatizada
+test:
+	python -m pytest -q
+
+## Gate local completo antes de commit/PR
+quality: lint format-check import-check test
+
 ## Limpa os logs salvos no MCP
 clean_logs:
 	@echo "[INFO] Limpando logs de monitoramento (mcp_logs/)..."
@@ -44,5 +66,10 @@ help:
 	@echo "  make run_full     - Executa o pipeline + painel MCP"
 	@echo "  make run_graph    - Executa somente o pipeline LangGraph"
 	@echo "  make monitor      - Abre o painel MCP (Streamlit)"
+	@echo "  make lint         - Executa Ruff"
+	@echo "  make format-check - Confere Black sem modificar arquivos"
+	@echo "  make import-check - Confere ordenação de imports com isort"
+	@echo "  make test         - Executa a suíte Pytest"
+	@echo "  make quality      - Executa Ruff e Pytest"
 	@echo "  make clean_logs   - Apaga os logs em mcp_logs/"
 	@echo "  make help         - Mostra esta ajuda"

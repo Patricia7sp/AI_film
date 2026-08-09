@@ -43,6 +43,7 @@ class AIFilmPipelineConfig(Config):
     image_style: str = "cinematic_realism"
     image_quality_preset: str = "high"
     cast_resume_local_only: bool = False
+    scene_resume_manifest_path: str = ""
     quality_threshold: float = 0.9
     enable_structured_logging: bool = True
     log_level: str = "INFO"
@@ -130,6 +131,7 @@ def enhanced_multimodal_input_asset(
             "image_style": config.image_style,
             "image_quality_preset": config.image_quality_preset,
             "cast_resume_local_only": config.cast_resume_local_only,
+            "scene_resume_manifest_path": config.scene_resume_manifest_path,
             "metadata": {
                 "input_source": input_source,
                 "story_file_path": (
@@ -142,6 +144,7 @@ def enhanced_multimodal_input_asset(
                 "image_style": config.image_style,
                 "image_quality_preset": config.image_quality_preset,
                 "cast_resume_local_only": config.cast_resume_local_only,
+                "scene_resume_manifest_path": config.scene_resume_manifest_path,
                 "structured_logging_enabled": config.enable_structured_logging,
             },
         }
@@ -181,6 +184,9 @@ def enhanced_multimodal_input_asset(
             "image_quality_preset": initial_state.get("image_quality_preset", "high"),
             "cast_resume_local_only": initial_state.get(
                 "cast_resume_local_only", False
+            ),
+            "scene_resume_manifest_path": initial_state.get(
+                "scene_resume_manifest_path", ""
             ),
             "metadata": initial_state.get("metadata", {}),
             "input_source": input_source,
@@ -255,6 +261,9 @@ def enhanced_langgraph_workflow_asset(
             ),
             "cast_resume_local_only": enhanced_multimodal_input_asset.get(
                 "cast_resume_local_only", False
+            ),
+            "scene_resume_manifest_path": enhanced_multimodal_input_asset.get(
+                "scene_resume_manifest_path", ""
             ),
         }
 

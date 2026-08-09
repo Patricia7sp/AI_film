@@ -107,7 +107,8 @@ def _safe_error_detail(response: requests.Response) -> str:
 def _raise_for_fal_status(response: requests.Response) -> None:
     if response.status_code in {401, 403}:
         raise FalAuthenticationError(
-            f"fal_authentication_failed:http_{response.status_code}"
+            f"fal_authentication_failed:http_{response.status_code}:"
+            f"{_safe_error_detail(response)}"
         )
     if response.status_code >= 400:
         raise FalRequestError(
